@@ -71,19 +71,23 @@ cd c_engine && bash build_unix.sh && cd ..
 python td_train.py --episodes 2000000 --hidden 80 --activation relu \
   --lr 0.1 --end-lr 0.01 --fast --save-path models/td_80
 
-# 2. Width-expand to [150,150], batch TD fine-tune
-python td_batch_train.py --episodes 300000 --hidden 150 150 --activation relu \
+# 2. Width-expand [80] to [150], then depth-expand to [150,150]
+python td_batch_train.py --episodes 300000 --hidden 150 --activation relu \
   --expand models/td_80_final.pt \
+  --fast --adam --lr 5e-5 --end-lr 5e-6 \
+  --save-path models/batch_150 --workers 8
+python td_batch_train.py --episodes 300000 \
+  --expand-depth models/batch_150_final.pt \
   --fast --adam --lr 5e-5 --end-lr 5e-6 \
   --save-path models/batch_150_150 --workers 8
 
-# 3. Width-expand to [256,256], fine-tune
+# 3. Width-expand [150,150] to [256,256], fine-tune
 python td_batch_train.py --episodes 1000000 --hidden 256 256 --activation relu \
   --expand models/batch_150_150_final.pt \
   --fast --adam --lr 5e-5 --end-lr 5e-6 \
   --save-path models/batch_256_256 --workers 8
 
-# 4. Width-expand to [512,512], fine-tune
+# 4. Width-expand [256,256] to [512,512], fine-tune
 python td_batch_train.py --episodes 2500000 --hidden 512 512 --activation relu \
   --expand models/batch_256_256_final.pt \
   --fast --adam --lr 5e-5 --end-lr 5e-6 \
@@ -101,7 +105,7 @@ python td_batch_train.py --episodes 1000000 \
   --fast --adam --lr 5e-5 --end-lr 5e-6 --warmup-cycles 20 \
   --save-path models/batch_512_512_256_128 --workers 8
 
-# 7. 1-ply value iteration fine-tune (the key step)
+# 7. 1-ply fine-tune (the key step)
 python td_batch_train.py --episodes 500000 \
   --resume models/batch_512_512_256_128_final.pt \
   --fast --adam --lr 1e-4 --end-lr 5e-6 --warmup-cycles 20 \
@@ -149,8 +153,8 @@ python gnubg_eval.py --model models/1ply_final.pt --games 1000 --gnubg /usr/game
 
 The best model's lineage:
 1. [80] online TD from scratch, 2M episodes (lr=0.1→0.01)
-2. [150,150] batch TD fine-tune, 300k episodes → 4.9 mEMG
-3. [256,256] width-expanded, 1M episodes
+2. [80]→[150] width-expand, then [150]→[150,150] depth-expand, batch TD → 4.9 mEMG
+3. [150,150]→[256,256] width-expand, 1M episodes
 4. [512,512] width-expanded, ~2.5M episodes
 5. [512,512,256] depth-expanded, 3M episodes → 3.7 mEMG
 6. [512,512,256,128] depth-expanded with LR warmup, 1M episodes → 3.6 mEMG
