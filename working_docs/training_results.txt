@@ -1,0 +1,545 @@
+Training Results Log
+====================
+
+Unless noted, all runs use lr=0.1, 40 hidden units, sigmoid activations.
+mEMG = millipoints Error per Move in Equivalent Money Game (lower is better).
+mEMG scale: <3 world class, 3-5 expert, 5-8 advanced, 8-12 intermediate, >12 beginner.
+
+
+ReLU [512,512,256,128] 1-ply Value Iteration (NEW PROJECT BEST — BEATS GNUBG 0-PLY)
+------------------------------------------------------------------------------------
+Warm-start from td_batch_relu_512_512_256_128_warmup_final.pt (0-ply TD, 3.6 mEMG).
+1-ply VI: Bellman backup at current state, enumerates all 21 dice outcomes.
+Adam lr=1e-4→5e-6 (linear), GPC=1000, batch=256, epochs=1, 63 workers, CUDA.
+528k params. 500k episodes total.
+
+Model: best_models/td_batch_relu_512_512_256_128_1ply_vi_final.pt
+
+Head-to-head results:
+  vs gnubg 0-ply:                          51.2% (p=0.0004, 20k games) — STRONGER
+  vs [256,256,256] 1-ply VI (prev best):   50.8% (p<0.0001, 100k games) — stronger
+  vs [512,512,256,128] 0-ply (parent):     not tested directly, but parent tied prev best
+
+Training stats:
+  Loss: 0.0001 (40x lower than 0-ply's 0.004 — 1-ply targets break the loss floor)
+  Grad norm: 0.002 (vs 0.015 with 0-ply — much smoother gradients)
+  Speed: ~120 games/sec with 63 workers (~8x slower than 0-ply)
+
+Key insight: combining larger architecture (528k params) with 1-ply targets produces
+  a model that surpasses both the larger 0-ply model and the smaller 1-ply model.
+  Neither approach alone was enough to beat gnubg 0-ply.
+
+Full training lineage (each step warm-starts from previous):
+  1. [80] online TD from scratch, lr=0.1→0.01
+     → td_80hu_lrp1top01_final.pt
+  2. [150,150] batch TD, warm-start from online TD, 300k eps, Adam lr=5e-5→5e-6
+     → td_batch_relu_150_150_gpc1000_final.pt (4.9 mEMG)
+  3. [150,150] → [256,256] width expand, 1M eps, Adam lr=5e-5→5e-6
+     → td_batch_relu_256_256_expand_v2_final.pt (4.9 mEMG)
+  4. [256,256] → [512,512] width expand, ~2.5M eps, Adam lr=5e-5→5e-6
+     → td_batch_relu_512_512_expand_v2_final.pt (4.9 mEMG)
+  5. [512,512] → [512,512,256] depth expand, 3M eps (3×1M), Adam lr=5e-5→5e-6
+     → td_batch_relu_512_512_256_v3_final.pt (3.7 mEMG)
+  6. [512,512,256] → [512,512,256,128] depth expand, 1M eps, Adam lr=5e-5→5e-6, warmup=20
+     → td_batch_relu_512_512_256_128_warmup_final.pt (3.6 mEMG)
+  7. [512,512,256,128] 1-ply VI fine-tune, 500k eps, Adam lr=1e-4→5e-6
+     → td_batch_relu_512_512_256_128_1ply_vi_final.pt (beats gnubg 51.2%)
+
+
+ReLU [512,512,256,128] 4-layer depth-expanded, linear+warmup (PREV PROJECT BEST)
+---------------------------------------------------------------------------------
+Depth-expanded from td_batch_relu_512_512_256_v3_final.pt ([512,512,256], 3.7 mEMG).
+Adam lr=5e-5→5e-6 (linear), warmup-cycles=20, GPC=1000, batch=256, epochs=1, 63 workers, CUDA.
+528k params. 3M episodes total.
+
+Model: best_models/td_batch_relu_512_512_256_128_warmup_final.pt
+
+mEMG: 3.6 (1000-game self-play eval, W=3.5, B=3.6)
+
+Head-to-head results (100k games each):
+  vs [512,512,256] 0-ply (parent):        50.3% (p=0.07) — borderline, trending stronger
+  vs [256,256,256] 1-ply VI (project best): 49.8% (p=0.24) — tied
+  vs [512,512,256,128] cosine+warmup:     50.4% (p=0.009) — stronger
+
+SL optimization experiments on [512,512,256,128]:
+  Weight decay sweep {1e-3, 1e-4, 1e-5}: no effect on loss or mEMG.
+  Cosine annealing: no effect vs linear (tied h2h).
+  LR warmup (20 cycles): improves depth expansion. Linear+warmup beats cosine+warmup h2h.
+  Loss floor ~0.004 is the same regardless of network size — irreducible TD target noise.
+  Larger networks improve mEMG despite same loss (better relative accuracy between moves).
+
+Key finding: 0-ply TD with larger network (528k params) matches 1-ply VI with smaller
+  network (182k params). Two paths to the same strength.
+
+
+ReLU [256,256,256] 1-ply Value Iteration fine-tune (TIED PROJECT BEST)
+----------------------------------------------------------------------
+Warm-start from td_batch_relu_256_256_256_v3_final.pt (4.1 mEMG).
+1-ply VI: Bellman backup at current state, enumerates all 21 dice outcomes.
+Adam lr=1e-4→5e-6, GPC=1000, batch=256, epochs=1, 14 workers.
+182k params. DMP-optimized (single P(win) output, no gammon values).
+
+Model: best_models/td_batch_relu_256_256_256_1ply_vi_final.pt
+
+mEMG measurements (note: 0-ply gnubg analysis overestimates error for DMP models):
+  gnubg 0-ply analysis (10k games): 3.2 mEMG (W=3.2, B=3.3)
+  gnubg 2-ply analysis (1k games):  2.5 mEMG (W=2.5, B=2.6)
+  Manual supremo/XG+ analysis: some "errors" flagged by gnubg confirmed correct
+    by XG+ and gnubg rollouts. True DMP error rate likely < 2 mEMG.
+
+Head-to-head results:
+  vs gnubg 0-ply (DMP):             50.1% (p=0.87, 20k games) — tied
+  vs [512,512,256] 0-ply (prev best): 50.6% (p<0.0001, 100k games) — stronger
+  vs [256,256,256] 0-ply baseline:  51.2% (p=0.0006, 20k games) — stronger
+  vs [512,512] 0-ply model:         51.8% (p<0.0001, 20k games) — stronger
+  vs [256,256] 0-ply model:         ~52% (est from 48.0% for [256,256] vs gnubg)
+
+Training was completely stable (56-58 samples/game throughout 500k episodes).
+Speed: ~70 games/sec with 14 workers (~30x slower than 0-ply collection).
+
+1-ply value iteration approach (inspired by jacobhilton/backgammon):
+  - Compute Bellman backup at CURRENT state: target = E_dice[max_move(1-V(next))]
+  - Enumerates all 21 dice outcomes, finds best move for each
+  - Terminal states handled explicitly (override network with exact 0/1)
+  - 0-ply move selection for game play (fast), 1-ply only for targets
+  - Key insight: E[V(s')|dice,best_action] is unbiased estimator of V(s)
+
+Key implementation details (4 bugs fixed from initial 1-ply attempt):
+  1. Original used torch.max instead of torch.min (opponent picked worst moves)
+  2. 1-ply move selection caused 400x slowdown + value collapse
+  3. Target computed at next state instead of current state (should be Bellman backup)
+  4. Terminal states not handled explicitly (network outputs ~0.4 for terminals)
+
+
+ReLU [80,80] TD(0), 2M episodes, perspective encoding
+------------------------------------------------------------------
+Stage 1: lr=0.05->0.005, 1M eps from scratch. Stage 2: lr=0.02->0.001, +1M eps.
+Model: td_relu_80_80_v2_final.pt. vs gnubg-nn 0-ply: 45.6% (20k games).
+Episodes     avg mEMG   notes
+  200,000       10.1    stage 1
+  400,000        9.8
+  600,000        9.4
+  800,000        6.9
+1,000,000        7.5    end stage 1
+1,200,000        6.1    stage 2, best single eval
+1,400,000        7.2
+1,600,000        6.7
+1,800,000        6.2
+2,000,000        6.2    final, advanced range
+
+		 
+best_models/td_relu_80_80_v2_final.pt
+==================================================
+  gnubg analysis: 10000 games
+==================================================
+  White avg mEMG: 6.2
+  Black avg mEMG: 6.7
+  Overall avg:    6.4
+==================================================
+
+
+80hu TD(0), lr=0.1->0.05, 2M episodes, perspective encoding
+-------------------------------------------------------------
+Episodes     avg mEMG   notes
+  100,000       15.3
+  200,000       13.1
+  250,000       11.5
+  500,000       11.9
+  750,000       10.2
+1,000,000       10.3    plateauing ~10
+1,350,000        9.3
+1,750,000        8.8    best
+2,000,000        8.9
+
+best_models/td_relu_80hu_v3_final.pt
+longer EMG from 10000 self-play games: 8.2
+
+Achieves 40% win rate against gnubg 0ply.
+Head-to-head (10k games): final(2M) beats 1.6M (52.0%, p<0.01),
+tied with 1.8M (50.1%, p=0.78).  Meaningful improvement stops ~1.5M.
+Beats model with 40HU that was trained for 1e6 runs (51.2%, p<0.01)
+Tied with 150hu (50.2%, p=0.66) and 256hu (50.2%, p=0.70) — all at 2M.
+Larger networks don't help at this training budget.
+Also tied with gnubg supervised models: sup_80hu (50.4%, p=0.61),
+sup_150hu (50.4%, p=0.66), sup_256hu (50.0%, p=0.95).
+TD self-play catches up to supervised at sufficient training length.
+
+
+40hu TD(0) baseline, lr=0.1, 100 eval games
+--------------------------------------------
+Fresh start. Accurate eval baseline (100 games throughout) for comparison.
+
+Episodes     avg mEMG
+   10,000      147.4
+   20,000       72.9
+   30,000       52.9
+   40,000       39.1
+   50,000       29.2
+
+
+Run 6: 40hu TD(0), perspective encoding
+----------------------------------------
+Total Episodes   avg mEMG   eval_games   notes
+       10,000       38.4           20     fresh start
+       50,000       18.8           20
+      100,000       17.0          100     resumed from 50k
+      200,000       13.4          100     broke old plateau!
+      300,000       12.8          100
+      350,000       12.7          100     best
+      500,000       13.0          100
+
+Best: 12.7 at 350k.
+
+
+Old code (dellalibera fork) reference results
+---------------------------------------------
+TD(0), dellalibera encoding (198 features), lr=0.1.
+
+40hu:
+Episodes     avg mEMG
+      100,000       19.4
+      200,000       16.7
+      300,000       18.7     plateau
+
+80hu:
+Episodes     avg mEMG
+   10,000       45.5
+   50,000       29.5
+  100,000       16.7
+  200,000       16.0
+  400,000       13.9
+
+150hu (lr=0.1 -> 0.05 -> 0.025):
+Episodes     lr      avg mEMG
+   10,000    0.1       41.3
+  100,000    0.1       19.2
+1,000,000    0.1       12.6
+2,500,000    0.05      10.5
+3,000,000    0.025     10.2
+4,000,000    0.025     10.2      plateaued
+
+
+Bugs found and fixed
+--------------------
+1. Turn encoding bug: _pick_best_play encoded resulting states with
+   mover's turn instead of opponent's turn.  Fixed by adding
+   switch_turn before encoding.
+
+2. sys.path growth bug: _pick_best_play_fast called sys.path.insert
+   on every move, growing sys.path to millions of entries over long
+   runs.  Fixed by caching the import.
+
+3. Move evaluation perspective bug (with perspective encoding):
+   _pick_best_play encoded resulting states without switch_turn,
+   causing network to evaluate "P(I win if I move again)" instead
+   of "P(I win given opponent moves next)".  Fixed by adding
+   switch_turn and using argmin.
+
+4. gnubg-nn board order bug: board_to_gnubg put on-roll player in
+   board[0], but gnubg convention is board[1] = on-roll player.
+   Result: all gnubg-nn evaluations were inverted (P(win) returned
+   as P(lose)).  This made all supervised training useless.
+   Found via sanity check: gnubg-nn vs gnubg-nn gave 224 mEMG.
+   User spotted that 0.449 ≈ 1 - 0.551 (gnubg-cli's value).
+
+
+Summary
+-------
+- Perspective encoding (196 features, no turn indicator) is the best
+  approach: converges faster AND reaches lower mEMG than dellalibera encoding.
+- C engine: 55-61 games/sec (1.7x faster than Python's 36 games/sec).
+- Lambda=0.7 does not help vs lambda=0 (TD(0)).
+- lr=0.1 dominates over 0.2-0.5 in LR sweep.
+- Our best TD result: 12.7 mEMG at 350k (40hu, Run 6).
+- Dellalibera 150hu reference: 10.2 mEMG at 3M (plateaued).
+- Dellalibera 80hu reference: 13.9 mEMG at 400k.
+- gnubg supervised: plateaus at ~10 mEMG with 40hu.
+- Next: scale to larger architectures ([128,128], [256,256]) with pure batch training.
+- Adam optimizer (online TD): tested lr={0.001,0.0003,0.0001,0.00003}. Best 14.1 mEMG vs SGD's 13.9; 1.7x slower. Removed from td_train.py.
+- ReLU 80hu TD(0): lr=0.05->0.005 over 1.15M eps -> 8.9 mEMG. Ties sigmoid 80hu head-to-head (49.5% vs 50.5%, p=0.50). Loses to gnubg-nn 0-ply 42.4%-57.6%.
+- Sigmoid 80hu +2M eps (lr=0.1->0.01): beats base sigmoid 51.8%-48.2% (p=0.0003). vs gnubg-nn 0-ply: 44.2% (100k games). Both 80hu models (ReLU/sigmoid) in 42-44% range vs gnubg-nn.
+- ReLU [80] anneal2 (lr=0.05->0.001, 1M eps): 7.8 mEMG. New single-layer best.
+- Multi-layer results (1M eps each, from scratch):
+  ReLU [80,40] lr=0.05->0.005: 7.6 mEMG. ReLU [80,80] lr=0.05->0.005: 6.9 mEMG (new project best).
+  ReLU [80,60,40] lr=0.03->0.003: 7.1 mEMG. Sigmoid [80,40] lr=0.1->0.01: 10.1 mEMG.
+  Multi-layer ReLU clearly beats sigmoid for deeper nets. All still improving at 1M.
+- Continuation runs (+1M eps each, lr=0.02->0.001):
+  ReLU [80] v3: 7.3 mEMG (3.15M total). Sigmoid [80] slightly better h2h: 50.5%-49.5% (p<0.001, 300k games).
+  Both equivalent vs gnubg-nn 0-ply: sigmoid 43.8%, ReLU 43.9% (20k games each).
+  ReLU [80,80] v2: 6.2 mEMG (2M total). New project best. Model: td_relu_80_80_v2_final.pt.
+  Trained from scratch: 1M eps lr=0.05->0.005, then +1M eps lr=0.02->0.001.
+  vs gnubg-nn 0-ply: 45.6% (20k games). Beats sigmoid [80] h2h: 51.2%-48.8% (p=0.0009, 20k games).
+  ReLU [80,60,40] v2: 6.5 mEMG (2M total).
+  Head-to-head (10k games): [80,80] ≈ [80,60,40] (50.7%, p=0.17). Both beat [80] significantly.
+  [80,60,40] vs [80]: 52.4% (p<0.0001). [80,80] vs [80]: 51.6% (p=0.002).
+  Conclusion: ReLU matches sigmoid for single-layer and dominates for multi-layer. Default to ReLU.
+- v3 continuation runs (+1M eps each, lr=0.01->0.001):
+  [80,80] v3: 5.8 mEMG final. Tied with v2 at 40k games (50.1%, p=0.80). Converged at 2M eps.
+  [80,60,40] v3: 6.2 mEMG final (improved from 6.5). Inconclusive vs v2 (50.4%, p=0.28, 20k games).
+  [80,60,40] v3 vs [80,80] v2: inconclusive (50.5%, p=0.19, 20k games). Both architectures equivalent.
+- HardSigmoid [80,80] tested with online TD: 36-37 mEMG at lr=0.05 and lr=0.1. Does not work with SGD online TD.
+  wildbg uses HardSigmoid with AdamW (lr=0.00113) + batch supervised training. Needs Adam + batching to avoid
+  vanishing gradients in flat regions. Worth retrying when batch training is available.
+
+Batch training investigation (see working_docs/batch_train_results.md for full details)
+----------------------------------------------------------------------------------------
+- Validated batch TD (td_batch_train.py) and experience replay (td_replay_train.py).
+- Best batch result [80,80]: 6.2-6.7 mEMG warm-started from online TD checkpoint.
+  Batch holds the online TD baseline but does not push below it.
+- Experience replay: validated correct (matches batch when params equivalent) but
+  offers no quality advantage and is 5-10x slower due to buffer overhead.
+- DECISION: pure batch training going forward. Experience replay code kept for reference.
+
+Batch parameter sweep (March 2026)
+-----------------------------------
+Systematic tuning of batch params on [150,150] ReLU, warm-started from online TD checkpoint.
+
+GPC sweep: tested 100-10000 on [80,80] and [150,150]. Every head-to-head inconclusive.
+  GPC does not affect quality. Locked in GPC=1000.
+
+Epochs sweep: tested 1, 3, 5, 10 on [150,150], 500k episodes.
+  epochs=1 best (4.5 mEMG), smoothest trajectory, 3x faster than e10.
+  More epochs overfit stale targets within each cycle. Locked in epochs=1.
+
+LR sweep: tested 2e-5, 5e-5, 1e-4, 5e-4 on [150,150], 300k episodes.
+  Higher LR destroys warm-started model (5e-4 regressed to 11.7 mEMG).
+  2e-5 and 5e-5 tied at ~4.7-4.8. Locked in lr=5e-5->5e-6 (headroom for larger nets).
+
+Locked-in batch defaults:
+  games_per_cycle=1000, epochs=1, Adam lr=5e-5->5e-6, minibatch=256.
+
+[150,150] batch training results:
+  4.9 mEMG (GPC 1000, 300k eps from online TD). Expert range — new project best.
+  Beats [80,80] baseline 51.7%-48.3% (p<0.0001, 20k games).
+  Best model: best_models/td_batch_relu_150_150_gpc1000_final.pt
+  Further fine-tuning with locked-in defaults reaches ~4.5-4.8 but tied head-to-head
+  with 4.9 model — near plateau for this architecture.
+
+
+ReLU [150,150] batch TD, 500k eps, warm-started from 4.9 mEMG (BEST MODEL)
+----------------------------------------------------------------------------
+Warm-start: td_batch_relu_150_150_gpc1000_final.pt (online TD 1M + batch 300k).
+Batch TD epochs=1, Adam lr=5e-5->5e-6, GPC=1000, minibatch=256, 14 workers.
+Model: td_batch_relu_150_150_e1_500k_final.pt.
+Episodes     avg mEMG   notes
+  100,000        5.5    (100-game eval)
+  200,000        5.0
+  300,000        5.0
+  400,000        4.8
+  500,000        4.5    (100-game eval)
+500-game eval:   5.0    (W=4.9 B=5.1) — expert range
+
+vs baseline (4.9 mEMG): 50.7%-49.3% (p=0.038, 20k games). Confirmed improvement.
+vs e3 (epochs=3): 50.1%-49.9% (p=0.82, 20k games). Tied — same strength.
+vs e5 (epochs=5): 49.8%-50.2% (p=0.64, 20k games). Tied — same strength.
+Epochs sweep conclusion: all epoch counts converge to same quality at 500k,
+but epochs=1 is 3x faster than epochs=10 (480 vs 159 games/sec).
+Still improving at 500k — longer training should push further into expert range.
+
+
+Extended encoding experiments (March 2026)
+-------------------------------------------
+Tested whether additional input features improve on the base perspective196 encoding.
+All experiments used ReLU [80,80] or [150,150] with warm-start from trained p196 models.
+
+Encoders tested:
+  - perspective199 (p199): p196 + 3 bounded pip count features
+  - perspective203 (p203): p196 + 3 pip count + 4 bar thermometer (>=1, >=2 per player)
+  - perspective370 (p370): p196 + 174 Hinton-style features (3+/4+/5+ stack indicators + bearoff thermo)
+
+Online TD results ([80,80], 2M total episodes each, lr=0.05->0.005):
+  p196 baseline: 6.8 mEMG (best 6.8 @ 1M). Baseline to beat is 6.2 from prior v2 run.
+  p199:          6.3 mEMG (best @ 1.6M total). Regressed to 7.4 by 2M.
+  p370:          6.5 mEMG (best @ 2M). Oscillated 7-8.5 throughout.
+  p203 (warm-started from p196 [80,80]): 6.3 mEMG (best @ 800k). Oscillated 6.3-7.5.
+
+Head-to-head (20k games each):
+  p199 final vs p196 [80,80] baseline: tied (49.5%, p=0.12)
+  p370 final vs p196 [80,80] baseline: tied (49.4%, p=0.11)
+  p199 final vs p370 final: p199 wins (51.0%, p<0.01)
+
+Batch TD results ([150,150], 500k episodes, warm-started from 4.5-5.0 mEMG p196 model):
+  p203: 4.6-4.8 mEMG (best 4.6 @ 400k, 100-game eval).
+  p203 final vs p196 baseline: tied (50.1%, p=0.70, 20k games).
+  p370: 4.7-5.2 mEMG (best 4.7 @ 200k, 100-game eval).
+  p370 final vs p196 baseline: tied (50.3%, p=0.43, 20k games).
+
+Conclusion: extra features (pip count, bar thermometer, stack indicators) do NOT improve
+  on the base perspective196 encoding. The network can learn these signals implicitly:
+  - Pip count is a linear function of checker positions — trivially learnable
+  - Bar count is already encoded (bar/2 scalar in p196)
+  - Stack depth beyond 4 checkers is rare and low-impact
+  The bottleneck is network capacity or training signal quality, not input features.
+
+
+ReLU [256,256] batch TD, width-expanded from [150,150] (NEW PROJECT BEST)
+--------------------------------------------------------------------------
+Width expansion: [150,150] -> [256,256] (52k -> 116k params).
+Source: td_batch_relu_150_150_gpc1000_final.pt (4.9 mEMG).
+Phase 1: 500k eps, Adam lr=5e-5->5e-6, GPC=1000, epochs=1 (low LR).
+Phase 2: +500k eps, same LR schedule (1M total).
+
+Episodes     avg mEMG   notes
+   50,000        5.5    phase 1 (100-game eval)
+  100,000        5.9
+  150,000        4.9
+  200,000        5.3
+  250,000        5.2
+  300,000        5.1
+  350,000        5.4
+  400,000        5.1
+  450,000        4.8
+  500,000        5.2    end phase 1
+  550,000        5.3    phase 2
+  600,000        5.0
+  650,000        4.9
+  700,000        5.7
+  750,000        4.8
+  800,000        6.1
+  850,000        4.4    best 100-game eval
+  900,000        4.5
+  950,000        5.1
+1,000,000        4.9
+10000-game eval: 4.9    (W=4.8 B=5.0) — expert range, very reliable measurement
+Model: best_models/td_batch_relu_256_256_expand_v2_final.pt
+
+vs [150,150] baseline: 50.6%-49.4% (p=0.014, 40k games). Confirmed stronger.
+
+Also tested:
+  [256,256] expand high LR (1e-3->1e-4 then 1e-4->1e-5): 5.4 at 500k, still improving.
+  [256,256] from scratch (1e-3->1e-4 then 1e-4->1e-5): 6.5 at 1M, far behind.
+  Width expansion saves massive wall time vs from-scratch training.
+
+Head-to-head: [512,512] vs [256,256] (100k games):
+  [512,512] wins 50.9%-49.1% (p<0.0001). Small but significant improvement from larger network.
+
+
+ReLU [256,256,256] depth-expanded from [256,256], batch TD (NEW PROJECT BEST)
+-------------------------------------------------------------------------------
+Depth-expanded from best_models/td_batch_relu_256_256_expand_v2_final.pt ([256,256], 4.4 mEMG).
+New 3rd hidden layer initialized as near-identity (I + 0.01*randn, bias=0).
+Batch TD epochs=1, Adam lr=5e-5->5e-6, GPC=1000, minibatch=256, 8 workers.
+Model: best_models/td_batch_relu_256_256_256_v3_final.pt (= v3 ep900k checkpoint).
+
+Episodes     avg mEMG   notes
+  200,000        4.2    (200-game eval)
+1,000,000        4.0    end of v1
+2,000,000        3.8    end of v2
+2,900,000        3.7    best 200-game eval (v3 ep900k)
+3,000,000        4.0    end of v3
+4,000,000        3.8    end of v4 (plateaued)
+
+10000-game eval: 4.1  (W=4.0, B=4.2) — reliable measurement, new project best.
+
+vs [512,512] expand_v2: 50.4%-49.6% (p=0.007, 100k games). Significantly stronger.
+Depth expansion beats width expansion at lower parameter count (182k vs 525k params).
+Still improving at 2M; plateau around 3.7-3.8 from 3M onward.
+
+ReLU [512,512] batch TD, width-expanded from [256,256]
+-------------------------------------------------------
+Width expansion: [256,256] -> [512,512] (116k -> 364k params).
+Source: td_batch_relu_256_256_expand_v2_final.pt (4.9 mEMG).
+Two expansion runs (expand, expand_v2), each ~1M eps, lr=5e-5->5e-6.
+Additional 500k fine-tuning (expand_v3): loss flat at 0.0042-0.0045, no improvement.
+100-game eval: 4.9 mEMG (White). New project best (confirmed by commit as best model).
+Model: best_models/td_batch_relu_512_512_expand_v2_final.pt
+
+
+ReLU [512,512,512] batch TD, depth-expanded from [512,512] (SGD — BAD RUN)
+---------------------------------------------------------------------------
+NOTE: This run accidentally used SGD instead of Adam. Results are invalid.
+Depth expansion: [512,512] -> [512,512,512] (364k -> 627k params).
+Source: td_batch_relu_512_512_expand_v2_final.pt.
+Phase 1: 500k eps, SGD lr=5e-5->5e-6, GPC=1000, epochs=1, 62 workers, CUDA.
+Phase 2: +1.5M eps, same LR schedule (2M total).
+Loss flat at ~0.0039-0.0040 from episode 1k through 2M — no learning.
+100-game eval: 5.6 mEMG (White). Worse than [512,512].
+Conclusion at the time was "depth hurts" — WRONG. The real problem was SGD.
+Re-run with Adam in the 3-layer sweep below achieves 3.8 mEMG (expert/world-class).
+
+3-Layer Architecture Sweep
+-----------------------------------------------------------
+Sweep: 3M episodes each (3×1M phases), GPC=1000, epochs=1, minibatch=256, 63 workers, CUDA.
+Depth-expanded models: Adam lr=5e-5->5e-6 all phases, warm-started from [512,512] or [256,256].
+From-scratch models: Adam lr=1e-3->1e-4 (phase 1), 1e-4->1e-5 (phase 2), 5e-5->5e-6 (phase 3).
+
+Sources:
+  Depth-expanded: best_models/td_batch_relu_512_512_expand_v2_final.pt ([512,512])
+                   best_models/td_batch_relu_256_256_expand_v2_final.pt ([256,256])
+  From-scratch: random initialization.
+
+200-game self-play mEMG evaluation:
+  [512,512,512] depth-expanded: 3.8 mEMG (W=3.3, B=4.2) [200-game]
+  [512,512,256] depth-expanded: 3.7 mEMG (W=3.7, B=3.8) [1000-game]. NEW PROJECT BEST mEMG.
+  [256,256,128] depth-expanded: 4.2 mEMG (W=4.1, B=4.2)
+  [256,128,128] from scratch:   4.9 mEMG (W=4.9, B=4.9)
+  [512,256,256] from scratch:   5.2 mEMG (W=5.2, B=5.2)
+
+Head-to-head (20k games each):
+  [512,512,512] vs [512,512,256]: 50.0%-50.0% (p=0.97, tied)
+  [512,512,512] vs [512,256,256]: 52.2%-47.8% (p<0.0001, 512³ wins)
+  [512,512,512] vs [256,256,128]: 50.4%-49.6% (p=0.32, inconclusive)
+  [512,512,512] vs [256,128,128]: 51.9%-48.1% (p<0.0001, 512³ wins)
+  [512,512,256] vs [512,256,256]: 51.3%-48.7% (p=0.0002, 512²×256 wins)
+  [512,512,256] vs [256,256,128]: 51.1%-48.9% (p=0.002, 512²×256 wins)
+  [512,512,256] vs [256,128,128]: 52.7%-47.3% (p<0.0001, 512²×256 wins)
+  [512,256,256] vs [256,256,128]: 48.8%-51.2% (p=0.0007, 256²×128 wins)
+  [512,256,256] vs [256,128,128]: 50.6%-49.4% (p=0.12, inconclusive)
+  [256,256,128] vs [256,128,128]: 52.2%-47.8% (p<0.0001, 256²×128 wins)
+
+Rankings (by head-to-head):
+  1. [512,512,512] and [512,512,256] — tied at top
+  3. [256,256,128] — depth-expanded, beats both from-scratch models
+  4. [512,256,256] — from scratch, inconclusive vs [256,128,128]
+  5. [256,128,128] — from scratch, weakest
+
+Key findings:
+  - Depth expansion dominates from-scratch at 3M episodes. [256,256,128] (depth-expanded,
+    72k params) beats [512,256,256] (from scratch, 263k params) despite being 3.6x smaller.
+  - Previous "depth hurts" conclusion was wrong — caused by accidentally using SGD.
+    With Adam, 3-layer models match or beat 2-layer.
+  - [512,512,256] achieves best mEMG at fewer params than [512,512,512] (460k vs 627k).
+  - From-scratch models may need significantly more than 3M episodes to catch up.
+
+Models:
+  best_models/td_batch_relu_512_512_256_v3_final.pt (project best)
+  models/sweep3/*_v3_final.pt (all sweep checkpoints)
+
+
+Phased encoding experiments (March 2026)
+-----------------------------------------
+Tested whether phase-gated feature copies improve on base perspective196 encoding.
+The "perspective588_phased" encoder triplicates the 196 base features:
+  [0-195]   always active (standard p196)
+  [196-391] contact-gated copy (nonzero only in contact/crashed positions)
+  [392-587] race-gated copy (nonzero only in race/bearoff positions)
+Uses gnubg_nn.classify() for authoritative game-phase classification.
+Rationale: gnubg trains separate networks for contact/race/crashed. Phase gating
+gives a single network phase-specific behavior (W_base + W_contact or W_base + W_race)
+while sharing base representations.
+
+Also tested gnubg3gametype (p196 + 3 binary game-type features): no improvement.
+
+Results (all warm-started from best p196 models, batch TD, Adam lr=5e-5->5e-6):
+
+  phased588 [256,256] (1.5M eps):
+    4.5 mEMG. Beats p196 [256,256] h2h 51.1%-48.9% (p=0.002, 20k games).
+    Ties p196 [512,512] h2h 50.1%-49.9% (p=0.72, 20k games).
+    Converged at 500k eps — extra 1M didn't improve.
+
+  phased588 [256,256,256] (1.5M eps):
+    3.9 mEMG (100-game eval). Ties p196 [256,256,256] h2h 50.2%-49.8% (p=0.28, 100k games).
+
+  phased588 [512,512,256] (1.5M eps):
+    3.6 mEMG (200-game eval). Ties p196 [512,512,256] h2h 50.0%-50.0% (p=0.91, 100k games).
+
+  gnubg3gametype [512,512] (500k eps):
+    4.5 mEMG. Ties p196 [512,512] h2h 49.9%-50.1% (p=0.76, 20k games).
+
+Conclusion: phase gating helps smaller networks match larger ones (phased [256,256]
+  matches raw [512,512]) but does not raise the performance ceiling. At each architecture
+  size, the phased model ties the p196 baseline. Combined with earlier extended encoding
+  experiments (p199, p203, p370 — all tied with p196), this strongly suggests the
+  bottleneck is NOT input features. The base perspective196 encoding captures all
+  the information the network needs. The limiting factor is likely training signal
+  quality (TD(0) bootstrapping noise), network capacity, or search depth (0-ply).

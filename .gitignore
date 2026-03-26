@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*~
+models/
+gnubg_test/
+gnubg_games/
+logs/
+*.pt
+!best_models/**/*.pt
+c_engine/*.so
+c_engine/*.dll
+c_engine/.build.lock
