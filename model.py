@@ -100,8 +100,8 @@ class TDNetwork(nn.Module):
         torch.save(data, path)
 
     @classmethod
-    def load(cls, path: str, map_location=None) -> "TDNetwork":
-        """Load a saved model."""
+    def load(cls, path: str, map_location="cpu") -> "TDNetwork":
+        """Load a saved model. Defaults to CPU to handle models saved on GPU."""
         checkpoint = torch.load(path, map_location=map_location, weights_only=False)
 
         model = cls(
