@@ -11,7 +11,7 @@ A backgammon AI trained entirely through self-play [Reinforcement Learning](http
 | Best (1-ply VI) | [512,512,256,128] | 528k | **51.2%** (p=0.0004) | 1-ply value iteration refinement | 2026-03-26 |
 | Strong (1-ply VI) | [256,256,256] | 182k | 50.1% (tied) | 1-ply value iteration refinement | 2026-03-26 |
 
-The mEMG error rate is ~2.5 (gnubg 2-ply analysis) and 1.70 (XG++ analysis, 110 self-play games), placing the model in the "world class" / "world champion" range.
+The mEMG error rate is ~2.5 (gnubg 2-ply analysis) and the XG PR is 1.70 (XG++ analysis, 110 self-play games), placing the model in the "world class" range.
 
 ## How It Works
 
