@@ -2,7 +2,7 @@
 
 A backgammon AI trained entirely through self-play [Reinforcement Learning](https://en.wikipedia.org/wiki/Reinforcement_learning).  The main approach is temporal difference learning with a neural network using Tesauro's original feature encoding (see [TD-Gammon](https://en.wikipedia.org/wiki/TD-Gammon)).  In addition to sampled Bellman backups, we implemented exact Bellman backups (sometimes called 1-ply backups), moving closer to an AlphaZero-style approach.  The framework supports multiprocessing and GPU acceleration to speed up training.  Currently it only covers 1-point matches (DMP) but we plan on extending to money games and match play.
 
-**Key result:** A 528k-parameter network achieves 51.2% win rate against gnubg 0-ply (p=0.0004, 20k games) in 1-point matches
+**Key result:** A 528k-parameter network achieves 51.2% win rate against gnubg 0-ply¹ (p=0.0004, 20k games) in 1-point matches
 
 ## Current Models and Results
 
@@ -176,3 +176,13 @@ Written by Alexander Strehl, with coding assistance from Claude (Anthropic).
 Inspired by and references:
 - [jacobhilton/backgammon](https://github.com/jacobhilton/backgammon) — 1-ply value iteration approach, OCaml implementation with experience replay
 - [carsten-wenderdel/wildbg](https://github.com/carsten-wenderdel/wildbg) — Supervised-learning settings, topology, and approaches, as well as extended and helpful discussions
+- Gerry Tesauro's TDGammon and related work.
+- GNUbg for all their wonderful work and especially for providing a baseline to compare to.
+
+---
+
+¹ Evaluated using [gnubg-nn](https://github.com/StonesAndDice/gnubg-nn-pypi) 1.1.0a6, which wraps GNU Backgammon's neural network (weights version 1.01, 1,097,867 bytes). Move generation was validated against gnubg-nn's own `moves()` function (100% agreement across tested positions).
+
+## License
+
+MIT
