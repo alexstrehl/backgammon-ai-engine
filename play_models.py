@@ -32,9 +32,18 @@ from model import TDNetwork
 def play_game(
     agent_white: Agent,
     agent_black: Agent,
+    record: bool = False,
 ) -> int:
-    """Play one full game. Returns the winner (WHITE or BLACK)."""
+    """Play one full game. Returns the winner (WHITE or BLACK).
+
+    If record=True, returns (winner, GameRecord) instead.
+    """
     state = BoardState.initial()
+    game_record = None
+
+    if record:
+        from gnubg_eval import GameRecord, MoveRecord
+        game_record = GameRecord()
 
     while not state.is_game_over():
         d1, d2 = random.randint(1, 6), random.randint(1, 6)
@@ -43,11 +52,24 @@ def play_game(
         if plays:
             agent = agent_white if state.turn == WHITE else agent_black
             play, next_state = agent.choose_play(state, (d1, d2), plays)
+            if game_record is not None:
+                game_record.moves.append(MoveRecord(
+                    player=state.turn, dice=(d1, d2), play=play))
             state = switch_turn(next_state)
         else:
+            if game_record is not None:
+                game_record.moves.append(MoveRecord(
+                    player=state.turn, dice=(d1, d2), play=()))
             state = switch_turn(state)
 
-    return state.winner()
+    winner = state.winner()
+
+    if game_record is not None:
+        game_record.winner = winner
+        game_record.result = state.game_result()
+        return winner, game_record
+
+    return winner
 
 
 def _play_matches_worker(args):
@@ -89,14 +111,17 @@ def play_matches(
     agent2: Agent,
     num_games: int,
     print_progress: bool = True,
+    record: bool = False,
 ) -> Tuple[int, int]:
     """
     Play agent1 vs agent2 for num_games.
     Each game randomly assigns WHITE/BLACK (50/50 chance).
-    Returns (agent1_wins, agent2_wins).
+    Returns (agent1_wins, agent2_wins) or
+    (agent1_wins, agent2_wins, records) if record=True.
     """
     agent1_wins = 0
     agent2_wins = 0
+    records = [] if record else None
     start_time = time.time()
     progress_interval = max(100, num_games // 10)
 
@@ -104,14 +129,24 @@ def play_matches(
         # Randomly decide who goes first
         if random.random() < 0.5:
             # agent1 is WHITE, agent2 is BLACK
-            winner = play_game(agent1, agent2)
+            result = play_game(agent1, agent2, record=record)
+            if record:
+                winner, game_record = result
+                records.append(game_record)
+            else:
+                winner = result
             if winner == WHITE:
                 agent1_wins += 1
             else:
                 agent2_wins += 1
         else:
             # agent2 is WHITE, agent1 is BLACK
-            winner = play_game(agent2, agent1)
+            result = play_game(agent2, agent1, record=record)
+            if record:
+                winner, game_record = result
+                records.append(game_record)
+            else:
+                winner = result
             if winner == WHITE:
                 agent2_wins += 1
             else:
@@ -125,6 +160,8 @@ def play_matches(
                 f"({elapsed:.1f}s)"
             )
 
+    if record:
+        return agent1_wins, agent2_wins, records
     return agent1_wins, agent2_wins
 
 
@@ -281,6 +318,12 @@ def main():
         default=1,
         help="Number of parallel workers (default: 1, sequential)",
     )
+    parser.add_argument(
+        "--save-games",
+        type=str,
+        default=None,
+        help="Directory to save games as .mat files (Jellyfish format for gnubg import)",
+    )
     args = parser.parse_args()
 
     # Override model2 if shorthand flags are set
@@ -317,15 +360,38 @@ def main():
     print()
 
     # Play all games with random first-mover assignment
+    save_games = args.save_games is not None
     if args.workers > 1:
-        model2_type = "random" if args.model2 == "random" else (
-            "gnubg" if args.model2 == "gnubg" else "model")
-        agent1_wins, agent2_wins = play_matches_parallel(
-            args.model1, args.model2, args.games,
-            workers=args.workers, model2_type=model2_type, plies=args.plies,
-        )
+        if save_games:
+            print("WARNING: --save-games not supported with --workers > 1, "
+                  "falling back to sequential play")
+            result = play_matches(agent1, agent2, args.games, record=True)
+            agent1_wins, agent2_wins, records = result
+        else:
+            model2_type = "random" if args.model2 == "random" else (
+                "gnubg" if args.model2 == "gnubg" else "model")
+            agent1_wins, agent2_wins = play_matches_parallel(
+                args.model1, args.model2, args.games,
+                workers=args.workers, model2_type=model2_type, plies=args.plies,
+            )
     else:
-        agent1_wins, agent2_wins = play_matches(agent1, agent2, args.games)
+        if save_games:
+            result = play_matches(agent1, agent2, args.games, record=True)
+            agent1_wins, agent2_wins, records = result
+        else:
+            agent1_wins, agent2_wins = play_matches(agent1, agent2, args.games)
+
+    # Save games as .mat files if requested
+    if save_games:
+        from gnubg_eval import export_mat
+        os.makedirs(args.save_games, exist_ok=True)
+        for i, rec in enumerate(records):
+            mat_content = export_mat(rec, game_id=i + 1)
+            mat_path = os.path.join(args.save_games, f"game_{i+1}.mat")
+            with open(mat_path, "w") as f:
+                f.write(mat_content)
+        print(f"Saved {len(records)} games to {args.save_games}/")
+
     total_games = agent1_wins + agent2_wins
     print()
 
