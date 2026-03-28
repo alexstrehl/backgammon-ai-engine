@@ -2,13 +2,13 @@
 
 A backgammon AI trained entirely through self-play [Reinforcement Learning](https://en.wikipedia.org/wiki/Reinforcement_learning).  The main approach is temporal difference learning with a neural network using Tesauro's original feature encoding (see [TD-Gammon](https://en.wikipedia.org/wiki/TD-Gammon)).  In addition to sampled Bellman backups, we implemented exact Bellman backups (sometimes called 1-ply backups), moving closer to an AlphaZero-style approach.  The framework supports multiprocessing and GPU acceleration to speed up training.  Currently it only covers 1-point matches (DMP) but we plan on extending to money games and match play.
 
-**Key result:** A 528k-parameter network achieves 51.2% win rate against gnubg 0-ply¹ (p=0.0004, 20k games) in 1-point matches
+**Key result:** A 528k-parameter network achieves 51.0% win rate against gnubg 0-ply¹ (p<0.0001, 1M games) in 1-point matches
 
 ## Current Models and Results
 
 | Model | Architecture | Params | vs gnubg 0-ply | Training | Date |
 |-------|-------------|--------|----------------|----------|------|
-| Best (1-ply VI) | [512,512,256,128] | 528k | **51.2%** (p=0.0004) | 1-ply value iteration refinement | 2026-03-26 |
+| Best (1-ply VI) | [512,512,256,128] | 528k | **51.0%** (p<0.0001, 1M games) | 1-ply value iteration refinement | 2026-03-26 |
 | Strong (1-ply VI) | [256,256,256] | 182k | 50.1% (tied) | 1-ply value iteration refinement | 2026-03-26 |
 
 The mEMG error rate is ~2.5 (gnubg 2-ply analysis) and the XG PR is 1.70 (XG++ analysis, 110 self-play games), placing the model in the "world class" range.
@@ -147,7 +147,7 @@ python gnubg_eval.py --model models/1ply_final.pt --games 1000 --gnubg /usr/game
 
 | Model | File | Win% vs gnubg 0-ply |
 |-------|------|---------------------|
-| Best | `best_models/td_batch_relu_512_512_256_128_1ply_vi_final.pt` | 51.2% |
+| Best | `best_models/td_batch_relu_512_512_256_128_1ply_vi_final.pt` | 51.0% |
 | Lighter | `best_models/td_batch_relu_256_256_256_1ply_vi_final.pt` | 50.1% |
 
 ## Key Findings
@@ -181,7 +181,7 @@ Inspired by and references:
 
 ---
 
-¹ Evaluated using [gnubg-nn](https://github.com/StonesAndDice/gnubg-nn-pypi) 1.1.0a6, which wraps GNU Backgammon's neural network (weights version 1.01, 1,097,867 bytes). Move generation was validated against gnubg-nn's own `moves()` function (100% agreement across tested positions).
+¹ Evaluated using [gnubg-nn](https://github.com/StonesAndDice/gnubg-nn-pypi) 1.1.0a6, which wraps GNU Backgammon's neural network (weights version 1.01, 1,097,867 bytes).
 
 ## License
 
