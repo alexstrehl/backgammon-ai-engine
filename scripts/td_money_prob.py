@@ -321,54 +321,39 @@ def train_batch(
 
 # ── Evaluation vs gnubg ───────────────────────────────────────────────────────
 
-def eval_vs_gnubg(network, num_games=10000, workers=1):
-    """Play money games vs gnubg-nn 0-ply, return equity/game."""
-    try:
-        import gnubg_nn
-    except ImportError:
-        print("gnubg-nn not installed (pip install gnubg-nn)", flush=True)
-        return None
+def _board_to_gnubg(state):
+    """Convert BoardState to gnubg's 2x25 board format."""
+    white_board = [0] * 25
+    black_board = [0] * 25
+    for i in range(24):
+        v = state.points[i]
+        if v > 0:
+            white_board[i] = v
+        elif v < 0:
+            black_board[23 - i] = -v
+    white_board[24] = state.bar[WHITE]
+    black_board[24] = state.bar[BLACK]
+    if state.turn == WHITE:
+        return [black_board, white_board]
+    else:
+        return [white_board, black_board]
 
-    def _board_to_gnubg(state):
-        """Convert BoardState to gnubg's 2x25 board format."""
-        white_board = [0] * 25
-        black_board = [0] * 25
-        for i in range(24):
-            v = state.points[i]
-            if v > 0:
-                white_board[i] = v
-            elif v < 0:
-                black_board[23 - i] = -v
-        white_board[24] = state.bar[WHITE]
-        black_board[24] = state.bar[BLACK]
-        if state.turn == WHITE:
-            return [black_board, white_board]
-        else:
-            return [white_board, black_board]
 
-    def gnubg_choose(state, dice, plays):
-        """gnubg money-optimal move: minimize opponent's equity after switch_turn."""
-        best_eq = 999
-        best_play = plays[0]
-        for play, next_state in plays:
-            switched = switch_turn(next_state)
-            board = _board_to_gnubg(switched)
-            probs = gnubg_nn.probabilities(board, 0)
-            # probs = (P_win, P_wg, P_wbg, P_lg, P_lbg) from on-roll's view
-            w, wg, wbg, lg, lbg = probs
-            eq = w - (1 - w) + wg - lg + wbg - lbg  # opponent's equity
-            if eq < best_eq:
-                best_eq = eq
-                best_play = (play, next_state)
-        return best_play
+def _eval_worker(args):
+    """Worker for parallel eval vs gnubg."""
+    os.environ["OMP_NUM_THREADS"] = "1"
+    state_dict, hidden_sizes, input_size, activation, num_games, start_as_white = args
+
+    import gnubg_nn
+    network = ProbNet(hidden_sizes, input_size, activation)
+    network.load_state_dict(state_dict)
+    network.eval()
 
     eq_total = 0.0
     for i in range(num_games):
         state = BoardState.initial()
-        if i % 2 == 0:
-            my_color = WHITE
-        else:
-            my_color = BLACK
+        my_color = WHITE if (start_as_white + i) % 2 == 0 else BLACK
+        if my_color == BLACK:
             state = switch_turn(state)
 
         while not state.is_game_over():
@@ -381,23 +366,63 @@ def eval_vs_gnubg(network, num_games=10000, workers=1):
                     idx = torch.argmin(eq).item()
                     _, next_state = plays[idx]
                 else:
-                    _, next_state = gnubg_choose(state, (d1, d2), plays)
+                    # gnubg money-optimal
+                    best_eq = 999
+                    best_next = plays[0][1]
+                    for play, ns in plays:
+                        switched = switch_turn(ns)
+                        board = _board_to_gnubg(switched)
+                        probs = gnubg_nn.probabilities(board, 0)
+                        w, wg, wbg, lg, lbg = probs
+                        eq_val = w - (1 - w) + wg - lg + wbg - lbg
+                        if eq_val < best_eq:
+                            best_eq = eq_val
+                            best_next = ns
+                    next_state = best_next
                 state = switch_turn(next_state)
             else:
                 state = switch_turn(state)
 
         result = state.game_result()
-        winner = state.winner()
-        if winner == my_color:
+        if state.winner() == my_color:
             eq_total += result
         else:
             eq_total -= result
 
-        if (i + 1) % max(1, num_games // 5) == 0:
-            print(f"  {i+1}/{num_games}: eq/game = {eq_total/(i+1):.4f}", flush=True)
+    return eq_total, num_games
 
-    eq_per_game = eq_total / num_games
-    print(f"\nResult: {num_games} games, eq/game = {eq_per_game:.4f}", flush=True)
+
+def eval_vs_gnubg(network, num_games=10000, workers=1):
+    """Play money games vs gnubg-nn 0-ply, return equity/game."""
+    try:
+        import gnubg_nn
+    except ImportError:
+        print("gnubg-nn not installed (pip install gnubg-nn)", flush=True)
+        return None
+
+    print(f"Evaluating vs gnubg-nn 0-ply ({num_games} games, {workers} workers)...",
+          flush=True)
+
+    if workers > 1:
+        state_dict = network.state_dict()
+        splits = _split(num_games, workers)
+        args_list = [
+            (state_dict, network.hidden_sizes, network.input_size,
+             network.activation, n, i)
+            for i, n in enumerate(splits)
+        ]
+        ctx = mp.get_context('spawn')
+        with ctx.Pool(workers) as pool:
+            results = pool.map(_eval_worker, args_list)
+        eq_total = sum(r[0] for r in results)
+        total_games = sum(r[1] for r in results)
+    else:
+        eq_total, total_games = _eval_worker(
+            (network.state_dict(), network.hidden_sizes, network.input_size,
+             network.activation, num_games, 0))
+
+    eq_per_game = eq_total / total_games
+    print(f"\nResult: {total_games} games, eq/game = {eq_per_game:.4f}", flush=True)
     return eq_per_game
 
 
@@ -427,7 +452,7 @@ if __name__ == "__main__":
     if args.eval_gnubg > 0:
         if network is None:
             parser.error("--eval-gnubg requires --resume")
-        eval_vs_gnubg(network, num_games=args.eval_gnubg)
+        eval_vs_gnubg(network, num_games=args.eval_gnubg, workers=args.workers)
     else:
         train_batch(
             num_episodes=args.episodes, hidden_sizes=args.hidden,
