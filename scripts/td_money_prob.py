@@ -1,18 +1,19 @@
 """
-td_money_prob.py -- Batch TD(0) cubeless money training with 5 probability outputs.
+td_money_prob196.py -- Batch TD(0) cubeless money training with 5 probability outputs.
 
 Uses the standard 196-feature perspective encoding (no cube features).
 Designed to work with the base backgammon-ai-engine codebase.
 
-Outputs (all sigmoid, from on-roll player's perspective):
+Outputs (from on-roll player's perspective):
   0: P(win)
-  1: P(gammon | win)
-  2: P(backgammon | win)
-  3: P(gammon | loss)
-  4: P(backgammon | loss)
+  1: P(win gammon)
+  2: P(win backgammon)
+  3: P(lose gammon)
+  4: P(lose backgammon)
 
 Equity derived as:
-  eq = P(win) * (1 + P(g|w) + P(bg|w)) - (1 - P(win)) * (1 + P(g|l) + P(bg|l))
+  eq = P(win) - P(lose) + P(wg) - P(lg) + P(wbg) - P(lbg)
+     = 2*P(win) + P(wg) + P(wbg) - P(lg) - P(lbg) - 1
 
 Move selection: pick the move that maximizes derived equity (from mover's
 perspective, which means minimizing opponent's equity after switch_turn).
@@ -43,13 +44,15 @@ NUM_FEATURES = 196
 class ProbNet(nn.Module):
     """5-output probability network for cubeless money games."""
 
-    def __init__(self, hidden_sizes=None, input_size=NUM_FEATURES, activation="relu"):
+    def __init__(self, hidden_sizes=None, input_size=NUM_FEATURES, activation="relu",
+                 raw_logits=False):
         super().__init__()
         if hidden_sizes is None:
             hidden_sizes = [80]
         self.hidden_sizes = hidden_sizes
         self.input_size = input_size
         self.activation = activation
+        self.raw_logits = raw_logits
         act_fn = {"relu": nn.ReLU, "leaky_relu": nn.LeakyReLU,
                   "tanh": nn.Tanh, "sigmoid": nn.Sigmoid}[activation]
 
@@ -63,13 +66,17 @@ class ProbNet(nn.Module):
         self.head = nn.Linear(prev, NUM_OUTPUTS)
 
     def forward(self, x):
-        return torch.sigmoid(self.head(self.trunk(x)))
+        raw = self.head(self.trunk(x))
+        if self.raw_logits:
+            return raw
+        return torch.sigmoid(raw)
 
     def save(self, path):
         torch.save({
             "model_type": "prob5",
             "hidden_sizes": self.hidden_sizes,
             "input_size": self.input_size,
+            "raw_logits": self.raw_logits,
             "activation": self.activation,
             "state_dict": self.state_dict(),
         }, path)
@@ -153,7 +160,8 @@ class ProbNet(nn.Module):
     @classmethod
     def load(cls, path):
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        net = cls(ckpt["hidden_sizes"], ckpt["input_size"], ckpt["activation"])
+        net = cls(ckpt["hidden_sizes"], ckpt["input_size"], ckpt["activation"],
+                  raw_logits=ckpt.get("raw_logits", False))
         net.load_state_dict(ckpt["state_dict"])
         return net
 
@@ -161,23 +169,10 @@ class ProbNet(nn.Module):
 # ── Equity from probabilities ─────────────────────────────────────────────────
 
 def prob_to_equity(p):
-    """Convert 5 conditional probability outputs to equity.
-
-    Outputs: P(win), P(g|w), P(bg|w), P(g|l), P(bg|l)
-    """
-    win = p[..., 0]
-    win_mult = 1 + p[..., 1] + p[..., 2]
-    loss_mult = 1 + p[..., 3] + p[..., 4]
-    return win * win_mult - (1 - win) * loss_mult
-
-
-def prob_to_equity_absolute(p):
-    """Convert 5 absolute probability outputs to equity.
+    """Convert 5 probability outputs to money equity.
 
     Outputs: P(win), P(wg), P(wbg), P(lg), P(lbg)
     Equity = 2*P(win) + P(wg) + P(wbg) - P(lg) - P(lbg) - 1
-
-    Credit: Øystein Schønning-Johansen
     """
     money_weight = torch.tensor([2, 1, 1, -1, -1], dtype=p.dtype, device=p.device)
     if p.ndim == 1:
@@ -186,7 +181,7 @@ def prob_to_equity_absolute(p):
 
 
 def postprocess(prediction):
-    """Enforce logical consistency on absolute probability outputs.
+    """Enforce logical consistency on probability outputs.
 
     Ensures: P(wg) <= P(win), P(lg) <= P(lose),
              P(wbg) <= P(wg), P(lbg) <= P(lg)
@@ -209,22 +204,13 @@ def postprocess(prediction):
     return prediction
 
 
-# Move selection mode. The TD targets are identical for both modes — the
-# network learns the same values regardless. The --absolute flag only changes
-# how outputs are converted to equity for move selection (during self-play
-# and eval). Existing models can be used with either mode without retraining.
-_use_absolute = False
-_use_postprocess = True
-
-
 def value_state(network, x):
     """Evaluate positions, returning equity."""
     with torch.no_grad():
         pred = network(x)
-        if _use_absolute:
-            if _use_postprocess:
-                pred = postprocess(pred)
-            return prob_to_equity_absolute(pred)
+        if network.raw_logits:
+            pred = torch.sigmoid(pred)
+        pred = postprocess(pred)
         return prob_to_equity(pred)
 
 
@@ -254,51 +240,109 @@ for d1 in range(1, 7):
         _DICE.append(((d1, d2), 1/36 if d1 == d2 else 2/36))
 
 
-def oneply_target(state, network, encode_fn, _get_legal_plays, _switch_turn):
+def oneply_target(state, network, encode_fn, _get_legal_plays, _switch_turn,
+                  device="cpu"):
     """Compute 1-ply target: exact expectation over all 21 dice outcomes.
 
-    For each dice, find the best move (by equity), evaluate the resulting
-    position, flip perspective, and average weighted by dice probability.
+    Batches all positions across all 21 dice into a single forward pass
+    for GPU efficiency.
     Returns 5-element numpy array.
     """
+    # Per-dice data: best move (post-switch) state info, plus probability
+    dice_data = []  # list of (prob, mode, payload) where mode is 'pass'/'plays'
+    pass_encs = []
+    play_encs_per_dice = []  # list of (start_idx, count, terminal_results, plays_states)
+
     target = np.zeros(NUM_OUTPUTS, dtype=np.float32)
 
-    for dice, prob in _DICE:
+    # Collect all encodings to batch
+    pass_indices = []  # (dice_idx, "pass")
+    play_indices = []  # (dice_idx, move_idx_within_dice)
+    all_pass_encs = []
+    all_play_encs = []
+    dice_plays_info = {}  # dice_idx -> (terminal_eqs_or_None_per_move, plays_states)
+
+    for dice_idx, (dice, prob) in enumerate(_DICE):
         plays = _get_legal_plays(state, dice)
         if not plays:
-            # No legal moves: position unchanged, opponent on roll
             switched = _switch_turn(state)
             if switched.is_game_over():
-                # Mover (opponent) wins
                 t = terminal_target(switched)
-                # But this is from opponent's view — flip to ours
                 target += prob * flip_target(t)
             else:
-                with torch.no_grad():
-                    x = torch.tensor(encode_fn(switched), dtype=torch.float32)
-                    v = network(x).numpy()
-                target += prob * flip_target(v)
+                pass_indices.append(dice_idx)
+                all_pass_encs.append(encode_fn(switched))
         else:
-            # Pick best move by equity
-            encoded = np.stack([encode_fn(_switch_turn(s)) for _, s in plays])
-            eq = value_state(network, torch.tensor(encoded, dtype=torch.float32))
-            idx = torch.argmin(eq).item()
-            _, next_state = plays[idx]
-            switched = _switch_turn(next_state)
+            switched_states = [_switch_turn(s) for _, s in plays]
+            move_terminals = []
+            for m_idx, sw in enumerate(switched_states):
+                if sw.is_game_over():
+                    # Mover wins (we picked the move)
+                    move_terminals.append(np.array([
+                        1.0,
+                        float(sw.game_result() >= 2),
+                        float(sw.game_result() >= 3),
+                        0.0, 0.0], dtype=np.float32))
+                else:
+                    move_terminals.append(None)
+                    play_indices.append((dice_idx, m_idx))
+                    all_play_encs.append(encode_fn(sw))
+            dice_plays_info[dice_idx] = (move_terminals, switched_states)
 
-            if switched.is_game_over():
-                mover = 1 - switched.turn  # who made the move
-                t = np.array([1.0,
-                              float(switched.game_result() >= 2),
-                              float(switched.game_result() >= 3),
-                              0.0, 0.0], dtype=np.float32)
-                # t is from mover's view = our view (we picked the move)
-                target += prob * t
-            else:
-                with torch.no_grad():
-                    x = torch.tensor(encode_fn(switched), dtype=torch.float32)
-                    v = network(x).numpy()
-                target += prob * flip_target(v)
+    # Batch forward pass
+    play_outputs = None
+    pass_outputs = None
+    if all_play_encs or all_pass_encs:
+        all_encs = all_play_encs + all_pass_encs
+        x = torch.tensor(np.stack(all_encs), dtype=torch.float32, device=device)
+        with torch.no_grad():
+            out = network(x)
+            if network.raw_logits:
+                out = torch.sigmoid(out)
+            # For move selection we use derived equity (single value per move)
+            # For target we need the 5 probability outputs (flipped)
+            out_np = out.cpu().numpy()
+        n_play = len(all_play_encs)
+        play_outputs = out_np[:n_play]  # (n_play, 5)
+        pass_outputs = out_np[n_play:]  # (n_pass, 5)
+
+    # Compute equity from outputs for move selection
+    def _eq_from_probs(probs_arr):
+        # Use absolute formula: eq = 2*P(win) + P(wg) + P(wbg) - P(lg) - P(lbg) - 1
+        return 2 * probs_arr[..., 0] + probs_arr[..., 1] + probs_arr[..., 2] \
+               - probs_arr[..., 3] - probs_arr[..., 4] - 1
+
+    # Process passes
+    pass_iter = iter(range(len(pass_indices)))
+    pass_lookup = {}
+    for i, dice_idx in enumerate(pass_indices):
+        pass_lookup[dice_idx] = pass_outputs[i]
+
+    # Process plays: build per-dice arrays
+    play_lookup = {}  # (dice_idx, move_idx) -> 5-vector
+    for i, (dice_idx, move_idx) in enumerate(play_indices):
+        play_lookup[(dice_idx, move_idx)] = play_outputs[i]
+
+    for dice_idx, (dice, prob) in enumerate(_DICE):
+        if dice_idx in dice_plays_info:
+            move_terminals, switched_states = dice_plays_info[dice_idx]
+            # For each move: get either terminal target or flipped network output
+            move_targets = []  # 5-vectors from our perspective
+            for m_idx, term in enumerate(move_terminals):
+                if term is not None:
+                    move_targets.append(term)
+                else:
+                    v_next = play_lookup[(dice_idx, m_idx)]
+                    move_targets.append(flip_target(v_next))
+            move_targets_arr = np.stack(move_targets)
+            # Pick move with best equity (highest, since these are from our view)
+            equities = _eq_from_probs(move_targets_arr)
+            best_idx = int(np.argmax(equities))
+            target += prob * move_targets_arr[best_idx]
+        elif dice_idx in pass_lookup:
+            v_next = pass_lookup[dice_idx]
+            target += prob * flip_target(v_next)
+        # else: terminal pass already added above
 
     return target
 
@@ -317,12 +361,14 @@ def _try_import_c_engine():
         return None
 
 
-def collect_data(network, num_games, encode_fn, eng=None, oneply=False):
+def collect_data(network, num_games, encode_fn, eng=None, oneply=False,
+                 teacher=None, oneply_device="cpu"):
     """Play self-play games, return (encodings, targets) arrays.
 
     With oneply=True, targets are exact 1-ply Bellman backups (averaged over
     all 21 dice) computed at the current state before the move.
     With oneply=False, targets bootstrap from the next state after the move.
+    If teacher is provided, it is used for move selection instead of network.
     """
     all_enc, all_tgt = [], []
     _switch_turn = eng.switch_turn if eng else switch_turn
@@ -341,15 +387,28 @@ def collect_data(network, num_games, encode_fn, eng=None, oneply=False):
             if oneply:
                 # 1-ply: exact Bellman backup at current state
                 all_tgt.append(oneply_target(
-                    state, network, encode_fn, _get_legal_plays, _switch_turn))
+                    state, network, encode_fn, _get_legal_plays, _switch_turn,
+                    device=oneply_device))
 
-            # Play a move (same for both modes)
+            # Play a move — use teacher for move selection if provided
             d1, d2 = random.randint(1, 6), random.randint(1, 6)
             plays = _get_legal_plays(state, (d1, d2))
             if plays:
                 encoded = np.stack([encode_fn(_switch_turn(s)) for _, s in plays])
-                eq = value_state(network, torch.tensor(encoded, dtype=torch.float32))
-                idx = torch.argmin(eq).item()
+                if teacher is not None:
+                    with torch.no_grad():
+                        # Teacher may use 199 features (cubeful encoder)
+                        t_input = torch.tensor(encoded, dtype=torch.float32)
+                        if teacher.input_size > encoded.shape[-1]:
+                            # Append cubeless cube features [1,0,0]
+                            pad = torch.zeros(len(encoded), teacher.input_size - encoded.shape[-1])
+                            pad[:, 0] = 1.0
+                            t_input = torch.cat([t_input, pad], dim=1)
+                        eq = teacher(t_input)
+                    idx = torch.argmin(eq).item()
+                else:
+                    eq = value_state(network, torch.tensor(encoded, dtype=torch.float32))
+                    idx = torch.argmin(eq).item()
                 _, next_state = plays[idx]
                 state = _switch_turn(next_state)
             else:
@@ -369,17 +428,20 @@ def collect_data(network, num_games, encode_fn, eng=None, oneply=False):
 
 
 def _collect_worker(state_dict, hidden_sizes, input_size, activation, num_games,
-                    use_absolute=False, use_postprocess=True, oneply=False):
+                    oneply=False, teacher_path=None):
     os.environ["OMP_NUM_THREADS"] = "1"
-    import td_money_prob as _mod
-    _mod._use_absolute = use_absolute
-    _mod._use_postprocess = use_postprocess
     network = ProbNet(hidden_sizes, input_size, activation)
     network.load_state_dict(state_dict)
     network.eval()
+    teacher = None
+    if teacher_path:
+        from model import TDNetwork
+        teacher = TDNetwork.load(teacher_path)
+        teacher.eval()
     eng = _try_import_c_engine()
     enc_fn = eng.encode_state if eng else encode_state
-    return collect_data(network, num_games, enc_fn, eng=eng, oneply=oneply)
+    return collect_data(network, num_games, enc_fn, eng=eng, oneply=oneply,
+                        teacher=teacher)
 
 
 def _split(total, n):
@@ -394,7 +456,7 @@ def train_batch(
     lr=1e-3, end_lr=None, games_per_cycle=1000, batch_size=256,
     save_path=None, save_every=10_000, print_every=1_000,
     network=None, workers=1, device="cpu", pw_weight=1.0, use_mse=False,
-    oneply=False,
+    oneply=False, teacher_path=None,
 ):
     if network is None:
         if hidden_sizes is None:
@@ -405,8 +467,16 @@ def train_batch(
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
 
     optimizer = torch.optim.Adam(network.parameters(), lr=lr)
-    base_loss_fn = nn.MSELoss() if use_mse else nn.BCELoss()
-    loss_fn_name = "MSE" if use_mse else "BCE"
+    _raw_logits = network.raw_logits if network else False
+    if _raw_logits:
+        base_loss_fn = nn.BCEWithLogitsLoss()
+        loss_fn_name = "BCEWithLogits"
+    elif use_mse:
+        base_loss_fn = nn.MSELoss()
+        loss_fn_name = "MSE"
+    else:
+        base_loss_fn = nn.BCELoss()
+        loss_fn_name = "BCE"
     loss_weights = torch.tensor([pw_weight, 1, 1, 1, 1], dtype=torch.float32)
 
     print(f"Prob5 batch TD(0), cubeless money (196 features)", flush=True)
@@ -442,14 +512,20 @@ def train_batch(
                 state_dict = network.state_dict()
                 splits = _split(batch_games, workers)
                 args_list = [(state_dict, network.hidden_sizes, network.input_size,
-                              network.activation, n, _use_absolute, _use_postprocess, oneply) for n in splits]
+                              network.activation, n, oneply, teacher_path) for n in splits]
                 results = pool.starmap(_collect_worker, args_list)
                 encodings = np.concatenate([r[0] for r in results])
                 targets = np.concatenate([r[1] for r in results])
             else:
                 eng = _try_import_c_engine()
                 enc_fn = eng.encode_state if eng else encode_state
-                encodings, targets = collect_data(network, batch_games, enc_fn, eng=eng, oneply=oneply)
+                teacher = None
+                if teacher_path:
+                    from model import TDNetwork
+                    teacher = TDNetwork.load(teacher_path)
+                    teacher.eval()
+                encodings, targets = collect_data(network, batch_games, enc_fn, eng=eng,
+                                                  oneply=oneply, teacher=teacher)
             t_collect = time.perf_counter() - t0
 
             total_played += batch_games
@@ -469,7 +545,10 @@ def train_batch(
                 idx = perm[i:i+batch_size]
                 pred = network(x_all[idx])
                 tgt = y_all[idx]
-                if use_mse:
+                if _raw_logits:
+                    per_loss = torch.stack([nn.functional.binary_cross_entropy_with_logits(
+                        pred[:, j], tgt[:, j]) for j in range(NUM_OUTPUTS)])
+                elif use_mse:
                     per_loss = torch.stack([nn.functional.mse_loss(
                         pred[:, j], tgt[:, j]) for j in range(NUM_OUTPUTS)])
                 else:
@@ -482,7 +561,10 @@ def train_batch(
                 total_loss += loss.item()
                 with torch.no_grad():
                     for j in range(NUM_OUTPUTS):
-                        if use_mse:
+                        if _raw_logits:
+                            per_output_loss[j] += nn.functional.binary_cross_entropy_with_logits(
+                                pred[:, j], y_all[idx, j]).item()
+                        elif use_mse:
                             per_output_loss[j] += nn.functional.mse_loss(
                                 pred[:, j], y_all[idx, j]).item()
                         else:
@@ -562,10 +644,7 @@ def _board_to_gnubg(state):
 def _eval_worker(args):
     """Worker for parallel eval vs gnubg."""
     os.environ["OMP_NUM_THREADS"] = "1"
-    state_dict, hidden_sizes, input_size, activation, num_games, start_as_white, use_absolute, use_postprocess = args
-    import td_money_prob as _mod
-    _mod._use_absolute = use_absolute
-    _mod._use_postprocess = use_postprocess
+    state_dict, hidden_sizes, input_size, activation, num_games, start_as_white = args
 
     import gnubg_nn
     network = ProbNet(hidden_sizes, input_size, activation)
@@ -629,7 +708,7 @@ def eval_vs_gnubg(network, num_games=10000, workers=1):
         splits = _split(num_games, workers)
         args_list = [
             (state_dict, network.hidden_sizes, network.input_size,
-             network.activation, n, i, _use_absolute, _use_postprocess)
+             network.activation, n, i)
             for i, n in enumerate(splits)
         ]
         ctx = mp.get_context('spawn')
@@ -640,7 +719,7 @@ def eval_vs_gnubg(network, num_games=10000, workers=1):
     else:
         eq_total, total_games = _eval_worker(
             (network.state_dict(), network.hidden_sizes, network.input_size,
-             network.activation, num_games, 0, _use_absolute, _use_postprocess))
+             network.activation, num_games, 0))
 
     eq_per_game = eq_total / total_games
     print(f"\nResult: {total_games} games, eq/game = {eq_per_game:.4f}", flush=True)
@@ -674,17 +753,13 @@ if __name__ == "__main__":
                         help="Use MSE loss instead of BCE")
     parser.add_argument("--oneply", action="store_true",
                         help="Use 1-ply exact Bellman backups for targets")
-    parser.add_argument("--absolute", action="store_true",
-                        help="Use absolute probability equity formula")
-    parser.add_argument("--no-postprocess", action="store_true",
-                        help="Disable postprocess clipping (only relevant with --absolute)")
+    parser.add_argument("--raw-logits", action="store_true",
+                        help="Remove sigmoid, output raw logits (train with MSE)")
+    parser.add_argument("--teacher", type=str, default=None,
+                        help="Path to equity model for move selection during training")
     parser.add_argument("--eval-gnubg", type=int, default=0, metavar="N",
                         help="Evaluate vs gnubg-nn 0-ply for N money games (requires gnubg-nn)")
     args = parser.parse_args()
-
-    import td_money_prob as _mod
-    _mod._use_absolute = args.absolute
-    _mod._use_postprocess = not args.no_postprocess
 
     # Load / expand / create network
     load_opts = [args.resume, args.expand, args.expand_depth]
@@ -709,6 +784,11 @@ if __name__ == "__main__":
               f"({sum(p.numel() for p in source.parameters())} -> "
               f"{sum(p.numel() for p in network.parameters())} params)", flush=True)
 
+    # Switch to raw logits mode if requested
+    if args.raw_logits and network is not None:
+        network.raw_logits = True
+        print(f"  raw_logits mode enabled (no sigmoid)", flush=True)
+
     if args.eval_gnubg > 0:
         if network is None:
             parser.error("--eval-gnubg requires --resume")
@@ -722,5 +802,5 @@ if __name__ == "__main__":
             print_every=args.print_every, network=network,
             workers=args.workers, device=args.device,
             pw_weight=args.pw_weight, use_mse=args.mse,
-            oneply=args.oneply,
+            oneply=args.oneply, teacher_path=args.teacher,
         )
