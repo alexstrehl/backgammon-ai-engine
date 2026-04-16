@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the C backgammon engine as a shared library (Linux/macOS).
+# Build the C backgammon engine as a shared library.
 set -e
 
 echo "Building libbg_engine.so ..."

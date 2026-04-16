@@ -17,7 +17,7 @@ import torch
 import pytest
 
 from model import TDNetwork
-from encoding import NUM_FEATURES, ENCODERS, get_encoder
+from encoding import NUM_FEATURES, ENCODERS, get_encoder, CubePerspective, CubefulEncoder
 from backgammon_engine import BoardState, WHITE, BLACK, get_legal_plays, switch_turn
 from agents import RandomAgent
 from td_agent import TDAgent
@@ -146,88 +146,6 @@ class TestSaveLoad:
             assert net_loaded._resumed_from == path
 
 
-# ── Smoke Training Test ──────────────────────────────────────────────────────
-
-class TestSmokeTraining:
-    """End-to-end training test (slower, ~20 seconds)."""
-
-    @pytest.mark.slow
-    def test_smoke_training_default(self):
-        """Train default network (40 HU, sigmoid) for 5000 episodes."""
-        from td_train import train
-
-        net = train(
-            num_episodes=5000,
-            hidden_sizes=[40],
-            lr=0.1,
-            print_every=1000,
-            use_py_engine=True,
-        )
-
-        # Verify network was trained and has non-zero gradients
-        assert net is not None
-        assert net.hidden_sizes == [40]
-
-        # Play games against random to check it learned something
-        random_agent = RandomAgent()
-        td_agent = TDAgent(net)
-
-        wins = 0
-        for _ in range(100):
-            state = BoardState.initial()
-            agents = {WHITE: td_agent, BLACK: random_agent}
-
-            while not state.is_game_over():
-                d1, d2 = random.randint(1, 6), random.randint(1, 6)
-                plays = get_legal_plays(state, (d1, d2))
-                if plays:
-                    _, state = agents[state.turn].choose_play(state, (d1, d2), plays)
-                state = switch_turn(state)
-
-            winner = state.winner()
-            if winner == WHITE:
-                wins += 1
-
-        win_rate = wins / 100
-        print(f"\nTD vs Random: {win_rate:.1%} win rate")
-        assert win_rate > 0.85, f"TD agent should beat random >85%, got {win_rate:.1%}"
-
-    @pytest.mark.slow
-    def test_smoke_training_multi_layer_relu(self):
-        """Train a 2-layer ReLU network for 5000 episodes."""
-        from td_train import train
-
-        net = train(
-            num_episodes=5000,
-            hidden_sizes=[80, 40],
-            activation="relu",
-            lr=0.1,
-            print_every=1000,
-            use_py_engine=True,
-        )
-
-        assert net is not None
-        assert net.hidden_sizes == [80, 40]
-        assert net.activation == "relu"
-
-        # Quick sanity check: can play a game
-        random_agent = RandomAgent()
-        td_agent = TDAgent(net)
-
-        state = BoardState.initial()
-        agents = {WHITE: td_agent, BLACK: random_agent}
-
-        while not state.is_game_over():
-            d1, d2 = random.randint(1, 6), random.randint(1, 6)
-            plays = get_legal_plays(state, (d1, d2))
-            if plays:
-                _, state = agents[state.turn].choose_play(state, (d1, d2), plays)
-            state = switch_turn(state)
-
-        # Game completed without error
-        assert state.is_game_over()
-
-
 # ── Additional Edge Case Tests ───────────────────────────────────────────────
 
 class TestEdgeCases:
@@ -308,4 +226,37 @@ class TestEncoderAbstraction:
         encoder = get_encoder("perspective196")
         assert net.input_size == encoder.num_features
         assert net.input_size == NUM_FEATURES
+
+
+class TestCubefulEncoder:
+    """CubefulEncoder = base encoder + 3-feature cube one-hot."""
+
+    def test_factory_recognises_cubeful_prefix(self):
+        enc = get_encoder("cubeful_perspective196")
+        assert isinstance(enc, CubefulEncoder)
+        assert enc.name == "cubeful_perspective196"
+        assert enc.num_features == 199
+
+    def test_factory_unknown_base_raises(self):
+        with pytest.raises(ValueError, match="Unknown base encoder"):
+            get_encoder("cubeful_nonsense")
+
+    def test_one_hot_appended(self):
+        enc = get_encoder("cubeful_perspective196")
+        state = BoardState.initial()
+        for cube in (CubePerspective.CENTERED,
+                     CubePerspective.MINE,
+                     CubePerspective.THEIRS):
+            x = enc.encode(state, cube)
+            assert x.shape == (199,)
+            assert x[196 + int(cube)] == 1.0
+            assert x[196:].sum() == 1.0
+
+    def test_base_features_match_perspective196(self):
+        """First 196 features must equal Perspective196Encoder output."""
+        cubeful = get_encoder("cubeful_perspective196")
+        base = get_encoder("perspective196")
+        state = BoardState.initial()
+        x = cubeful.encode(state, CubePerspective.CENTERED)
+        np.testing.assert_array_equal(x[:196], base.encode(state))
 

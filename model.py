@@ -37,7 +37,10 @@ def _get_activation_fn(name: str):
 class TDNetwork(nn.Module):
     """Feedforward network for backgammon value estimation.
 
-    Output is a single scalar in [0, 1] representing a win probability.
+    Supports two output modes:
+      - "probability": sigmoid → P(on-roll player wins) ∈ [0, 1]
+      - "equity": linear → expected payoff ∈ [-3, +3]
+
     Supports multiple hidden layers and configurable activation functions.
     """
 
@@ -47,9 +50,11 @@ class TDNetwork(nn.Module):
         input_size: int = None,
         activation: str = "relu",
         encoder_name: str = "perspective196",
+        output_mode: str = "probability",
     ):
         super().__init__()
         self.encoder_name = encoder_name
+        self.output_mode = output_mode
         if input_size is None:
             from encoding import get_encoder
             input_size = get_encoder(encoder_name).num_features
@@ -71,7 +76,6 @@ class TDNetwork(nn.Module):
 
         self._n_hidden = len(hidden_sizes)
 
-        # Output layer: always sigmoid for win probability
         self.fc_output = nn.Linear(prev_size, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -82,7 +86,10 @@ class TDNetwork(nn.Module):
             h = x
             for layer in self.hidden_layers:
                 h = self._activation_fn(layer(h))
-        return torch.sigmoid(self.fc_output(h)).squeeze(-1)
+        raw = self.fc_output(h).squeeze(-1)
+        if self.output_mode == "equity":
+            return raw
+        return torch.sigmoid(raw)
 
     # ── Save / Load ──────────────────────────────────────────────────
 
@@ -93,6 +100,7 @@ class TDNetwork(nn.Module):
             "input_size": self.input_size,
             "activation": self.activation,
             "encoder_name": self.encoder_name,
+            "output_mode": self.output_mode,
             "state_dict": self.state_dict(),
         }
         if train_params:
@@ -109,6 +117,7 @@ class TDNetwork(nn.Module):
             input_size=checkpoint.get("input_size", NUM_FEATURES),
             activation=checkpoint.get("activation", "relu"),
             encoder_name=checkpoint.get("encoder_name", "perspective196"),
+            output_mode=checkpoint.get("output_mode", "probability"),
         )
 
         model.load_state_dict(checkpoint["state_dict"])
@@ -120,10 +129,15 @@ class TDNetwork(nn.Module):
     def width_expand(cls, source: "TDNetwork", new_hidden_sizes: List[int]) -> "TDNetwork":
         """Create a wider network initialized from a narrower one.
 
-        Copies weights from *source* into the first N units of each layer
-        in the new network.  New units get Kaiming-initialized input weights
-        and zero output weights, so the expanded network is functionally
-        identical to *source* at initialization.
+        Inspired by Net2Net (Chen, Goodfellow & Shlens, 2015;
+        https://arxiv.org/abs/1511.05641). Same number of hidden layers;
+        each layer can have more (not fewer) units, so the old model is
+        embedded as a subgraph. Weights corresponding to the embedded
+        old model are copied exactly. Weights that are inputs to new
+        units get random Kaiming initialization (PyTorch default). All
+        other new weights (new units to old units, or final output
+        weights of new units) are zeroed. With no training the new
+        model behaves identically to the old.
 
         Args:
             source: The smaller trained network to expand from.
@@ -150,6 +164,7 @@ class TDNetwork(nn.Module):
             input_size=source.input_size,
             activation=source.activation,
             encoder_name=source.encoder_name,
+            output_mode=source.output_mode,
         )
 
         with torch.no_grad():
@@ -222,6 +237,7 @@ class TDNetwork(nn.Module):
             input_size=source.input_size,
             activation=source.activation,
             encoder_name=source.encoder_name,
+            output_mode=source.output_mode,
         )
 
         with torch.no_grad():

@@ -3,7 +3,7 @@
 import random
 from backgammon_engine import (
     BoardState, WHITE, BLACK, BAR, OFF, NUM_CHECKERS,
-    get_legal_plays, switch_turn,
+    get_legal_plays, opening_roll, switch_turn,
 )
 
 
@@ -94,3 +94,40 @@ def test_random_rollout():
         if plays:
             _, state = random.choice(plays)
         state = switch_turn(state)
+
+
+# ── opening_roll ─────────────────────────────────────────────────────
+
+
+def test_opening_roll_no_doublets():
+    """opening_roll never returns doublets — they should be rerolled."""
+    rng = random.Random(0)
+    for _ in range(500):
+        _, (d1, d2) = opening_roll(rng)
+        assert d1 != d2, f"opening_roll returned doublet ({d1},{d2})"
+        assert 1 <= d1 <= 6 and 1 <= d2 <= 6
+        assert d1 >= d2, "opening_roll should return (high, low)"
+
+
+def test_opening_roll_starts_at_initial_position():
+    """The state returned should be the standard starting position with
+    only the turn possibly differing from BoardState.initial()."""
+    rng = random.Random(7)
+    state, _ = opening_roll(rng)
+    canonical = BoardState.initial()
+    assert state.points == canonical.points
+    assert state.bar == canonical.bar
+    assert state.off == canonical.off
+    assert state.turn in (WHITE, BLACK)
+
+
+def test_opening_roll_picks_both_players_over_time():
+    """Over many calls each player should sometimes go first."""
+    rng = random.Random(123)
+    counts = {WHITE: 0, BLACK: 0}
+    for _ in range(500):
+        state, _ = opening_roll(rng)
+        counts[state.turn] += 1
+    assert counts[WHITE] > 100 and counts[BLACK] > 100, (
+        f"unbalanced opening rolls: {counts}"
+    )

@@ -1,5 +1,12 @@
 /*
- * bg_engine.h -- Backgammon engine: board state, move generation, encoding.
+ * bg_engine.h (v2) -- Backgammon engine: board state, move generation, encoding.
+ *
+ * v2 differs from v1 (../c_engine/) in ONE convention: get_legal_plays
+ * switches the turn on every resulting_state before returning, so
+ * plays[i].resulting_state.turn is the OPPONENT of the original
+ * state.turn. This preserves the BoardState invariant that .turn
+ * always means "the player whose turn it is to act next" — no more
+ * post-call switching by the caller.
  *
  * Designed to be called from Python via ctypes.
  * All functions use simple C types and pre-allocated buffers.

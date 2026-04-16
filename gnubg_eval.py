@@ -75,17 +75,29 @@ class MoveRecord:
 
 
 @dataclass
+class CubeRecord:
+    """A cube action (double / take / drop)."""
+    player: int                # who acted
+    action: str                # "double", "take", or "drop"
+    new_cube_value: int = 2    # cube value after doubling (for "double")
+
+
+@dataclass
 class GameRecord:
-    """A complete recorded game."""
-    moves: List[MoveRecord] = field(default_factory=list)
+    """A complete recorded game. `moves` may interleave MoveRecord
+    and CubeRecord entries when the game is cubeful.
+    """
+    moves: List = field(default_factory=list)
     winner: Optional[int] = None
     result: Optional[int] = None   # 1=normal, 2=gammon, 3=backgammon
+    cube_value: int = 1            # final cube value (cubeful only)
+    ended_by_drop: bool = False    # True if game ended on a drop
 
 
 def play_and_record(agent_white, agent_black) -> GameRecord:
-    """Play a full game, recording every dice roll and move.
+    """Play a full cubeless game, recording every dice roll and move.
 
-    Both agents should implement choose_play(state, dice, plays).
+    Both agents should implement choose_checker_action(state, dice, plays).
     """
     state = BoardState.initial()
     record = GameRecord()
@@ -96,13 +108,14 @@ def play_and_record(agent_white, agent_black) -> GameRecord:
 
         if plays:
             agent = agent_white if state.turn == WHITE else agent_black
-            play, next_state = agent.choose_play(state, (d1, d2), plays)
+            play, next_state = agent.choose_checker_action(state, (d1, d2), plays)
             record.moves.append(MoveRecord(
                 player=state.turn,
                 dice=(d1, d2),
                 play=play,
             ))
-            state = switch_turn(next_state)
+            # next_state already has turn switched (engine convention)
+            state = next_state
         else:
             # No legal moves -- record the dice roll with empty play
             record.moves.append(MoveRecord(
@@ -114,6 +127,91 @@ def play_and_record(agent_white, agent_black) -> GameRecord:
 
     record.winner = state.winner()
     record.result = state.game_result()
+    return record
+
+
+def play_and_record_cubeful(
+    agent_white, agent_black, jacoby: bool = True,
+) -> GameRecord:
+    """Play a full cubeful money game, recording dice, moves, and
+    cube actions. Both agents must be cubeful TDAgents supporting
+    offer_double / respond_to_double / choose_checker_action_cubeful.
+    """
+    from modes import MatchState, CubeOwner, cube_perspective  # local
+
+    state = BoardState.initial()
+    record = GameRecord()
+    match_state = MatchState(jacoby=jacoby)
+
+    while not state.is_game_over():
+        player = state.turn
+        agent = agent_white if player == WHITE else agent_black
+        opp_agent = agent_black if player == WHITE else agent_white
+
+        # ── Cube decision ─────────────────────────────────────
+        if match_state.can_offer(player):
+            offer = agent.offer_double(state, match_state)
+            if offer.should_double:
+                new_cube_value = match_state.cube_value * 2
+                record.moves.append(CubeRecord(
+                    player=player, action="double",
+                    new_cube_value=new_cube_value,
+                ))
+                # Opponent responds; self-play threads the cache through,
+                # inter-agent play gives no hint (opponent recomputes).
+                hint = offer if opp_agent is agent else None
+                takes = opp_agent.respond_to_double(
+                    state, match_state, hint=hint,
+                )
+                opponent = 1 - player
+                if takes:
+                    record.moves.append(CubeRecord(
+                        player=opponent, action="take",
+                        new_cube_value=new_cube_value,
+                    ))
+                    match_state = match_state.after_take(player)
+                else:
+                    record.moves.append(CubeRecord(
+                        player=opponent, action="drop",
+                        new_cube_value=new_cube_value,
+                    ))
+                    record.winner = player
+                    record.result = 1
+                    record.cube_value = match_state.cube_value  # pre-double
+                    record.ended_by_drop = True
+                    return record
+
+        # ── Checker play ──────────────────────────────────────
+        d1, d2 = random.randint(1, 6), random.randint(1, 6)
+        result = agent.choose_checker_action_cubeful(
+            state, (d1, d2), match_state,
+        )
+        if result is not None:
+            next_state, _bootstrap = result
+            # Find the matching Play object (engine gives us both).
+            plays = get_legal_plays(state, (d1, d2))
+            play = ()
+            for p, s in plays:
+                if s == next_state:
+                    play = p
+                    break
+            record.moves.append(MoveRecord(
+                player=player, dice=(d1, d2), play=play,
+            ))
+            state = next_state
+        else:
+            record.moves.append(MoveRecord(
+                player=player, dice=(d1, d2), play=(),
+            ))
+            state = switch_turn(state)
+
+    record.winner = state.winner()
+    raw_result = state.game_result()
+    # Jacoby: gammons/bgs only count if cube has been turned.
+    if jacoby and match_state.cube_owner == CubeOwner.CENTERED:
+        raw_result = 1
+    record.result = raw_result
+    record.cube_value = match_state.cube_value
     return record
 
 
@@ -150,52 +248,133 @@ def _dice_str(dice: Tuple[int, int]) -> str:
     return f"{dice[0]}{dice[1]}"
 
 
-def export_mat(record: GameRecord, game_id: int = 1) -> str:
+def export_mat(
+    record: GameRecord, game_id: int = 1, money_game: bool = False,
+) -> str:
     """Export a GameRecord to Jellyfish .mat format string.
 
-    The .mat format pairs White and Black moves on the same line:
-        31: 8/5 6/5                  42: 24/20 13/11
+    Cubeless: pairs white/black moves per line. `money_game=False`
+    writes a "1 point match" header.
+
+    Cubeful: same pairing but cube actions (Doubles/Takes/Drops) are
+    interleaved into the appropriate columns following gnubg's
+    left-to-right reading order. `money_game=True` writes a "0 point
+    match" header (= money game).
     """
     lines = []
 
-    # Header — minimal, matching gnubg's own export format
+    # Header
     lines.append("")
-    lines.append(" 1 point match")
+    lines.append(" 0 point match" if money_game else " 1 point match")
     lines.append("")
-    lines.append(" Game 1")
+    lines.append(f" Game {game_id}")
     lines.append(" white : 0                      black : 0")
 
-    # Pair up moves: white's turn then black's turn per line
-    white_moves = []
-    black_moves = []
+    # Rows are [left_col, right_col] (left=WHITE, right=BLACK).
+    rows: List[List[str]] = []
 
-    for mr in record.moves:
-        notation = _play_notation(mr.play, mr.player)
-        dice = _dice_str(mr.dice)
-        move_str = f"{dice}: {notation}" if notation else f"{dice}: "
+    def _ensure_row(idx: int) -> None:
+        while len(rows) <= idx:
+            rows.append(["", ""])
 
-        if mr.player == WHITE:
-            white_moves.append(move_str)
+    w_next = 0  # next row index where WHITE can write to the left col
+    b_next = 0  # next row index where BLACK can write to the right col
+
+    i = 0
+    entries = record.moves
+    while i < len(entries):
+        entry = entries[i]
+
+        if isinstance(entry, CubeRecord) and entry.action == "double":
+            dbl_str = f" Doubles => {entry.new_cube_value}"
+            # Consume the following response (take/drop) entry, if any.
+            resp_str = ""
+            if i + 1 < len(entries) and isinstance(entries[i + 1], CubeRecord):
+                resp = entries[i + 1]
+                resp_str = " Takes" if resp.action == "take" else " Drops"
+                i += 1
+
+            if entry.player == WHITE:
+                # WHITE doubles (left col) + response (right col) on SAME row.
+                row = w_next
+                _ensure_row(row)
+                rows[row][0] = dbl_str
+                rows[row][1] = resp_str
+                w_next = row + 1
+                b_next = max(b_next, row + 1)
+            else:
+                # BLACK doubles: double on right col of current row, response
+                # on left col of NEXT row (gnubg reads left-to-right).
+                row = b_next
+                _ensure_row(row)
+                rows[row][1] = dbl_str
+                b_next = row + 1
+                resp_row = max(w_next, b_next)
+                _ensure_row(resp_row)
+                rows[resp_row][0] = resp_str
+                w_next = resp_row + 1
+                b_next = max(b_next, resp_row)
+
+        elif isinstance(entry, MoveRecord):
+            notation = _play_notation(entry.play, entry.player)
+            dice = _dice_str(entry.dice)
+            s = f"{dice}: {notation}" if notation else f"{dice}: "
+
+            if entry.player == WHITE:
+                _ensure_row(w_next)
+                rows[w_next][0] = s
+                w_next += 1
+            else:
+                _ensure_row(b_next)
+                rows[b_next][1] = s
+                b_next += 1
+                w_next = max(w_next, b_next)
+
+        i += 1
+
+    # Winner detection
+    winner = record.winner
+    if winner is None:
+        for entry in reversed(record.moves):
+            if isinstance(entry, MoveRecord):
+                winner = entry.player
+                break
+        if winner is None:
+            winner = WHITE
+
+    # Points awarded
+    cube = record.cube_value
+    result_mult = record.result if record.result else 1
+    points = cube if record.ended_by_drop else cube * result_mult
+    point_word = "point" if points == 1 else "points"
+    wins_str = f"Wins {points} {point_word}"
+
+    # For drops, place the "Wins" text alongside the drop marker in
+    # the same row so gnubg reads it correctly.
+    drop_wins_separate = False
+    if record.ended_by_drop and rows:
+        last = rows[-1]
+        if last[0] and not last[1]:
+            last[1] = f" {wins_str}"
+        elif not last[0] and last[1]:
+            last[0] = f" {wins_str}"
+        elif last[0] and last[1]:
+            last[1] = last[1] + f"  {wins_str}"
         else:
-            black_moves.append(move_str)
+            drop_wins_separate = True
 
-    # Interleave into numbered paired lines (gnubg format)
-    max_pairs = max(len(white_moves), len(black_moves))
-    for i in range(max_pairs):
-        w = white_moves[i] if i < len(white_moves) else ""
-        b = black_moves[i] if i < len(black_moves) else ""
-        num = f"{i+1:>3d})"
+    for idx, (w, b) in enumerate(rows):
+        num = f"{idx + 1:>3d})"
         if b:
             lines.append(f"{num} {w:<33s}{b}")
         else:
             lines.append(f"{num} {w}")
 
-    # Game result — gnubg format: indented, on the winner's side
-    winner = record.moves[-1].player if record.moves else WHITE
-    if winner == BLACK:
-        lines.append(f"                                  Wins 1 point")
-    else:
-        lines.append(f"  Wins 1 point")
+    if not record.ended_by_drop or drop_wins_separate:
+        if winner == BLACK:
+            lines.append(f"                                  {wins_str}")
+        else:
+            lines.append(f"      {wins_str}")
     lines.append("")
 
     return "\n".join(lines)
@@ -269,12 +448,15 @@ def run_gnubg_analysis(
             timeout=timeout_secs,
         )
     except FileNotFoundError:
-        print(f"ERROR: gnubg not found at '{gnubg_cmd}'")
-        print("Install gnubg or set GNUBG_CMD in gnubg_eval.py")
-        return []
+        raise FileNotFoundError(
+            f"gnubg not found at '{gnubg_cmd}'. "
+            f"Install gnubg or set GNUBG_CMD in gnubg_eval.py."
+        )
     except subprocess.TimeoutExpired:
-        print(f"ERROR: gnubg timed out after {timeout_secs} seconds")
-        return []
+        raise TimeoutError(
+            f"gnubg timed out after {timeout_secs}s analyzing "
+            f"{len(mat_files)} games."
+        )
 
     # Dump raw output for debugging
     output = result.stdout + result.stderr
@@ -302,10 +484,11 @@ def run_gnubg_analysis(
             continue
 
         # Extract the two mEMG values: the numbers immediately
-        # BEFORE each parenthesized percentage.
-        # Pattern: "-201.4   (-10.069%)" -> we want 201.4
+        # BEFORE each parenthesized companion value.
+        # Match-play (MWC) format: "-201.4   (-10.069%)" -> 201.4
+        # Cubeful money (Points) format: "-4.0   ( -0.008)" -> 4.0
         mEMG_values = re.findall(
-            r"([-+]?\d+\.?\d*)\s*\(\s*[-+]?\d+\.\d+%\s*\)", line
+            r"([-+]?\d+\.?\d*)\s*\(\s*[-+]?\d+\.\d+%?\s*\)", line
         )
         if len(mEMG_values) >= 2:
             white_err = abs(float(mEMG_values[0]))
@@ -325,7 +508,12 @@ def run_gnubg_analysis(
 def _play_games_worker(args):
     """Worker function for parallel game generation.
     Each worker loads the model once and plays many games."""
-    model_path, num_games, work_dir, start_idx = args
+    if len(args) == 4:
+        model_path, num_games, work_dir, start_idx = args
+        cubeful = False
+        jacoby = True
+    else:
+        model_path, num_games, work_dir, start_idx, cubeful, jacoby = args
 
     os.environ["OMP_NUM_THREADS"] = "1"
     from model import TDNetwork
@@ -337,8 +525,11 @@ def _play_games_worker(args):
     mat_files = []
     for i in range(num_games):
         game_id = start_idx + i
-        record = play_and_record(agent, agent)
-        mat_content = export_mat(record, game_id=game_id)
+        if cubeful:
+            record = play_and_record_cubeful(agent, agent, jacoby=jacoby)
+        else:
+            record = play_and_record(agent, agent)
+        mat_content = export_mat(record, game_id=game_id, money_game=cubeful)
         mat_path = os.path.join(work_dir, f"game_{game_id}.mat")
         with open(mat_path, "w") as f:
             f.write(mat_content)
@@ -368,6 +559,8 @@ def evaluate_with_gnubg(
     work_dir: Optional[str] = None,
     keep_files: bool = False,
     verbose: bool = True,
+    cubeful: bool = False,
+    jacoby: bool = True,
 ) -> dict:
     """Play games, export to .mat, analyze with gnubg, return error rates.
 
@@ -399,11 +592,16 @@ def evaluate_with_gnubg(
     records = []
     mat_files = []
     for i in range(num_games):
-        record = play_and_record(agent_white, agent_black)
+        if cubeful:
+            record = play_and_record_cubeful(
+                agent_white, agent_black, jacoby=jacoby,
+            )
+        else:
+            record = play_and_record(agent_white, agent_black)
         records.append(record)
 
         # Export to .mat
-        mat_content = export_mat(record, game_id=i + 1)
+        mat_content = export_mat(record, game_id=i + 1, money_game=cubeful)
         mat_path = os.path.join(work_dir, f"game_{i+1}.mat")
         with open(mat_path, "w") as f:
             f.write(mat_content)
@@ -478,6 +676,8 @@ def evaluate_with_gnubg_parallel(
     workers: int = 1,
     gnubg_workers: int = 4,
     gnubg_chunk_size: int = 50,
+    cubeful: bool = False,
+    jacoby: bool = True,
 ) -> dict:
     """Parallel version: play games with multiple workers, analyze with multiple gnubg instances.
 
@@ -513,7 +713,9 @@ def evaluate_with_gnubg_parallel(
         for i in range(workers):
             n = num_games // workers + (1 if i < num_games % workers else 0)
             if n > 0:
-                games_per_worker.append((model_path, n, work_dir, start_idx))
+                games_per_worker.append(
+                    (model_path, n, work_dir, start_idx, cubeful, jacoby)
+                )
                 start_idx += n
 
         ctx = mp.get_context('spawn')
@@ -528,8 +730,11 @@ def evaluate_with_gnubg_parallel(
 
         mat_files = []
         for i in range(num_games):
-            record = play_and_record(agent, agent)
-            mat_content = export_mat(record, game_id=i + 1)
+            if cubeful:
+                record = play_and_record_cubeful(agent, agent, jacoby=jacoby)
+            else:
+                record = play_and_record(agent, agent)
+            mat_content = export_mat(record, game_id=i + 1, money_game=cubeful)
             mat_path = os.path.join(work_dir, f"game_{i+1}.mat")
             with open(mat_path, "w") as f:
                 f.write(mat_content)
@@ -625,7 +830,7 @@ def evaluate_with_gnubg_parallel(
 
 class _RandomAgent:
     """Picks a random legal play.  No torch dependency."""
-    def choose_play(self, state, dice, plays):
+    def choose_checker_action(self, state, dice, plays):
         return random.choice(plays)
 
 
@@ -661,6 +866,12 @@ if __name__ == "__main__":
                         help="Parallel gnubg analysis workers (default: 4)")
     parser.add_argument("--gnubg-chunk-size", type=int, default=50,
                         help="Games per gnubg analysis chunk (default: 50)")
+    parser.add_argument("--cubeful", action="store_true",
+                        help="Cubeful money game. Model must be a cubeful "
+                             "agent (cubeful_perspective196 encoder).")
+    parser.add_argument("--jacoby", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Jacoby rule for cubeful (default: on).")
     args = parser.parse_args()
 
     if args.random:
@@ -715,6 +926,8 @@ if __name__ == "__main__":
             workers=args.workers,
             gnubg_workers=args.gnubg_workers,
             gnubg_chunk_size=args.gnubg_chunk_size,
+            cubeful=args.cubeful,
+            jacoby=args.jacoby,
         )
     else:
         results = evaluate_with_gnubg(
@@ -723,4 +936,6 @@ if __name__ == "__main__":
             gnubg_cmd=args.gnubg,
             work_dir=args.work_dir,
             keep_files=args.keep_files,
+            cubeful=args.cubeful,
+            jacoby=args.jacoby,
         )

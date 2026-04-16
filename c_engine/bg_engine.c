@@ -884,7 +884,15 @@ static int play_uses_die(const Play *play, const BoardState *original, int die) 
     return dst == src + direction * die;
 }
 
-/* ── Public: get_legal_plays ───────────────────────────────────── */
+/* ── Public: get_legal_plays ───────────────────────────────────── *
+ *
+ * NOTE (v2 wart-free convention): unlike the v1 c_engine, this
+ * version switches the turn on every resulting_state before
+ * returning. After this call, plays[i].resulting_state.turn is the
+ * OPPONENT of state.turn — i.e. "the next player to act," which
+ * preserves the BoardState invariant that .turn always means "the
+ * player whose turn it is to act next".
+ */
 
 int get_legal_plays(const BoardState *state, int d1, int d2,
                     Play *plays, int max_plays) {
@@ -957,6 +965,13 @@ int get_legal_plays(const BoardState *state, int d1, int d2,
         }
     }
 
+    /* v2 wart-free convention: switch the turn on every resulting
+     * state before returning. After this loop the on-roll player at
+     * resulting_state[i] is the OPPONENT of the original mover. */
+    for (i = 0; i < out_count; i++) {
+        plays[i].resulting_state.turn = 1 - plays[i].resulting_state.turn;
+    }
+
     return out_count;
 }
 
@@ -967,14 +982,10 @@ int get_legal_plays_encoded(const BoardState *state, int d1, int d2,
                             float *encoded_features) {
     int count = get_legal_plays(state, d1, d2, plays, max_plays);
 
-    /* Encode resulting states with SWITCHED TURN for move evaluation.
-     * After a move, it's the opponent's turn.  The perspective encoding
-     * needs the correct turn to produce the right player's view.
-     * We switch turn on a temporary copy, not the stored resulting_state. */
+    /* v2: get_legal_plays already switched the turn on resulting_state,
+     * so we can encode each one directly — no temporary switch needed. */
     for (int i = 0; i < count; i++) {
-        BoardState switched = plays[i].resulting_state;
-        switched.turn = 1 - switched.turn;
-        encode_state(&switched,
+        encode_state(&plays[i].resulting_state,
                      encoded_features + i * NUM_FEATURES);
     }
 
@@ -993,10 +1004,9 @@ int get_legal_plays_encoded_210(const BoardState *state, int d1, int d2,
                                 float *encoded_features) {
     int count = get_legal_plays(state, d1, d2, plays, max_plays);
 
+    /* v2: resulting_state is already switched. */
     for (int i = 0; i < count; i++) {
-        BoardState switched = plays[i].resulting_state;
-        switched.turn = 1 - switched.turn;
-        encode_state_210(&switched,
+        encode_state_210(&plays[i].resulting_state,
                          encoded_features + i * NUM_FEATURES_210);
     }
 
@@ -1010,10 +1020,9 @@ int get_legal_plays_encoded_224(const BoardState *state, int d1, int d2,
                                 float *encoded_features) {
     int count = get_legal_plays(state, d1, d2, plays, max_plays);
 
+    /* v2: resulting_state is already switched. */
     for (int i = 0; i < count; i++) {
-        BoardState switched = plays[i].resulting_state;
-        switched.turn = 1 - switched.turn;
-        encode_state_224(&switched,
+        encode_state_224(&plays[i].resulting_state,
                          encoded_features + i * NUM_FEATURES_224);
     }
 
@@ -1025,10 +1034,9 @@ int get_legal_plays_encoded_246(const BoardState *state, int d1, int d2,
                                 float *encoded_features) {
     int count = get_legal_plays(state, d1, d2, plays, max_plays);
 
+    /* v2: resulting_state is already switched. */
     for (int i = 0; i < count; i++) {
-        BoardState switched = plays[i].resulting_state;
-        switched.turn = 1 - switched.turn;
-        encode_state_246(&switched,
+        encode_state_246(&plays[i].resulting_state,
                          encoded_features + i * NUM_FEATURES_246);
     }
 

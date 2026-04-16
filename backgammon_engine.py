@@ -16,15 +16,17 @@ Internal storage:
     off    : list[int]  — [white_borne_off, black_borne_off]
     turn   : int        — WHITE (0) or BLACK (1)
 
-Simplification: WHITE always moves first. In real backgammon, the first
-player is determined by an opening roll. For single-game evaluation this
-doesn't matter (play_models.py randomizes which agent plays WHITE). For
-future match play, an opening roll mechanism should be added.
+`BoardState.initial()` returns a position with WHITE to move. For
+self-play training and matchplay where the opening must follow real
+backgammon rules, use `opening_roll(rng)` to draw a non-doublet
+opening and determine which player goes first.
 """
 
 from __future__ import annotations
 
 from typing import List, Tuple, Optional
+
+import numpy as np
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -44,7 +46,12 @@ Play = Tuple[Move, ...]         # a full turn (sequence of single moves)
 # ── Board state ──────────────────────────────────────────────────────────────
 
 class BoardState:
-    """Immutable-style backgammon board (call copy() before mutating)."""
+    """Immutable-style backgammon board (call copy() before mutating).
+
+    `.turn` = the player to act next. `get_legal_plays` returns
+    successors already turn-switched, so at a terminal state `.turn`
+    is the LOSER.
+    """
 
     __slots__ = ("points", "bar", "off", "turn")
 
@@ -424,7 +431,9 @@ def get_legal_plays(
     """Return every legal play for *state.turn* given *dice*.
 
     Each entry is ``(play, resulting_state)`` where *play* is a tuple
-    of ``(src, dst)`` single moves.  Results are deduplicated by
+    of ``(src, dst)`` single moves and ``resulting_state.turn`` is
+    already switched to the opponent (the next player to act).
+    Callers should NOT switch_turn again. Results are deduplicated by
     resulting board state.
 
     Rules enforced:
@@ -469,7 +478,29 @@ def get_legal_plays(
         if uses_big:
             filtered = uses_big
 
-    return filtered
+    # Switch turn on each result so .turn is the opponent (next to act).
+    return [(p, switch_turn(s)) for p, s in filtered]
+
+
+def get_legal_plays_encoded(state: BoardState, dice, encoder=None):
+    """Combined move generation + perspective encoding. Mirrors
+    `bg_fast.get_legal_plays_encoded` so callers use the same
+    signature regardless of which engine is active.
+
+    Returns `(features, next_states)`:
+      - features: (N, num_features) float32, perspective-encoded
+      - next_states: list of N BoardState objects (already switched)
+    """
+    # Lazy import to avoid a circular dep with encoding.py.
+    from encoding import get_encoder
+    if encoder is None:
+        encoder = get_encoder("perspective196")
+    plays = get_legal_plays(state, dice)
+    if not plays:
+        return np.empty((0, encoder.num_features), dtype=np.float32), []
+    next_states = [s for _, s in plays]
+    features = np.stack([encoder.encode(s) for s in next_states])
+    return features, next_states
 
 
 def _play_uses_die(play: Play, original: BoardState, die: int) -> bool:
@@ -518,4 +549,33 @@ def move_label(move: Move) -> str:
 def play_label(play: Play) -> str:
     """Human-readable label for a full play."""
     return "  ".join(move_label(m) for m in play)
+
+
+def opening_roll(rng=None) -> Tuple[BoardState, Tuple[int, int]]:
+    """Standard backgammon opening: each player rolls one die. The
+    higher die wins and uses both dice as the first move; doublets are
+    rerolled (you cannot start a game with a doublet).
+
+    Args:
+        rng: an object with a `randint(a, b)` method (a `random.Random`
+            instance, or the `random` module itself). Defaults to the
+            global `random` module.
+
+    Returns:
+        (state, dice) where state is the standard initial position with
+        `state.turn` set to the winner of the opening roll, and dice is
+        `(higher_die, lower_die)`.
+    """
+    if rng is None:
+        import random as _random
+        rng = _random
+    while True:
+        white_die = rng.randint(1, 6)
+        black_die = rng.randint(1, 6)
+        if white_die != black_die:
+            break
+    state = BoardState.initial()
+    state.turn = WHITE if white_die > black_die else BLACK
+    high, low = max(white_die, black_die), min(white_die, black_die)
+    return state, (high, low)
 

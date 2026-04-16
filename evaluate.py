@@ -39,13 +39,14 @@ def play_game(
 
         if plays:
             agent = agent_white if state.turn == WHITE else agent_black
-            play, next_state = agent.choose_play(state, (d1, d2), plays)
+            play, next_state = agent.choose_checker_action(state, (d1, d2), plays)
 
             if verbose:
                 side = "W" if state.turn == WHITE else "B"
                 print(f"  {side} rolls ({d1},{d2}): {play_label(play)}")
 
-            state = switch_turn(next_state)
+            # next_state already has turn switched (engine convention)
+            state = next_state
         else:
             if verbose:
                 side = "W" if state.turn == WHITE else "B"

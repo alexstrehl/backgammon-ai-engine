@@ -1,0 +1,34 @@
+Cubeful Money Model Log
+=======================
+
+Current Best: cubeful_money_512_512_256_256.pt
+  Architecture: [512, 512, 256, 256] — 562,433 parameters
+  Encoder: cubeful_perspective196 (199 inputs: 196 board + 3 cube one-hot)
+  Output: equity (linear, per-unit normalized to cube_value=1)
+  Activation: relu
+
+  Performance (0-ply, 100k games):
+    vs gnubg 0-ply cubeful: +24.1 mEq/game (p=0.016)
+    mEMG (self-play): ~3.3
+
+  Lineage (~63M total episodes):
+    [512,512] from scratch → depth-expand [512,512,256] → 16M 0-ply + 1-ply
+    → cubeful warm-start 35M with Boltzmann cube exploration + multiple
+    0-ply/1-ply cycles → depth-expand [512,512,256,256] → 10M+ 0-ply polish
+    + 1-ply cube refinement + 0-ply recovery.
+    All training: batch TD(0), Adam, C engine, GPU.
+
+Best 3-layer: cubeful_money_512_512_256.pt
+  Architecture: [512, 512, 256] — 496,641 parameters
+  Encoder: cubeful_perspective196 (199 inputs)
+  Output: equity, relu
+
+  Performance:
+    mEMG (self-play): ~3.7 (world class)
+    H2H vs 4-layer best: -21.3 mEq/game (200k games, significant)
+
+  Lineage (~26.5M total cubeful episodes):
+    [512,512] from scratch → depth-expand [512,512,256] → 26M cubeful
+    episodes with Boltzmann cube exploration (eps 0.05) throughout
+    → 500k 1-ply refinement (lr 1e-5→5e-6).
+    All training: batch TD(0), Adam, C engine.

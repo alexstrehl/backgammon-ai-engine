@@ -1,0 +1,73 @@
+DMP Model Training Log
+======================
+
+Model: dmp_512_512_256_256.pt  *** CURRENT BEST ***
+Architecture: [512, 512, 256, 256] — 560,897 parameters
+Encoder: perspective196 (196 inputs)
+Output: probability (sigmoid, P(win))
+Activation: relu
+
+Performance (0-ply play):
+  vs gnubg 0-ply (40k games): 51.6% (CI [51.1%, 52.1%], p<0.01)
+  vs td_batch_relu_512_512_256_128_1ply_vi_final (50k games): 50.4% (CI [49.9%, 50.8%], p=0.086)
+  vs random (10k games): 99.8%
+
+Training Lineage:
+  1. [80] from scratch — 1M eps, batch TD, adam lr=1e-3
+  2. Width-expand [80] -> [150] — 500k eps, adam lr=5e-5
+  3. Depth-expand [150] -> [150,150] — 500k eps, adam lr=5e-5
+  4. Width-expand [150,150] -> [256,256] — 1M eps, adam lr=5e-5
+  5. Width-expand [256,256] -> [512,512] — 1M eps, adam lr=5e-5, GPU
+  6. Depth-expand [512,512] -> [512,512,256] — 3M eps, adam lr=5e-5->5e-6
+  7. Continue 0-ply — 3M eps, adam lr=2.5e-5->2.5e-6
+  8. 1-ply + polish — 500k 1-ply + 500k polish -> saved as dmp_512_512_256.pt
+  9. Depth-expand [512,512,256] -> [512,512,256,256] — 3M eps, adam lr=5e-5->5e-6
+  10-19. Multiple cycles of 0-ply continuation (3-10M eps) + 1-ply + polish
+         with progressively halving LR (1e-4 down to 1.25e-5).
+  Total: ~49M (0-ply) + ~2.5M (1-ply) = ~51.5M episodes
+  All training: batch TD(0), Adam, C engine, GPU.
+
+======================================================================
+
+Model: dmp_512_512_256.pt
+Architecture: [512, 512, 256] — 496,641 parameters
+Encoder: perspective196 (196 inputs)
+Output: probability (sigmoid, P(win))
+Activation: relu
+
+Performance (0-ply play):
+  vs gnubg 0-ply: 50.7% (from step 8 above)
+
+Lineage: steps 1-8 of dmp_512_512_256_256 lineage above.
+
+======================================================================
+
+Model: dmp_256_256_256.pt
+Architecture: [256, 256, 256] — 182,273 parameters
+Encoder: perspective196 (196 inputs)
+Output: probability (sigmoid, P(win))
+Activation: relu
+
+Performance (0-ply play):
+  vs gnubg 0-ply: 50.1% (tied)
+  vs dmp_512_512_256_256 (50k games): 49.5% (p=0.019)
+
+Lineage:
+  [80] from scratch → width-expand [150] → depth-expand [150,150]
+  → width-expand [256,256] → depth-expand [256,256,256] → 1-ply refinement.
+  Total: ~7M episodes.
+
+Note: Most parameter-efficient model. 182k params achieves 50.1% vs gnubg.
+
+======================================================================
+
+Model: td_batch_relu_512_512_256_128_1ply_vi_final.pt (legacy)
+Architecture: [512, 512, 256, 128] — 528,385 parameters
+Encoder: perspective196 (196 inputs)
+Output: probability (sigmoid, P(win))
+Activation: relu
+
+Performance (0-ply play):
+  vs gnubg 0-ply: 51.0% (1M games)
+
+Note: Original best model from initial release. Referenced in README.
