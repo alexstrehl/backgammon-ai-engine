@@ -8,8 +8,10 @@ construction, the resume path, and a vs-Random eval helper.
 import argparse
 import random
 
+import torch
 from agents import RandomAgent
 from backgammon_engine import BoardState, WHITE, get_legal_plays, switch_turn
+from encoding import CubefulEncoder
 from model import TDNetwork
 from modes import CubefulMoneyMode, CubelessMoneyMode, DMPMode
 
@@ -42,10 +44,14 @@ def build_network(args) -> TDNetwork:
     when resuming or expanding (CLI overrides are ignored with a warning).
     """
     # Mutual exclusivity guard
-    sources = [args.resume, args.expand, args.expand_depth]
+    warm_start_eq = getattr(args, "warm_start_equity", None)
+    warm_start_cf = getattr(args, "warm_start_cubeful", None)
+    sources = [args.resume, args.expand, args.expand_depth,
+               warm_start_eq, warm_start_cf]
     if sum(1 for s in sources if s) > 1:
         raise ValueError(
-            "--resume, --expand, and --expand-depth are mutually exclusive"
+            "--resume, --expand, --expand-depth, --warm-start-equity, "
+            "and --warm-start-cubeful are mutually exclusive"
         )
 
     if args.resume:
@@ -89,11 +95,103 @@ def build_network(args) -> TDNetwork:
         )
         return net
 
+    if warm_start_eq:
+        keep_output = getattr(args, "keep_output_layer", False)
+        net = _warm_start_equity(warm_start_eq, reinit_output=not keep_output)
+        return net
+
+    if warm_start_cf:
+        net = _warm_start_cubeful(warm_start_cf)
+        return net
+
     return TDNetwork(
         hidden_sizes=parse_hidden_sizes(args.hidden),
         output_mode=args.output_mode,
         encoder_name=args.encoder,
     )
+
+
+def _warm_start_equity(path: str, reinit_output: bool = True) -> TDNetwork:
+    """Load a probability-output model and convert to equity output.
+
+    Copies all hidden layer weights. If reinit_output=True, re-initializes
+    the output layer; if False, copies the output layer weights as-is.
+    """
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    old_output = checkpoint.get("output_mode", "probability")
+    if old_output != "probability":
+        raise ValueError(
+            f"--warm-start-equity expects a probability-output model, "
+            f"got output_mode='{old_output}'. Use --resume for equity models."
+        )
+    old_hidden = checkpoint["hidden_sizes"]
+    old_input = checkpoint.get("input_size", 196)
+    old_activation = checkpoint.get("activation", "relu")
+    old_encoder = checkpoint.get("encoder_name", "perspective196")
+
+    net = TDNetwork(
+        hidden_sizes=old_hidden,
+        input_size=old_input,
+        activation=old_activation,
+        output_mode="equity",
+        encoder_name=old_encoder,
+    )
+
+    old_state = checkpoint.get("state_dict", checkpoint)
+    new_state = net.state_dict()
+
+    for key in new_state:
+        if "output" in key and reinit_output:
+            pass  # keep random init
+        elif key in old_state:
+            new_state[key] = old_state[key]
+
+    net.load_state_dict(new_state)
+    out_msg = "re-initialized" if reinit_output else "copied from source"
+    print(f"Warm-started equity from: {path}")
+    print(f"  Output: probability -> equity (output layer {out_msg})")
+    print(f"  Hidden: {old_hidden}, input: {old_input}, encoder: {old_encoder}")
+    return net
+
+
+def _warm_start_cubeful(path: str) -> TDNetwork:
+    """Load a 196-input model and extend to cubeful (199-input).
+
+    Copies the first 196 columns of the input layer from the pretrained
+    model. The 3 new columns (cube features) get Kaiming initialization.
+    Output mode is set to equity.
+    """
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    old_hidden = checkpoint["hidden_sizes"]
+    old_input = checkpoint.get("input_size", 196)
+    old_activation = checkpoint.get("activation", "relu")
+
+    encoder = CubefulEncoder()
+    new_input = encoder.num_features  # 199
+
+    net = TDNetwork(
+        hidden_sizes=old_hidden,
+        input_size=new_input,
+        activation=old_activation,
+        output_mode="equity",
+        encoder_name=encoder.name,
+    )
+
+    old_state = checkpoint.get("state_dict", checkpoint)
+    new_state = net.state_dict()
+
+    for key in new_state:
+        if key == "hidden_layers.0.weight":
+            old_weight = old_state[key]
+            new_state[key][:, :old_input] = old_weight
+        elif key in old_state:
+            new_state[key] = old_state[key]
+
+    net.load_state_dict(new_state)
+    print(f"Warm-started cubeful from: {path}")
+    print(f"  Input: {old_input} -> {new_input}, output -> equity")
+    print(f"  Hidden: {old_hidden}, encoder: {encoder.name}")
+    return net
 
 
 def eval_vs_random(agent, n_games: int = 200, seed: int = 99) -> float:
@@ -164,6 +262,19 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
                       help="Size of the new layer when using --expand-depth. "
                            "Defaults to the last hidden layer's size. Must be "
                            "<= the last hidden size (for identity init).")
+    g_io.add_argument("--warm-start-equity", default=None, metavar="PATH",
+                      help="Initialize an equity-output model from a "
+                           "probability-output (DMP) model. Copies hidden "
+                           "layers, re-initializes output head (unless "
+                           "--keep-output-layer is set).")
+    g_io.add_argument("--keep-output-layer", action="store_true",
+                      help="With --warm-start-equity: copy the output layer "
+                           "weights instead of re-initializing them.")
+    g_io.add_argument("--warm-start-cubeful", default=None, metavar="PATH",
+                      help="Initialize a cubeful money model from any "
+                           "196-input model (DMP or cubeless money). Extends "
+                           "input 196->199 (adds cube features), sets output "
+                           "to equity.")
     g_io.add_argument("--save", default=None,
                       help="Path to save the trained network at the end of the run.")
 

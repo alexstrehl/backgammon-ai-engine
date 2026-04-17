@@ -137,36 +137,45 @@ python train_batch.py --game-mode dmp \
 
 Training supports multiprocessing via `--workers` and GPU via `--device cuda`.
 
-### Cubeful Money Training
+### Cubeless Money Training
 
-The best cubeful money 3-layer model (`cubeful_money_512_512_256.pt`, 3.7 mEMG) was trained
-starting from the DMP [512,512] base and adding cubeful money game play with the doubling cube:
+Train a cubeless money model from an existing DMP model. The `--warm-start-equity` flag
+converts the DMP model's probability output to equity output (re-initializing the output
+layer) while preserving the hidden layer weights:
 
 ```bash
-# 1. Start from a DMP [512,512] model, depth-expand to [512,512,256]
-#    and train cubeful money
-python train_batch.py --game-mode cubeful-money \
-  --expand-depth models/dmp_512_512.pt --expand-depth-size 256 \
-  --num-episodes 3000000 --optimizer adam --lr 5e-5 --end-lr 5e-6 \
-  --warmup-cycles 20 --workers 48 --episodes-per-round 2000 \
-  --device cuda --save models/cubeful_512_512_256_3M.pt
-
-# 2. Continue 0-ply training (repeat for ~26M total cubeful episodes)
-python train_batch.py --game-mode cubeful-money \
-  --resume models/cubeful_512_512_256_3M.pt \
+# Warm-start from DMP [512,512,256] and train cubeless money
+python train_batch.py --game-mode cubeless-money \
+  --warm-start-equity best_models/dmp_512_512_256.pt \
   --num-episodes 10000000 --optimizer adam --lr 5e-5 --end-lr 5e-6 \
   --workers 48 --episodes-per-round 2000 \
-  --device cuda --save models/cubeful_512_512_256_continued.pt
+  --device cuda --save models/cubeless_money_512_512_256.pt
+```
 
-# 3. 1-ply refinement (exact Bellman backups for cubeful play)
+The DMP warm-start significantly accelerates cubeless money training.  Training from scratch is possible but we found it can lead to getting stuck in apparent plateaus (likely resolvable with enough training).
+
+### Cubeful Money Training
+
+Train a cubeful money model from a cubeless money model. The `--warm-start-cubeful` flag
+extends the 196-input model to 199 inputs (adding 3 cube one-hot features):
+
+```bash
+# 1. Warm-start from cubeless money model and train cubeful
 python train_batch.py --game-mode cubeful-money \
-  --resume models/cubeful_512_512_256_continued.pt \
+  --warm-start-cubeful models/cubeless_money_512_512_256.pt \
+  --num-episodes 10000000 --optimizer adam --lr 5e-5 --end-lr 5e-6 \
+  --warmup-cycles 20 --workers 48 --episodes-per-round 2000 \
+  --device cuda --save models/cubeful_512_512_256.pt
+
+# 2. 1-ply refinement (exact Bellman backups for cubeful play)
+python train_batch.py --game-mode cubeful-money \
+  --resume models/cubeful_512_512_256.pt \
   --num-episodes 500000 --oneply \
   --optimizer adam --lr 1e-5 --end-lr 5e-6 \
   --workers 48 --episodes-per-round 1000 \
   --device cuda --save models/cubeful_512_512_256_1ply.pt
 
-# 4. Low-LR polish to recover network strength after 1-ply
+# 3. Low-LR polish to recover network strength after 1-ply
 python train_batch.py --game-mode cubeful-money \
   --resume models/cubeful_512_512_256_1ply.pt \
   --num-episodes 2000000 --optimizer adam --lr 2e-5 --end-lr 1e-6 \
@@ -174,11 +183,11 @@ python train_batch.py --game-mode cubeful-money \
   --device cuda --save models/cubeful_512_512_256_final.pt
 ```
 
-The key differences from DMP training: cubeful models use 199 inputs (196 board + 3 cube one-hot
-features), equity output mode (linear, unbounded), and learn cube decisions (double/take/pass)
-alongside checker play.
+The full pipeline is: **DMP → cubeless money → cubeful money → 1-ply → polish**.
+Each stage warm-starts from the previous, so learned checker play transfers through.
 
-We observed that one-ply training would often complete without helping and sometimes even degrading model strength, but that if we followed it by a 0-ply low-LR training run, strength would improve.
+We observed that 1-ply training alone sometimes degrades model strength, but following
+it with a low-LR 0-ply polish reliably recovers and improves equity.
 
 ### Evaluate
 
@@ -256,7 +265,7 @@ Prints architecture, parameter count, encoder, and output mode for any saved `.p
 
 **Extra input features don't help.** We tested extended encodings (pip counts, game-phase gating, gnubg's 25 expert contact features) — none improved over the base 196-feature perspective encoding. The bottleneck is training signal quality, not input features.
 
-**DMP pre-training accelerates money game learning.** Initializing cubeful and cubeless money models from DMP-trained weights produces faster convergence and fewer plateaus than training from scratch, despite the different output representations (probability vs. equity).
+**Reusing weights from existing models helps.** Initializing the cubeless money model from DMP-trained weights produces faster convergence and fewer plateaus than training from scratch, despite the different output representations (probability vs. equity). Similarly when training a cubeful money model, initializing the weights based on a mature cubeless money model is helpful.
 
 **Supervised learning optimizations don't help.** Weight decay ({1e-3, 1e-4, 1e-5}), cosine annealing, and other regularization techniques had no effect on loss or playing strength.
 
