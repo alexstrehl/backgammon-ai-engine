@@ -53,7 +53,8 @@ int nn_load(NNModel *model, const char *path) {
     /* Header */
     if (fread(&model->num_hidden, 4, 1, f) != 1 ||
         fread(&model->input_size, 4, 1, f) != 1 ||
-        fread(&model->activation, 4, 1, f) != 1) {
+        fread(&model->activation, 4, 1, f) != 1 ||
+        fread(&model->output_mode, 4, 1, f) != 1) {
         fprintf(stderr, "nn_load: truncated header\n");
         fclose(f);
         return -1;
@@ -166,8 +167,9 @@ float nn_forward(const NNModel *model, const float *input) {
             if (L < model->num_hidden) {
                 out[i] = activate(sum);
             } else {
-                /* Output layer: always sigmoid */
-                out[i] = act_sigmoid(sum);
+                /* Output layer: sigmoid for probability, linear for equity */
+                out[i] = (model->output_mode == NN_OUTPUT_EQUITY)
+                         ? sum : act_sigmoid(sum);
             }
         }
 

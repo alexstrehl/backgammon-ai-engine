@@ -8,6 +8,7 @@ Binary format (.bin):
     int32:    num_hidden_layers
     int32:    input_size
     int32:    activation (0=relu, 1=sigmoid, 2=tanh, 3=leaky_relu)
+    int32:    output_mode (0=probability [sigmoid], 1=equity [linear])
     int32[]:  hidden_sizes (num_hidden_layers entries)
 
     Then for each layer (hidden_0 ... hidden_N-1, output):
@@ -37,6 +38,11 @@ ACTIVATION_MAP = {
     "leaky_relu": 3,
 }
 
+OUTPUT_MODE_MAP = {
+    "probability": 0,
+    "equity": 1,
+}
+
 
 def export_model(model_path: str, output_path: str):
     """Load a .pt TDNetwork and write binary weights."""
@@ -48,12 +54,15 @@ def export_model(model_path: str, output_path: str):
         raise ValueError(f"Unsupported activation '{model.activation}' for C export. "
                          f"Supported: {list(ACTIVATION_MAP.keys())}")
 
+    output_mode_id = OUTPUT_MODE_MAP.get(model.output_mode, 0)
+
     with open(output_path, "wb") as f:
         # Header
         f.write(b"BGNN")
         f.write(struct.pack("<i", len(model.hidden_sizes)))
         f.write(struct.pack("<i", model.input_size))
         f.write(struct.pack("<i", act_id))
+        f.write(struct.pack("<i", output_mode_id))
         for hs in model.hidden_sizes:
             f.write(struct.pack("<i", hs))
 
@@ -77,6 +86,7 @@ def export_model(model_path: str, output_path: str):
     print(f"Exported: {output_path}")
     print(f"  Architecture: [{model.input_size}] -> {model.hidden_sizes} -> [1]")
     print(f"  Activation: {model.activation}")
+    print(f"  Output mode: {model.output_mode}")
     print(f"  Parameters: {total_params:,}")
     print(f"  File size: {file_size:,} bytes ({file_size / 1024:.1f} KB)")
 

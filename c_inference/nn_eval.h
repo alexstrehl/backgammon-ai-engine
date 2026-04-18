@@ -18,10 +18,14 @@
 #define NN_ACTIVATION_TANH        2
 #define NN_ACTIVATION_LEAKY_RELU  3
 
+#define NN_OUTPUT_PROBABILITY     0   /* sigmoid output in [0,1] */
+#define NN_OUTPUT_EQUITY          1   /* linear output (unbounded) */
+
 typedef struct {
     int num_hidden;                     /* number of hidden layers */
     int input_size;
     int activation;
+    int output_mode;                    /* 0=probability, 1=equity */
     int hidden_sizes[NN_MAX_LAYERS];
 
     /* Per-layer weights and biases (num_hidden + 1 for output layer) */
@@ -47,8 +51,9 @@ int nn_load(NNModel *model, const char *path);
 void nn_free(NNModel *model);
 
 /*
- * Forward pass: input[input_size] -> returns scalar in [0,1].
- * For backgammon: output = P(on-roll player wins).
+ * Forward pass: input[input_size] -> returns scalar.
+ * For probability mode: output in [0,1] (sigmoid), P(on-roll player wins).
+ * For equity mode: output is unbounded (linear), expected equity.
  */
 float nn_forward(const NNModel *model, const float *input);
 
