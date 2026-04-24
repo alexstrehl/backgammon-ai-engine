@@ -37,7 +37,8 @@ enum {
 enum {
     FIBSBOARD_ERR_NOT_A_BOARD = -99,
     FIBSBOARD_ERR_INDEX_OUT_OF_BOUNDS = -98,
-    FIBSBOARD_ERR_OUT_OF_VALUES_TO_READ = -97
+    FIBSBOARD_ERR_OUT_OF_VALUES_TO_READ = -97,
+	FIBSBOARD_ERR_UNEXPECTED_ENDPTR = -96
 };
 
 /* Reading an integer from a fibsboard_string with some error checking. */
@@ -62,7 +63,8 @@ static inline int read_integer_from_fibsboard( const char *in, int index )
 	char *endptr;
 	int retval = (int) strtol( buf, &endptr, 10 );
 	// printf("DEBUG: At the enpointer I have '%c' \n", *endptr);
-	assert( *endptr == expected_endptr ); 
+	if( *endptr != expected_endptr )
+		return FIBSBOARD_ERR_UNEXPECTED_ENDPTR;
 	return retval;
 }
 #endif /* __FIBSBOARD_READER_H__ */
