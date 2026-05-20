@@ -37,7 +37,10 @@ import torch
 torch.set_num_threads(1)
 
 from td_agent import TDAgent
-from train_cli import add_common_args, build_mode, build_network, eval_vs_random
+from train_cli import (
+    add_common_args, build_mode, build_network, eval_vs_random,
+    resolve_save_path,
+)
 from trainer import Trainer
 
 
@@ -74,11 +77,40 @@ def main():
                          help="Compute training targets via 1-ply lookahead "
                               "(enumerate all 21 dice outcomes per state). "
                               "Lower variance, ~5-10x slower per turn. "
-                              "Move selection during collection stays at 0-ply.")
+                              "Move selection during collection stays at 0-ply "
+                              "unless --oneply-acting is also set.")
+    g_batch.add_argument("--oneply-acting", action="store_true",
+                         help="Use 1-ply move selection during episode "
+                              "collection (the agent picks moves via 1-ply "
+                              "lookahead). Implies --oneply for targets.")
+    g_batch.add_argument("--boltzmann-temp", type=float, default=0.0,
+                         help="Boltzmann temperature for checker play "
+                              "exploration. 0.0 (default) = greedy. "
+                              "Higher = more exploration.")
     g_batch.add_argument("--warmup-cycles", type=int, default=0,
                          help="Ramp LR from lr*0.1 up to scheduled lr over the "
                               "first N rounds. Useful when starting from a "
                               "depth-expanded model.")
+    g_batch.add_argument("--bf16-collect", action="store_true",
+                         help="Run 1-ply target NN forward in bf16 inside "
+                              "collection workers (~1.9x matmul speedup). "
+                              "Master training step stays fp32. Introduces "
+                              "~1e-3 numerical drift in 1-ply targets.")
+    g_batch.add_argument("--cube-targets-1ply", action="store_true",
+                         help="EXPERIMENTAL: in --oneply training mode, use "
+                              "value_oneply_checker_cubeful() for cube-decision "
+                              "targets (pure 1-ply, conceptually a deeper "
+                              "search). Default uses the 0-ply formula "
+                              "(evaluate_cubeful at is_cube_action=False) for "
+                              "cube targets, which empirically gives much "
+                              "better cube_mEMG. No effect without --oneply.")
+    g_batch.add_argument("--save-every", type=int, default=0, metavar="N",
+                         help="Checkpoint at the first round boundary on "
+                              "or after every N episodes (effective "
+                              "granularity is max(N, --episodes-per-round)). "
+                              "Saves to {--save}_ep{episodes}.pt; final "
+                              "save still goes to --save. 0 disables; "
+                              "requires --save.")
 
     parser.add_argument("--log-every", type=int, default=1,
                         help="Print recent batch loss every N rounds (0 to disable).")
@@ -107,7 +139,11 @@ def main():
         torch.manual_seed(args.torch_seed)
 
     net = build_network(args)
-    agent = TDAgent(net, device=args.device)
+    # --oneply-acting implies --oneply for targets
+    if args.oneply_acting:
+        args.oneply = True
+    agent = TDAgent(net, device=args.device, oneply=args.oneply_acting,
+                    boltzmann_temp=args.boltzmann_temp)
     mode = build_mode(args.game_mode, jacoby=args.jacoby)
 
     # Equity output is unbounded; high lr can cause gradient explosion -> NaN.
@@ -142,6 +178,15 @@ def main():
         f"(batch={args.batch_size}, ep/round={args.episodes_per_round}, "
         f"epochs/round={args.epochs_per_round})..."
     )
+    # Resolve save path up-front so periodic checkpoints and the final
+    # save share the same normalized target.
+    resolved_save = (
+        resolve_save_path(args.save, args.game_mode, net.hidden_sizes)
+        if args.save else None
+    )
+    if args.save_every > 0 and not resolved_save:
+        raise ValueError("--save-every requires --save")
+
     t0 = time.perf_counter()
     losses = trainer.train(
         mode,
@@ -153,8 +198,14 @@ def main():
         log_every=args.log_every,
         workers=args.workers,
         oneply=args.oneply,
+        oneply_acting=args.oneply_acting,
         end_lr=args.end_lr,
         warmup_cycles=args.warmup_cycles,
+        boltzmann_temp=args.boltzmann_temp,
+        bf16_collect=args.bf16_collect,
+        save_path=resolved_save,
+        save_every=args.save_every,
+        cube_targets_1ply=args.cube_targets_1ply,
     )
     elapsed = time.perf_counter() - t0
     eps_per_s = args.num_episodes / elapsed if elapsed > 0 else 0.0
@@ -163,9 +214,9 @@ def main():
         f"{len(losses)} batches)"
     )
 
-    if args.save:
-        net.save(args.save)
-        print(f"Saved network to {args.save}")
+    if resolved_save:
+        net.save(resolved_save)
+        print(f"Saved network to {resolved_save}")
 
     if args.eval_vs_random > 0:
         wr = eval_vs_random(agent, n_games=args.eval_vs_random)

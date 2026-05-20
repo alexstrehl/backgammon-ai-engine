@@ -6,7 +6,7 @@ Includes:
     - Save/load tests
     - Smoke training test (full pipeline)
 
-Run with: pytest test_model.py -v
+Run with: pytest tests/test_model.py -v
 """
 
 import tempfile
@@ -235,7 +235,7 @@ class TestCubefulEncoder:
         enc = get_encoder("cubeful_perspective196")
         assert isinstance(enc, CubefulEncoder)
         assert enc.name == "cubeful_perspective196"
-        assert enc.num_features == 199
+        assert enc.num_features == 200
 
     def test_factory_unknown_base_raises(self):
         with pytest.raises(ValueError, match="Unknown base encoder"):
@@ -248,9 +248,11 @@ class TestCubefulEncoder:
                      CubePerspective.MINE,
                      CubePerspective.THEIRS):
             x = enc.encode(state, cube)
-            assert x.shape == (199,)
+            assert x.shape == (200,)
             assert x[196 + int(cube)] == 1.0
-            assert x[196:].sum() == 1.0
+            # Cube one-hot (3) + is_cube_action (0) = 1.0 total
+            assert x[196:199].sum() == 1.0
+            assert x[199] == 0.0  # is_cube_action defaults to False
 
     def test_base_features_match_perspective196(self):
         """First 196 features must equal Perspective196Encoder output."""

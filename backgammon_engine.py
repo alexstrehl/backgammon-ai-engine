@@ -116,25 +116,6 @@ class BoardState:
         else:
             return max(-v, 0)
 
-    def has_checker(self, player: int, idx: int) -> bool:
-        return self.checker_count(player, idx) > 0
-
-    def is_blocked(self, player: int, idx: int) -> bool:
-        """True if the opponent has 2+ checkers on *idx* (blocked for *player*)."""
-        opp = 1 - player
-        return self.checker_count(opp, idx) >= 2
-
-    def all_in_home(self, player: int) -> bool:
-        """True if all of *player*'s remaining_dice checkers are in the home board."""
-        if self.bar[player] > 0:
-            return False
-        if player == WHITE:
-            # Home = indices 0–5.  No white checkers on 6–23.
-            return all(self.points[i] <= 0 for i in range(6, 24))
-        else:
-            # Home = indices 18–23.  No black checkers on 0–17.
-            return all(self.points[i] >= 0 for i in range(0, 18))
-
     def is_game_over(self) -> bool:
         return self.off[WHITE] == NUM_CHECKERS or self.off[BLACK] == NUM_CHECKERS
 
@@ -519,12 +500,23 @@ def _play_uses_die(play: Play, original: BoardState, die: int) -> bool:
         return dst == expected_dst
 
     if dst == OFF:
-        # Could be exact or over-bear — compute distance
+        # Compute distance from bear-off edge
         if player == WHITE:
             d = src + 1
         else:
             d = 24 - src
-        return die >= d  # exact or over-bear with this die
+        if die == d:
+            return True  # exact bear-off with this die
+        # Over-bear: only allowed from farthest checker, and only
+        # if die > d. Check that src IS the farthest checker.
+        if die > d:
+            pts = original.points
+            if player == WHITE:
+                farthest = max((i for i in range(6) if pts[i] > 0), default=-1)
+            else:
+                farthest = min((i for i in range(18, 24) if pts[i] < 0), default=24)
+            return src == farthest
+        return False
     else:
         return dst == src + direction * die
 

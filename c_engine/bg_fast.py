@@ -34,7 +34,7 @@ import numpy as np
 from backgammon_engine import BoardState
 
 NUM_FEATURES = 196
-MAX_PLAYS = 512
+MAX_PLAYS = 1024
 MAX_MOVES_PER_PLAY = 4
 NUM_POINTS = 24
 

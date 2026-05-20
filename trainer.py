@@ -19,7 +19,8 @@ import math
 import multiprocessing as mp
 import os
 import random
-from typing import Callable, List, Optional, Sequence, Tuple, Union
+import time
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -37,6 +38,7 @@ def collect_episode(
     mode: GameMode,
     rng: random.Random,
     oneply: bool = False,
+    cube_targets_1ply: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Play one self-play episode and return (encodings, targets).
 
@@ -61,7 +63,8 @@ def collect_episode(
     initial_match_state = mode.initial_match_state()
     if initial_match_state is not None:
         return _collect_episode_cubeful_money(
-            agent, mode, rng, initial_match_state, oneply=oneply,
+            agent, mode, rng, initial_match_state,
+            oneply=oneply, cube_targets_1ply=cube_targets_1ply,
         )
 
     state, dice = opening_roll(rng)
@@ -119,31 +122,22 @@ def _collect_episode_cubeful_money(
     rng: random.Random,
     match_state,
     oneply: bool = False,
+    cube_targets_1ply: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Cubeful MONEY-game episode collector.
 
-    Money-specific assumptions baked in:
-      - A pass ends the episode with per-unit target 1.0.
-      - A terminal ends the episode with per-unit game_result.
-      - A take bootstrap is literally 2·v_cube_theirs (stake doubles).
-      - There is no "next game" — one game is one episode.
+    The cube decision is a proper TD transition: each turn that is
+    eligible for doubling emits a cube-phase sample (is_cube_action=1)
+    whose target is the checker-phase value after the cube action
+    resolves:
+      - No double:   target = V(state, is_cube_action=0, same perspective)
+      - Double/pass: target = +1.0 (doubler wins 1 per unit)
+      - Double/take: target = 2 * V(state, is_cube_action=0, theirs)
 
-    Matchplay will need a separate collector (or Option B from the
-    matchplay plan: push game-end handling into the Mode so a single
-    cubeful collector can drive both money and matchplay).
+    The checker-phase sample (is_cube_action=0) follows as before, with
+    bootstrap = -V(opp view) or terminal game_result at episode end.
 
-    Per turn, up to two samples may be emitted:
-      D1 (cube decision): encoded at the doubler's cube perspective
-        BEFORE the double. Target = 2·v_cube_theirs (per-unit) if the
-        opponent takes, else 1.0 (doubler wins 1 point per-unit on a
-        drop).
-      D3 (checker decision): encoded at the post-double cube
-        perspective. Target is the usual bootstrap (−V(opp view)),
-        or terminal game_result (per-unit) at episode end.
-
-    All targets are per-unit equity (cube_value = 1). The agent's
-    network learns V(pos, cube_perspective) normalised to stake=1;
-    cube_value appears on TerminalOutcome as metadata only.
+    All targets are per-unit equity (cube_value = 1).
     """
     from dataclasses import replace
     from encoding import CubePerspective
@@ -157,73 +151,83 @@ def _collect_episode_cubeful_money(
     while not mode.is_episode_over(state):
         player = state.turn
 
-        # ── D1: cube decision (if eligible) ─────────────────────────
-        # Doubling is not allowed on the opening roll.
-        # When oneply=True, compute v_pre_double and v_cube_theirs via
-        # 1-ply lookahead (lower variance) and cache v_pre_double so
-        # the D3 checker target can reuse it when no double happens.
-        oneply_no_double = None  # cached for D3 reuse
+        # ── Cube decision phase (if eligible) ───────────────────────
+        oneply_no_double = None  # cached for checker-phase reuse
         if not is_opening and match_state.can_offer(player):
+            pre_persp = cube_perspective(match_state.cube_owner, player)
+
+            # Emit cube-phase sample: is_cube_action=True
+            enc_list.append(agent._encode_cubeful(
+                state, pre_persp, is_cube_action=True,
+            ))
+
             if oneply:
-                v_pre_double = agent.value_oneply_checker_cubeful(
-                    state, match_state,
-                )
-                oneply_no_double = v_pre_double
-                # v_cube_theirs: same state, but cube is THEIRS (= we
-                # doubled and they took). Temporarily flip cube_owner
-                # to the opponent for the 1-ply eval.
                 opponent = 1 - player
                 theirs_ms = replace(
                     match_state, cube_owner=CubeOwner(opponent + 1),
                 )
-                v_cube_theirs = agent.value_oneply_checker_cubeful(
-                    state, theirs_ms,
-                )
-                pre_persp = cube_perspective(match_state.cube_owner, player)
+                if cube_targets_1ply:
+                    # EXPERIMENTAL: pure 1-ply cube targets. Conceptually
+                    # the deeper search (1-ply lookahead at cube decisions),
+                    # but empirically inflates slack at boundary positions
+                    # via a subtle bug in value_oneply_checker_cubeful, which
+                    # degrades cube performance vs the 0-ply-target default.
+                    v_no_double = agent.value_oneply_checker_cubeful(
+                        state, match_state,
+                    )
+                    oneply_no_double = v_no_double
+                    v_double_take = 2.0 * agent.value_oneply_checker_cubeful(
+                        state, theirs_ms,
+                    )
+                else:
+                    # Default: 0-ply cube targets while keeping 1-ply for
+                    # the checker phase. Avoids the 1-ply cube-target
+                    # inflation that produced r8_tmp's cube_mEMG regression.
+                    v_no_double = agent.evaluate_cubeful(
+                        state, pre_persp, is_cube_action=False,
+                    )
+                    v_double_take = 2.0 * agent.evaluate_cubeful(
+                        state, CubePerspective.THEIRS, is_cube_action=False,
+                    )
+                    # leave oneply_no_double = None so checker_target
+                    # below recomputes via 1-ply (don't reuse 0-ply v_nd)
                 do_double = agent._money_cube_decision(
-                    v_pre_double, v_cube_theirs, pre_persp, match_state.jacoby,
+                    v_no_double, v_double_take, pre_persp, match_state.jacoby,
                 )
-                offer = None  # placeholder; we use the 1-ply values directly
+                offer = None
             else:
                 offer = agent.offer_double(state, match_state)
                 do_double = offer.should_double
-                pre_persp = cube_perspective(match_state.cube_owner, player)
-                v_cube_theirs = (
-                    offer._cache["v_cube_theirs_0ply"] if do_double else None
-                )
+                v_double_take = offer._cache["v_double_take_0ply"]
+                v_no_double = offer._cache["v_no_double_0ply"]
 
             if do_double:
-                cube_sample_enc = agent._encode_cubeful(state, pre_persp)
                 if oneply:
-                    # Same take-point as TDAgent.respond_to_double;
-                    # inlined here to avoid a redundant forward pass.
-                    takes = (2.0 * v_cube_theirs) <= 1.0
+                    takes = v_double_take <= 1.0
                 else:
                     takes = agent.respond_to_double(
                         state, match_state, hint=offer,
                     )
                 if takes:
-                    # Target = 2 * v_cube_theirs (doubled stake, per-unit).
-                    enc_list.append(cube_sample_enc)
-                    targets.append(2.0 * v_cube_theirs)
+                    # Cube target: stake doubles, cube transfers.
+                    targets.append(v_double_take)
                     match_state = match_state.after_take(player)
-                    # After take, cube_owner changed → oneply_no_double
-                    # is no longer valid for D3 (computed at old persp).
                     oneply_no_double = None
                 else:
-                    # Pass → game ends. Doubler wins 1 per unit.
-                    enc_list.append(cube_sample_enc)
+                    # Cube target: opponent drops, we win 1 per unit.
                     targets.append(1.0)
                     break
+            else:
+                # No double: cube target = checker-phase value.
+                targets.append(v_no_double)
 
-        # ── D3: checker decision ────────────────────────────────────
+        # ── Checker decision phase ──────────────────────────────────
         post_persp = cube_perspective(match_state.cube_owner, player)
-        enc_list.append(agent._encode_cubeful(state, post_persp))
+        enc_list.append(agent._encode_cubeful(
+            state, post_persp, is_cube_action=False,
+        ))
 
         if oneply:
-            # Target: 1-ply at current state under current cube persp.
-            # Reuse the no-double value if we have it (no cube turn
-            # since it was computed).
             if oneply_no_double is not None:
                 checker_target = oneply_no_double
             else:
@@ -231,7 +235,6 @@ def _collect_episode_cubeful_money(
                     state, match_state,
                 )
             targets.append(checker_target)
-            # Move selection at 0-ply (fast) — just advance the game.
             result = agent.choose_checker_action_cubeful(
                 state, dice, match_state,
             )
@@ -257,12 +260,12 @@ def _collect_episode_cubeful_money(
                 targets.append(bootstrap)
                 state = next_state
             else:
-                # Forced pass: opponent gets the roll on the same position.
                 opp_view = switch_turn(state)
                 opp_persp = cube_perspective(
                     match_state.cube_owner, opp_view.turn,
                 )
-                v_opp = agent.evaluate_cubeful(opp_view, opp_persp)
+                opp_cube_action = match_state.can_offer(opp_view.turn)
+                v_opp = agent.evaluate_cubeful(opp_view, opp_persp, is_cube_action=opp_cube_action)
                 targets.append(-v_opp)
                 state = opp_view
 
@@ -298,39 +301,75 @@ def _collect_worker(args):
     numpy arrays. The GameMode instance is pickled directly into
     `args` — simpler and more general than name-based dispatch,
     because modes can carry config (e.g. CubefulMoneyMode.jacoby).
+
+    Set env LEAK_DIAG=1 to log RSS at entry/exit (for leak hunts).
     """
     os.environ["OMP_NUM_THREADS"] = "1"
     torch.set_num_threads(1)
 
-    (state_dict, hidden_sizes, output_mode, encoder_name,
-     mode, num_episodes, seed, oneply) = args
+    (state_dict, hidden_sizes, input_size, output_mode, encoder_name,
+     mode, num_episodes, seed, oneply, oneply_acting, boltzmann_temp,
+     bf16_inference, cube_targets_1ply) = args
+
+    diag = os.environ.get("LEAK_DIAG") == "1"
+
+    def _rss_kb():
+        try:
+            with open("/proc/self/statm") as f:
+                # fields in pages: size resident shared text lib data dt
+                resident = int(f.read().split()[1])
+            return resident * (os.sysconf("SC_PAGE_SIZE") // 1024)
+        except Exception:
+            return -1
+
+    rss_in = _rss_kb() if diag else None
 
     from model import TDNetwork
     from td_agent import TDAgent
 
     net = TDNetwork(
         hidden_sizes=hidden_sizes,
+        input_size=input_size,
         output_mode=output_mode,
         encoder_name=encoder_name,
     )
     net.load_state_dict(state_dict)
-    agent = TDAgent(net)
+    agent = TDAgent(
+        net, oneply=oneply_acting, boltzmann_temp=boltzmann_temp,
+        bf16_inference=bf16_inference,
+    )
 
     rng = random.Random(seed)
 
     enc_chunks: List[np.ndarray] = []
     tgt_chunks: List[np.ndarray] = []
     for _ in range(num_episodes):
-        encs, tgts = collect_episode(agent, mode, rng, oneply=oneply)
+        encs, tgts = collect_episode(
+            agent, mode, rng, oneply=oneply,
+            cube_targets_1ply=cube_targets_1ply,
+        )
         if len(encs) > 0:
             enc_chunks.append(encs)
             tgt_chunks.append(tgts)
     if not enc_chunks:
-        return (
+        result = (
             np.empty((0, 0), dtype=np.float32),
             np.empty((0,), dtype=np.float32),
         )
-    return np.concatenate(enc_chunks, axis=0), np.concatenate(tgt_chunks, axis=0)
+    else:
+        result = (
+            np.concatenate(enc_chunks, axis=0),
+            np.concatenate(tgt_chunks, axis=0),
+        )
+
+    if diag:
+        rss_out = _rss_kb()
+        print(
+            f"[worker {os.getpid()}] RSS {rss_in/1024:.1f} -> {rss_out/1024:.1f} MB "
+            f"(Δ {(rss_out-rss_in)/1024:+.1f} MB), {num_episodes} eps",
+            flush=True,
+        )
+    return result
 
 
 # ── Trainer class ─────────────────────────────────────────────────────
@@ -422,8 +461,15 @@ class Trainer:
         log_every: int = 1,
         workers: int = 1,
         oneply: bool = False,
+        oneply_acting: bool = False,
         end_lr: Optional[float] = None,
         warmup_cycles: int = 0,
+        boltzmann_temp: float = 0.0,
+        bf16_collect: bool = False,
+        save_path: Optional[str] = None,
+        save_every: int = 0,
+        metrics_out: Optional[dict] = None,
+        cube_targets_1ply: bool = False,
     ) -> List[float]:
         """Round-based batch TD(0). A round collects
         `episodes_per_round` episodes, then trains `epochs_per_round`
@@ -461,11 +507,60 @@ class Trainer:
         if warmup_cycles > 0:
             print(f"LR warmup: lr*0.1 -> lr over first {warmup_cycles} rounds")
 
+        next_save = save_every if (save_path and save_every > 0) else None
+        if next_save is not None:
+            print(f"Checkpoint every {save_every} episodes -> {save_path} (with _ep{{N}} suffix)")
+
         # Worker pool created once for the whole run (avoids per-round
         # subprocess startup cost). None means single-process.
-        pool = mp.Pool(processes=workers) if workers > 1 else None
+        #
+        # We use the "spawn" start method, not the Linux default "fork".
+        # With fork, replacement workers (and the initial workers
+        # themselves) inherit the master's RSS at the moment of fork via
+        # copy-on-write — and because the master's peak RSS scales with
+        # pool size (pool_enc + sh_enc + pool.map deserialization
+        # buffers), a replacement worker spawned mid-training starts at
+        # multiple GB, and at 128 workers a single anomalous-pool round
+        # can push combined RSS over a terabyte. Spawn gives every
+        # worker a pristine interpreter that only re-imports torch and
+        # the model modules, so per-worker RSS is bounded by the
+        # worker's own workload, not the master's history.
+        #
+        # TRAINER_MAXTASKSPERCHILD env var recycles workers after N
+        # calls — useful if you observe residual per-worker growth over
+        # a long run (glibc arena fragmentation, torch allocator cache).
+        # With spawn, recycled workers start pristine, so this is now a
+        # real knob rather than a diagnostic stub.
+        _mt = os.environ.get("TRAINER_MAXTASKSPERCHILD")
+        maxtasks = int(_mt) if _mt else None
+        pool = (
+            mp.get_context("spawn").Pool(
+                processes=workers, maxtasksperchild=maxtasks,
+            )
+            if workers > 1 else None
+        )
+
+        # Master-side leak diagnostic: RSS at pool creation + per-round
+        # delta. Uses the same /proc/self/statm trick as the worker.
+        _diag_master = os.environ.get("LEAK_DIAG") == "1"
+
+        def _master_rss_mb():
+            try:
+                with open("/proc/self/statm") as f:
+                    resident = int(f.read().split()[1])
+                return resident * (os.sysconf("SC_PAGE_SIZE") // 1024) / 1024.0
+            except Exception:
+                return -1.0
+
+        if _diag_master:
+            print(
+                f"[master {os.getpid()}] RSS at pool start: "
+                f"{_master_rss_mb():.1f} MB",
+                flush=True,
+            )
         net = self.agent.network
         hidden_sizes = list(net.hidden_sizes)
+        input_size = getattr(net, "input_size", 196)
         output_mode = getattr(net, "output_mode", "probability")
         encoder_name = getattr(net, "encoder_name", "perspective196")
 
@@ -476,6 +571,7 @@ class Trainer:
                 round_size = min(
                     episodes_per_round, num_episodes - episodes_played,
                 )
+                rss_round_start = _master_rss_mb() if _diag_master else 0.0
 
                 # ── LR annealing (linear, by episodes_played) ──────
                 if end_lr is not None:
@@ -494,13 +590,22 @@ class Trainer:
                         pg["lr"] = current_lr
 
                 # ── Collect this round into (encodings, targets) ───
+                _t_collect_start = time.perf_counter()
                 enc_chunks: List[np.ndarray] = []
                 tgt_chunks: List[np.ndarray] = []
 
                 if pool is None:
+                    # Single-process: master agent does the collection,
+                    # so its bf16 inference copy (if enabled) must be
+                    # re-synced to the current fp32 weights each round.
+                    if bf16_collect:
+                        if not self.agent.bf16_inference:
+                            self.agent.bf16_inference = True
+                        self.agent.refresh_bf16_inference()
                     for _ in range(round_size):
                         encs, tgts = collect_episode(
                             self.agent, mode, rng, oneply=oneply,
+                            cube_targets_1ply=cube_targets_1ply,
                         )
                         if len(encs) > 0:
                             enc_chunks.append(encs)
@@ -512,8 +617,11 @@ class Trainer:
                         for k, v in net.state_dict().items()
                     }
                     worker_args = [
-                        (state_dict, hidden_sizes, output_mode, encoder_name,
-                         mode, n_eps, rng.randint(0, 2**31 - 1), oneply)
+                        (state_dict, hidden_sizes, input_size, output_mode,
+                         encoder_name,
+                         mode, n_eps, rng.randint(0, 2**31 - 1),
+                         oneply, oneply_acting, boltzmann_temp,
+                         bf16_collect, cube_targets_1ply)
                         for n_eps in splits
                     ]
                     for w_enc, w_tgt in pool.map(
@@ -524,24 +632,47 @@ class Trainer:
                             tgt_chunks.append(w_tgt)
 
                 episodes_played += round_size
+                if metrics_out is not None:
+                    metrics_out.setdefault("collection_times", []).append(
+                        time.perf_counter() - _t_collect_start
+                    )
+                    metrics_out.setdefault("round_sizes", []).append(round_size)
                 if not enc_chunks:
                     continue
 
                 pool_enc = np.concatenate(enc_chunks, axis=0)
                 pool_tgt = np.concatenate(tgt_chunks, axis=0)
+                _t_train_start = time.perf_counter()
+                # Release the per-worker chunks — pool_enc/pool_tgt own
+                # a copy. Without this, chunks + pool arrays are both
+                # live during the training step (≈2× pool bytes, and
+                # pool bytes scale with pool size, so on an anomalous-
+                # length round this was a GB-class redundant footprint).
+                enc_chunks = None
+                tgt_chunks = None
                 n = len(pool_enc)
 
-                # ── Train: shuffle + slice + step (master only) ────
+                # Shuffle + batch via index slicing. We used to
+                # materialize `sh_enc = pool_enc[perm]` — a full shuffled
+                # copy of the entire pool — which doubled peak RSS for
+                # the whole training phase of the round. Fancy-indexing
+                # per batch holds only a batch-sized copy at a time,
+                # and the per-batch op cost is negligible next to the
+                # forward/backward pass.
                 for _epoch in range(epochs_per_round):
                     perm = np.arange(n)
                     rng_np = np.random.default_rng(rng.randint(0, 2**31 - 1))
                     rng_np.shuffle(perm)
-                    sh_enc = pool_enc[perm]
-                    sh_tgt = pool_tgt[perm]
                     for start in range(0, n, batch_size):
-                        batch_e = sh_enc[start:start + batch_size]
-                        batch_t = sh_tgt[start:start + batch_size]
+                        idx = perm[start:start + batch_size]
+                        batch_e = pool_enc[idx]
+                        batch_t = pool_tgt[idx]
                         losses.append(self.train_step(batch_e, batch_t))
+
+                if metrics_out is not None:
+                    metrics_out.setdefault("train_times", []).append(
+                        time.perf_counter() - _t_train_start
+                    )
 
                 if log_every and (round_idx + 1) % log_every == 0:
                     recent = losses[-10:] if losses else [0.0]
@@ -551,6 +682,24 @@ class Trainer:
                         f"| episodes {episodes_played}/{num_episodes} "
                         f"| pool {n:5d} "
                         f"| recent batch loss {avg:.4f}"
+                    )
+
+                if next_save is not None and episodes_played >= next_save:
+                    root, ext = os.path.splitext(save_path)
+                    ckpt_path = f"{root}_ep{episodes_played}{ext or '.pt'}"
+                    self.agent.network.save(ckpt_path)
+                    print(f"  -> checkpoint saved: {ckpt_path}", flush=True)
+                    while next_save <= episodes_played:
+                        next_save += save_every
+
+                if _diag_master:
+                    rss_round_end = _master_rss_mb()
+                    print(
+                        f"[master round={round_idx + 1}] RSS "
+                        f"{rss_round_start:.1f} -> {rss_round_end:.1f} MB "
+                        f"(Δ {rss_round_end - rss_round_start:+.1f}) "
+                        f"| losses={len(losses)}",
+                        flush=True,
                     )
         finally:
             if pool is not None:
@@ -646,22 +795,25 @@ class Trainer:
             while not mode.is_episode_over(state):
                 player = state.turn
 
-                # ── D1: cube decision (if eligible) ─────────────
+                # ── Cube decision phase (if eligible) ──────────
                 if match_state.can_offer(player):
+                    pre_persp = cube_perspective(
+                        match_state.cube_owner, player,
+                    )
+                    cube_enc = agent._encode_cubeful(
+                        state, pre_persp, is_cube_action=True,
+                    )
                     offer = agent.offer_double(state, match_state)
+                    ply_tag = "1ply" if agent.oneply else "0ply"
                     if offer.should_double:
-                        pre_persp = cube_perspective(
-                            match_state.cube_owner, player,
-                        )
-                        cube_enc = agent._encode_cubeful(state, pre_persp)
+                        v_double_take = offer._cache[f"v_double_take_{ply_tag}"]
                         takes = agent.respond_to_double(
                             state, match_state, hint=offer,
                         )
                         if takes:
-                            v_theirs = offer._cache["v_cube_theirs_0ply"]
-                            target = 2.0 * v_theirs
                             losses.append(
-                                agent.td_update_encoded(cube_enc, target, lr)
+                                agent.td_update_encoded(
+                                    cube_enc, v_double_take, lr)
                             )
                             match_state = match_state.after_take(player)
                         else:
@@ -669,10 +821,19 @@ class Trainer:
                                 agent.td_update_encoded(cube_enc, 1.0, lr)
                             )
                             break
+                    else:
+                        # No double: cube target = checker-phase value.
+                        v_no_double = offer._cache[f"v_no_double_{ply_tag}"]
+                        losses.append(
+                            agent.td_update_encoded(
+                                cube_enc, v_no_double, lr)
+                        )
 
-                # ── D3: checker play ────────────────────────────
+                # ── Checker decision phase ─────────────────────
                 post_persp = cube_perspective(match_state.cube_owner, player)
-                enc = agent._encode_cubeful(state, post_persp)
+                enc = agent._encode_cubeful(
+                    state, post_persp, is_cube_action=False,
+                )
                 result = agent.choose_checker_action_cubeful(
                     state, dice, match_state,
                 )
@@ -696,7 +857,11 @@ class Trainer:
                     opp_persp = cube_perspective(
                         match_state.cube_owner, opp_view.turn,
                     )
-                    v_opp = agent.evaluate_cubeful(opp_view, opp_persp)
+                    opp_cube_action = match_state.can_offer(opp_view.turn)
+                    v_opp = agent.evaluate_cubeful(
+                        opp_view, opp_persp,
+                        is_cube_action=opp_cube_action,
+                    )
                     losses.append(
                         agent.td_update_encoded(enc, -v_opp, lr)
                     )

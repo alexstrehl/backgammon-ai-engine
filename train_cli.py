@@ -6,6 +6,7 @@ construction, the resume path, and a vs-Random eval helper.
 """
 
 import argparse
+import os
 import random
 
 import torch
@@ -19,6 +20,24 @@ from modes import CubefulMoneyMode, CubelessMoneyMode, DMPMode
 def parse_hidden_sizes(s: str):
     """Parse '80,40' → [80, 40]."""
     return [int(x) for x in s.split(",") if x]
+
+
+def resolve_save_path(save: str, game_mode: str, hidden_sizes) -> str:
+    """Normalize --save so both `path/to/file.pt` and `path/to/dir/`
+    work, and so missing parent directories are created rather than
+    causing torch.save to silently fail.
+
+    If `save` is a directory (existing or trailing-separator), generate
+    a deterministic filename inside it from the game mode and hidden
+    sizes, e.g. `models/dmp_512_512_256.pt`.
+    """
+    if save.endswith(("/", "\\")) or os.path.isdir(save):
+        hidden_str = "_".join(str(h) for h in hidden_sizes)
+        save = os.path.join(save, f"{game_mode}_{hidden_str}.pt")
+    parent = os.path.dirname(save)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return save
 
 
 def build_mode(name: str, jacoby: bool = True):

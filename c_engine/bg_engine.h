@@ -36,7 +36,7 @@ extern "C" {
 #define OFF_SENTINEL   (-2)
 
 #define MAX_MOVES_PER_PLAY  4
-#define MAX_PLAYS         512   /* generous upper bound */
+#define MAX_PLAYS         1024  /* generous upper bound */
 
 /* ── Board state ───────────────────────────────────────────────── */
 

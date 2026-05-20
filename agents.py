@@ -264,25 +264,72 @@ class GnubgNNAgent(Agent):
 class GnubgNNCubefulAgent(Agent):
     """Cubeful money agent backed by gnubg-nn.
 
-    Checker play: argmin over cubeless money equity (same as
-    GnubgNNAgent with cubeless_money=True).
+    Checker play: for each legal move we call ``gnubg_nn.probabilities``
+    on the resulting position and convert the 5-tuple to cubeless money
+    equity, then pick the move minimising the opponent's equity.
+
+    Note on cube-aware checker play: gnubg's desktop "Cubeful checker
+    evaluations" GUI toggle does take cube ownership into account, but
+    we could not find a way to enable that path through gnubg-nn —
+    every ``set.*`` combination we tried left both ``probabilities``
+    and ``best_move`` invariant to cube ownership at every ply. There
+    is a ``best_move`` API that could be used in place of the equity
+    argmin above, but in a 400k-game H-H at 0-ply, calling it both at
+    money score (0,0) and at the 21-point 0-0 match-equity approximation
+    was statistically inferior to the equity approach, so we leave that
+    path unused.
 
     Cube decisions: gnubg_nn.evaluate_cube_decision at a simulated
-    match (default 13pt, 0-0) approximates money play. Jacoby
-    override: when gnubg says "no double" on a centered cube, we
-    check if the opponent would pass. If so, we force a double — under 
-    Jacoby, gammons don't count on a centered cube.
+    match (default 21pt, 0-0) approximates money play. Match-length
+    sweep against ml=21 baseline at 800k games showed ml ∈ {13,17,21,25}
+    all within ±2 mEq of each other (effective tie); ml ∈ {31, 41} are
+    broken in gnubg-nn (runaway tails / weak play). 21pt picked as a
+    safe middle. Jacoby override: when gnubg says "no double, too good"
+    on a centered cube, we force a double — under Jacoby, gammons don't
+    count on a centered cube so doubling is monotonic.
+
+    Cube plies clamp: gnubg-nn's evaluate_cube_decision at n=0 is
+    broken (returns stale state — see __init__ comment). We default
+    cube_plies to max(plies, 1) so a "0-ply" GnubgNNCubefulAgent still
+    makes sane cube decisions, at ~25-40% throughput cost. Pass
+    cube_plies=0 to reproduce the historical (broken) behavior.
     """
 
     def __init__(
         self,
         plies: int = 0,
-        match_length: int = 13,
+        match_length: int = 21,
+        cube_plies: Optional[int] = None,
     ):
+        # cube_plies controls plies for evaluate_cube_decision calls.
+        # Defaults to max(plies, 1) — i.e. clamped to at least 1.
+        #
+        # Why the clamp: gnubg-nn's evaluate_cube_decision is BROKEN at
+        # n=0. In gnubg-nn/analyze/danalyze.cc the else branch of
+        # Analyze::R1::cubefulEquities (the nPlies==0 case) calls
+        # cubefulEquity once and discards the result, never writing
+        # matchProbNoDouble / matchProbDoubleTake / matchProbDoubleDrop.
+        # setDecision then reads those three fields from stale state
+        # left over from a previous cube call on the same Player object,
+        # so the decision is essentially random.
+        #
+        # Verified empirically: gnubg's CLI `hint` at 0-ply gives the
+        # right answer; gnubg-nn's evaluate_cube_decision(n=0) does not.
+        # At n>=1 the bug doesn't trigger (the n>0 branch writes the
+        # three fields correctly).
+        #
+        # Speed cost of the clamp: cube actions are ~5-10/game vs
+        # ~50-100 chequer moves, so going from n=0 to n=1 on cube alone
+        # only adds ~25-40% wall time per game. Worth it for sane cube
+        # decisions.
+        #
+        # Set cube_plies=0 explicitly if you specifically want the
+        # broken-at-0-ply behavior (e.g. to reproduce historical numbers).
         if not _GNUBG_NN_AVAILABLE:
             raise ImportError("gnubg-nn is not installed. Run: pip install gnubg-nn")
         self.plies = plies
         self.match_length = match_length
+        self.cube_plies = cube_plies if cube_plies is not None else max(plies, 1)
 
     def _board_and_probs(self, state: BoardState):
         board = GnubgNNAgent._board_to_gnubg(state)
@@ -305,6 +352,27 @@ class GnubgNNCubefulAgent(Agent):
         idx = int(np.argmin(values))
         return actions[idx]
 
+    @staticmethod
+    def _set_cube_for(match_state, on_roll_player: int) -> None:
+        """Configure gnubg's cube state to match the actual game's cube
+        ownership (perspective-corrected).
+
+        gnubg-nn convention (verified empirically against gnubg CLI):
+        the on-roll player at board[1] maps to gnubg's "O" internally,
+        even though gnubg's CLI labels it X. So we keep the default
+        s parameter in evaluate_cube_decision (xOnPlay=false = "O on
+        play"), and pair owned cubes with owner=b'O' (xOwns=false,
+        matches xOnPlay).
+        """
+        from modes import cube_perspective, CubePerspective
+        persp = cube_perspective(match_state.cube_owner, on_roll_player)
+        if persp == CubePerspective.CENTERED:
+            gnubg_nn.set.cube(1, b'X')   # owner ignored at cube=1
+        elif persp == CubePerspective.MINE:
+            gnubg_nn.set.cube(2, b'O')   # on-roll owns; matches default s
+        else:
+            gnubg_nn.set.cube(2, b'X')   # off-roll owns (defensive — usually unreachable)
+
     def offer_double(self, state: BoardState, match_state) -> CubeOffer:
         from modes import CubeOwner
         board, probs = self._board_and_probs(state)
@@ -316,20 +384,22 @@ class GnubgNNCubefulAgent(Agent):
         #    mwcND, mwcDT, mwcDP)
         pid = gnubg_nn.position_id(board)
         gnubg_nn.set.score(self.match_length, self.match_length)
-        gnubg_nn.set.cube(1, b'X')
-        r = gnubg_nn.evaluate_cube_decision(pid, n=self.plies, i=1)
+        self._set_cube_for(match_state, state.turn)
+        r = gnubg_nn.evaluate_cube_decision(pid, n=self.cube_plies, i=1)
         action_double = r[0]
         action_take = r[1]
         too_good = r[2]
         should_double = (action_double == 1)
 
-        # Jacoby override for centered cube
+        # Jacoby override for centered cube: under Jacoby gammons
+        # don't count on a centered cube, so doubling is monotonic
+        # regardless of opponent's take/drop. Drop the action_take
+        # gate the older code had.
         if (
             not should_double
             and too_good
             and match_state.jacoby
             and match_state.cube_owner == CubeOwner.CENTERED
-            and action_take == 0  # opponent would pass
         ):
             should_double = True
 
@@ -354,6 +424,6 @@ class GnubgNNCubefulAgent(Agent):
         board = GnubgNNAgent._board_to_gnubg(state)
         pid = gnubg_nn.position_id(board)
         gnubg_nn.set.score(self.match_length, self.match_length)
-        gnubg_nn.set.cube(1, b'X')
-        r = gnubg_nn.evaluate_cube_decision(pid, n=self.plies, i=1)
+        self._set_cube_for(match_state, state.turn)
+        r = gnubg_nn.evaluate_cube_decision(pid, n=self.cube_plies, i=1)
         return r[1] == 1  # actionTake

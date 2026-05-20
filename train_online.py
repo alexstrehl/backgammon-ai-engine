@@ -35,7 +35,10 @@ import torch
 torch.set_num_threads(1)
 
 from td_agent import TDAgent
-from train_cli import add_common_args, build_mode, build_network, eval_vs_random
+from train_cli import (
+    add_common_args, build_mode, build_network, eval_vs_random,
+    resolve_save_path,
+)
 from trainer import Trainer
 
 
@@ -119,8 +122,11 @@ def main():
     )
 
     if args.save:
-        net.save(args.save)
-        print(f"Saved network to {args.save}")
+        save_path = resolve_save_path(
+            args.save, args.game_mode, net.hidden_sizes,
+        )
+        net.save(save_path)
+        print(f"Saved network to {save_path}")
 
     if args.eval_vs_random > 0:
         wr = eval_vs_random(agent, n_games=args.eval_vs_random)

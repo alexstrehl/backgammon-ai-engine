@@ -119,8 +119,11 @@ def _play_one_signed(agent1, agent2, cubeful, jacoby, record=False):
 def _play_matches_worker(args):
     """Worker function for parallel game playing."""
     os.environ["OMP_NUM_THREADS"] = "1"
+    import torch as _torch
+    _torch.set_num_threads(1)
     (model1_path, model2_path, num_games, model2_type, plies,
-     cubeless_money, cubeful, jacoby, oneply1, oneply2) = args
+     cubeless_money, cubeful, jacoby, oneply1, oneply2,
+     extreme_threshold) = args
 
     net1 = TDNetwork.load(model1_path)
     agent1 = TDAgent(net1, oneply=oneply1)
@@ -139,15 +142,23 @@ def _play_matches_worker(args):
     a2_wins = 0
     a1_equity = 0
     a1_equity_sq = 0
+    per_game = []
+    extremes = []
+    capture_extremes = extreme_threshold > 0 and cubeful
     for _ in range(num_games):
-        signed, _ = _play_one_signed(agent1, agent2, cubeful, jacoby)
+        signed, rec = _play_one_signed(
+            agent1, agent2, cubeful, jacoby, record=capture_extremes,
+        )
         if signed > 0:
             a1_wins += 1
         else:
             a2_wins += 1
         a1_equity += signed
         a1_equity_sq += signed * signed
-    return a1_wins, a2_wins, a1_equity, a1_equity_sq
+        per_game.append(signed)
+        if capture_extremes and abs(signed) >= extreme_threshold:
+            extremes.append((signed, rec))
+    return a1_wins, a2_wins, a1_equity, a1_equity_sq, per_game, extremes
 
 
 def play_matches(
@@ -174,6 +185,7 @@ def play_matches(
     agent2_wins = 0
     agent1_equity = 0
     agent1_equity_sq = 0
+    per_game = []
     records = [] if record else None
     start_time = time.time()
     progress_interval = max(100, num_games // 10)
@@ -190,6 +202,7 @@ def play_matches(
             agent2_wins += 1
         agent1_equity += signed
         agent1_equity_sq += signed * signed
+        per_game.append(signed)
 
         if print_progress and i % progress_interval == 0:
             elapsed = time.time() - start_time
@@ -200,8 +213,8 @@ def play_matches(
             )
 
     if record:
-        return agent1_wins, agent2_wins, agent1_equity, agent1_equity_sq, records
-    return agent1_wins, agent2_wins, agent1_equity, agent1_equity_sq
+        return agent1_wins, agent2_wins, agent1_equity, agent1_equity_sq, per_game, records
+    return agent1_wins, agent2_wins, agent1_equity, agent1_equity_sq, per_game
 
 
 def play_matches_parallel(
@@ -216,9 +229,12 @@ def play_matches_parallel(
     jacoby: bool = True,
     oneply1: bool = False,
     oneply2: bool = False,
-) -> Tuple[int, int, int, int]:
+    extreme_threshold: float = 0.0,
+):
     """Play games in parallel across multiple workers.
-    Returns (agent1_wins, agent2_wins, agent1_equity, agent1_equity_sq).
+    Returns (a1_wins, a2_wins, eq_sum, eq_sq_sum, per_game, extremes).
+    `extremes` is a list of (signed_equity, GameRecord) for games with
+    |equity| >= extreme_threshold (empty if threshold == 0).
     """
     # Split games across workers
     base = num_games // workers
@@ -227,7 +243,7 @@ def play_matches_parallel(
 
     args_list = [
         (model1_path, model2_path, n, model2_type, plies, cubeless_money,
-         cubeful, jacoby, oneply1, oneply2)
+         cubeful, jacoby, oneply1, oneply2, extreme_threshold)
         for n in game_counts
     ]
 
@@ -241,10 +257,16 @@ def play_matches_parallel(
     total_a2 = sum(r[1] for r in results)
     total_eq = sum(r[2] for r in results)
     total_eq_sq = sum(r[3] for r in results)
+    all_per_game = []
+    for r in results:
+        all_per_game.extend(r[4])
+    extremes = []
+    for r in results:
+        extremes.extend(r[5])
     print(f"  {num_games} games completed in {elapsed:.1f}s "
           f"({num_games/elapsed:.0f} games/sec, {workers} workers)")
 
-    return total_a1, total_a2, total_eq, total_eq_sq
+    return total_a1, total_a2, total_eq, total_eq_sq, all_per_game, extremes
 
 
 def compute_binomial_pvalue(wins: int, trials: int) -> float:
@@ -379,6 +401,19 @@ def main():
         help="Directory to save games as .mat files (Jellyfish format for gnubg import)",
     )
     parser.add_argument(
+        "--save-extreme-games",
+        type=str,
+        default=None,
+        help="Directory to save only games whose |equity| >= --extreme-threshold "
+             "(works with --workers > 1; cubeful only).",
+    )
+    parser.add_argument(
+        "--extreme-threshold",
+        type=float,
+        default=128.0,
+        help="Equity magnitude threshold for --save-extreme-games (default: 128 pts).",
+    )
+    parser.add_argument(
         "--game-mode",
         choices=["dmp", "cubeless-money", "cubeful-money"],
         default="dmp",
@@ -410,6 +445,10 @@ def main():
         "--oneply",
         action="store_true",
         help="1-ply lookahead for BOTH models (shorthand for --oneply1 --oneply2).",
+    )
+    parser.add_argument(
+        "--n-bootstrap", type=int, default=10000,
+        help="Number of bootstrap resamples for equity CI (default: 10000).",
     )
     args = parser.parse_args()
     if args.oneply:
@@ -472,7 +511,7 @@ def main():
                 agent1, agent2, args.games, record=True,
                 cubeful=cubeful, jacoby=args.jacoby,
             )
-            agent1_wins, agent2_wins, agent1_equity, agent1_equity_sq, records = result
+            agent1_wins, agent2_wins, agent1_equity, agent1_equity_sq, per_game, records = result
         else:
             model2_type = (
                 "random" if args.model2 == "random"
@@ -480,22 +519,37 @@ def main():
                 else "gnubg-cubeful" if args.model2 == "gnubg-cubeful"
                 else "model"
             )
-            agent1_wins, agent2_wins, agent1_equity, agent1_equity_sq = play_matches_parallel(
+            extreme_threshold = args.extreme_threshold if args.save_extreme_games else 0.0
+            (agent1_wins, agent2_wins, agent1_equity, agent1_equity_sq,
+             per_game, extremes) = play_matches_parallel(
                 args.model1, args.model2, args.games,
                 workers=args.workers, model2_type=model2_type, plies=args.plies,
                 cubeless_money=cubeless_money,
                 cubeful=cubeful, jacoby=args.jacoby,
                 oneply1=args.oneply1, oneply2=args.oneply2,
+                extreme_threshold=extreme_threshold,
             )
+
+            if args.save_extreme_games and extremes:
+                from gnubg_eval import export_mat
+                os.makedirs(args.save_extreme_games, exist_ok=True)
+                extremes.sort(key=lambda x: -abs(x[0]))
+                for i, (signed, rec) in enumerate(extremes):
+                    mat = export_mat(rec, game_id=i + 1, money_game=cubeful)
+                    name = f"extreme_{i+1:03d}_eq{int(signed):+d}.mat"
+                    with open(os.path.join(args.save_extreme_games, name), "w") as f:
+                        f.write(mat)
+                print(f"Saved {len(extremes)} extreme games "
+                      f"(|eq| >= {extreme_threshold}) to {args.save_extreme_games}/")
     else:
         if save_games:
             result = play_matches(
                 agent1, agent2, args.games, record=True,
                 cubeful=cubeful, jacoby=args.jacoby,
             )
-            agent1_wins, agent2_wins, agent1_equity, agent1_equity_sq, records = result
+            agent1_wins, agent2_wins, agent1_equity, agent1_equity_sq, per_game, records = result
         else:
-            agent1_wins, agent2_wins, agent1_equity, agent1_equity_sq = play_matches(
+            agent1_wins, agent2_wins, agent1_equity, agent1_equity_sq, per_game = play_matches(
                 agent1, agent2, args.games,
                 cubeful=cubeful, jacoby=args.jacoby,
             )
@@ -535,37 +589,69 @@ def main():
     print(f"p-value: {pvalue:.4f}")
     print(f"Verdict: {verdict}")
     if cubeless_money or cubeful:
-        import math as _math
+        import numpy as np
+        from concurrent.futures import ProcessPoolExecutor
+        from functools import partial
+        from stats import (
+            bootstrap_ci, bootstrap_ci_statistic, trimmed_mean, capped_mean,
+        )
         eq_per_game = agent1_equity / total_games
-        # Sample variance from collected stakes (much tighter than worst-case bound)
-        mean_sq = agent1_equity_sq / total_games
-        var = mean_sq - eq_per_game * eq_per_game
-        if var < 0:
-            var = 0.0
-        se = _math.sqrt(var / total_games)
-        ci_half = 1.96 * se
-        ci_lo = eq_per_game - ci_half
-        ci_hi = eq_per_game + ci_half
-        # Two-sided z-test p-value for "equity != 0"
-        z = eq_per_game / se if se > 0 else 0.0
-        try:
-            from math import erf, sqrt
-            pval = 2 * (1 - 0.5 * (1 + erf(abs(z) / sqrt(2))))
-        except Exception:
-            pval = float("nan")
         tag = "Cubeful money" if cubeful else "Cubeless money"
         print()
         print(f"{tag} equity (Model1): "
               f"{eq_per_game:+.4f} pts/game ({eq_per_game*1000:+.1f} mEq/game)")
-        print(f"  95% CI: [{ci_lo*1000:+.1f}, {ci_hi*1000:+.1f}] mEq/game "
-              f"(±{ci_half*1000:.1f})")
-        print(f"  Equity p-value: {pval:.4f}")
-        if ci_lo > 0:
-            print("  Equity verdict: Model1 significantly stronger (p<0.05)")
-        elif ci_hi < 0:
-            print("  Equity verdict: Model2 significantly stronger (p<0.05)")
-        else:
-            print("  Equity verdict: No significant equity difference")
+
+        # Share one ProcessPool across all 2-4 bootstrap calls; saves
+        # the ~0.2-0.3s pool-startup hit per call.
+        n_jobs = min(os.cpu_count() or 1, 32)
+        with ProcessPoolExecutor(max_workers=n_jobs) as boot_pool:
+            ci_lo, ci_hi, pval = bootstrap_ci(
+                per_game, n_boot=args.n_bootstrap, executor=boot_pool,
+            )
+            ci_half = (ci_hi - ci_lo) / 2
+            print(f"  95% CI (bootstrap): [{ci_lo*1000:+.1f}, {ci_hi*1000:+.1f}] mEq/game "
+                  f"(±{ci_half*1000:.1f})")
+            print(f"  Equity p-value (bootstrap): {pval:.4f}")
+
+            if ci_lo > 0:
+                print("  Equity verdict: Model1 significantly stronger (p<0.05)")
+            elif ci_hi < 0:
+                print("  Equity verdict: Model2 significantly stronger (p<0.05)")
+            else:
+                print("  Equity verdict: No significant equity difference")
+
+            # Robust estimators (relevant when cube escalation creates
+            # heavy-tailed per-game point distributions).
+            per_game_arr = np.asarray(per_game, dtype=np.float64)
+
+            med = float(np.median(per_game_arr))
+            m_lo, m_hi, m_p = bootstrap_ci_statistic(
+                per_game_arr, np.median,
+                n_boot=args.n_bootstrap, executor=boot_pool,
+            )
+            print(f"  Median equity:   {med*1000:+.1f} mEq/game  "
+                  f"[{m_lo*1000:+.1f}, {m_hi*1000:+.1f}]  p={m_p:.4f}")
+
+            tmean = trimmed_mean(per_game_arr, trim=0.01)
+            t_lo, t_hi, t_p = bootstrap_ci_statistic(
+                per_game_arr,
+                partial(trimmed_mean, trim=0.01),
+                n_boot=args.n_bootstrap, executor=boot_pool,
+            )
+            print(f"  Trimmed mean (1%): {tmean*1000:+.1f} mEq/game  "
+                  f"[{t_lo*1000:+.1f}, {t_hi*1000:+.1f}]  p={t_p:.4f}")
+
+            if cubeful:
+                # Capped/Winsorized mean — equity under a per-game point cap.
+                cap_pts = 128.0
+                cmean = capped_mean(per_game_arr, cap=cap_pts)
+                c_lo, c_hi, c_p = bootstrap_ci_statistic(
+                    per_game_arr,
+                    partial(capped_mean, cap=cap_pts),
+                    n_boot=args.n_bootstrap, executor=boot_pool,
+                )
+                print(f"  Capped mean (±{int(cap_pts)}): {cmean*1000:+.1f} mEq/game  "
+                      f"[{c_lo*1000:+.1f}, {c_hi*1000:+.1f}]  p={c_p:.4f}")
     print("=" * 60)
 
 

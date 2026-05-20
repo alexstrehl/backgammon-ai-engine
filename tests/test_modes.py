@@ -325,18 +325,18 @@ class TestTDAgentCubeActions:
         assert offer.should_double is False
         assert offer._cache is None
 
-    def test_respond_uses_cached_v_theirs(self):
+    def test_respond_uses_cached_v_double_take(self):
         """When self-play threads the offer cache through, no extra
         forward pass is needed."""
         agent = _make_cubeful_agent()
         state = BoardState.initial()
         m = MatchState()
         offer = agent.offer_double(state, m)
-        # Replace v_cube_theirs in the cache with a sentinel that
+        # Replace v_double_take in the cache with a sentinel that
         # would change the take/pass decision; verify respond uses it.
-        offer._cache["v_cube_theirs_0ply"] = 0.6  # 2*0.6 = 1.2 > 1.0 → pass
+        offer._cache["v_double_take_0ply"] = 1.2  # > 1.0 → pass
         assert agent.respond_to_double(state, m, hint=offer) is False
-        offer._cache["v_cube_theirs_0ply"] = 0.4  # 2*0.4 = 0.8 ≤ 1.0 → take
+        offer._cache["v_double_take_0ply"] = 0.8  # ≤ 1.0 → take
         assert agent.respond_to_double(state, m, hint=offer) is True
 
     def test_respond_recomputes_without_hint(self):
@@ -345,8 +345,8 @@ class TestTDAgentCubeActions:
         state = BoardState.initial()
         m = MatchState()
         offer = agent.offer_double(state, m)
-        v_theirs = offer._cache["v_cube_theirs_0ply"]
-        expected = (2.0 * v_theirs) <= 1.0
+        v_double_take = offer._cache["v_double_take_0ply"]
+        expected = v_double_take <= 1.0
         assert agent.respond_to_double(state, m, hint=None) is expected
 
     def test_offer_double_huge_advantage_doubles_and_offered_passes(self):

@@ -40,7 +40,7 @@ from typing import List, Tuple, Optional
 
 from backgammon_engine import (
     BoardState, WHITE, BLACK, BAR, OFF,
-    Play, Move, get_legal_plays, switch_turn,
+    Play, Move, get_legal_plays, switch_turn, opening_roll,
 )
 
 # ── Platform configuration ───────────────────────────────────────────────────
@@ -139,17 +139,18 @@ def play_and_record_cubeful(
     """
     from modes import MatchState, CubeOwner, cube_perspective  # local
 
-    state = BoardState.initial()
+    state, opening_dice = opening_roll()
     record = GameRecord()
     match_state = MatchState(jacoby=jacoby)
+    is_opening = True
 
     while not state.is_game_over():
         player = state.turn
         agent = agent_white if player == WHITE else agent_black
         opp_agent = agent_black if player == WHITE else agent_white
 
-        # ── Cube decision ─────────────────────────────────────
-        if match_state.can_offer(player):
+        # ── Cube decision (not allowed on opening roll) ──────
+        if not is_opening and match_state.can_offer(player):
             offer = agent.offer_double(state, match_state)
             if offer.should_double:
                 new_cube_value = match_state.cube_value * 2
@@ -182,7 +183,10 @@ def play_and_record_cubeful(
                     return record
 
         # ── Checker play ──────────────────────────────────────
-        d1, d2 = random.randint(1, 6), random.randint(1, 6)
+        if is_opening:
+            d1, d2 = opening_dice
+        else:
+            d1, d2 = random.randint(1, 6), random.randint(1, 6)
         result = agent.choose_checker_action_cubeful(
             state, (d1, d2), match_state,
         )
@@ -204,6 +208,7 @@ def play_and_record_cubeful(
                 player=player, dice=(d1, d2), play=(),
             ))
             state = switch_turn(state)
+        is_opening = False
 
     record.winner = state.winner()
     raw_result = state.game_result()
@@ -382,7 +387,7 @@ def export_mat(
 
 # ── gnubg analysis ───────────────────────────────────────────────────────────
 
-def _write_gnubg_script(mat_files: List[str], script_path: str):
+def _write_gnubg_script(mat_files: List[str], script_path: str, plies: int = 3):
     """Write a Python script for gnubg's embedded interpreter.
 
     The script imports each .mat file, analyzes it, and prints statistics.
@@ -391,8 +396,9 @@ def _write_gnubg_script(mat_files: List[str], script_path: str):
     lines = [
         "import gnubg",
         "",
-        "# Use 2-ply for accurate analysis (0 = fast but shallow)",
-        "gnubg.command('set analysis chequerplay evaluation plies 2')",
+        f"# {plies}-ply analysis for both chequer and cube decisions",
+        f"gnubg.command('set analysis chequerplay evaluation plies {plies}')",
+        f"gnubg.command('set analysis cubedecision evaluation plies {plies}')",
         "",
     ]
 
@@ -413,6 +419,7 @@ def run_gnubg_analysis(
     work_dir: str,
     gnubg_cmd: Optional[str] = None,
     verbose: bool = True,
+    plies: int = 3,
 ) -> List[Tuple[float, float]]:
     """Run gnubg in batch mode on a list of .mat files.
 
@@ -426,7 +433,7 @@ def run_gnubg_analysis(
     abs_work_dir = os.path.abspath(work_dir)
     abs_mat_files = [os.path.abspath(f) for f in mat_files]
     script_path = os.path.join(abs_work_dir, "_gnubg_analyze.py")
-    _write_gnubg_script(abs_mat_files, script_path)
+    _write_gnubg_script(abs_mat_files, script_path, plies=plies)
 
     # Run gnubg with:
     #   -t : text-only (no GUI)
@@ -438,8 +445,9 @@ def run_gnubg_analysis(
         print(f"  gnubg command: {' '.join(cmd)}")
         print(f"  working dir:   {work_dir}")
 
-    # Scale timeout with number of games (~3s per game + 120s base for gnubg startup)
-    timeout_secs = 120 + len(mat_files) * 3
+    # Scale timeout with number of games. 3-ply analysis is much slower
+    # per game than 2-ply (~30s/game vs ~3s/game), so bump generously.
+    timeout_secs = 120 + len(mat_files) * 60
     try:
         result = subprocess.run(
             cmd,
@@ -495,12 +503,12 @@ def run_gnubg_analysis(
             black_err = abs(float(mEMG_values[1]))
             all_error_lines.append((white_err, black_err))
 
-    # Take every 3rd line (index 0, 3, 6, ...) = the chequer play line per game.
-    # (Could also use index 2, 5, 8, ... for overall, but they're identical
-    # since cube errors are always 0 in our games.)
-    error_rates = [all_error_lines[i] for i in range(0, len(all_error_lines), 3)]
+    # Per game: index 0,3,6,... = chequer; 1,4,7,... = cube; 2,5,8,... = overall
+    chequer_rates = [all_error_lines[i] for i in range(0, len(all_error_lines), 3)]
+    cube_rates = [all_error_lines[i] for i in range(1, len(all_error_lines), 3)]
+    overall_rates = [all_error_lines[i] for i in range(2, len(all_error_lines), 3)]
 
-    return error_rates
+    return chequer_rates, cube_rates, overall_rates
 
 
 # ── Parallel game generation ──────────────────────────────────────────────────
@@ -508,19 +516,14 @@ def run_gnubg_analysis(
 def _play_games_worker(args):
     """Worker function for parallel game generation.
     Each worker loads the model once and plays many games."""
-    if len(args) == 4:
-        model_path, num_games, work_dir, start_idx = args
-        cubeful = False
-        jacoby = True
-    else:
-        model_path, num_games, work_dir, start_idx, cubeful, jacoby = args
+    model_path, num_games, work_dir, start_idx, cubeful, jacoby, oneply = args
 
     os.environ["OMP_NUM_THREADS"] = "1"
     from model import TDNetwork
     from td_agent import TDAgent
 
     net = TDNetwork.load(model_path)
-    agent = TDAgent(net)
+    agent = TDAgent(net, oneply=oneply)
 
     mat_files = []
     for i in range(num_games):
@@ -539,14 +542,14 @@ def _play_games_worker(args):
 
 def _gnubg_worker(args):
     """Worker function for parallel gnubg analysis on a chunk of .mat files."""
-    mat_files, work_dir, gnubg_cmd, chunk_id = args
-    error_rates = run_gnubg_analysis(
-        mat_files, work_dir, gnubg_cmd=gnubg_cmd, verbose=False,
+    mat_files, work_dir, gnubg_cmd, chunk_id, plies = args
+    chequer, cube, overall = run_gnubg_analysis(
+        mat_files, work_dir, gnubg_cmd=gnubg_cmd, verbose=False, plies=plies,
     )
-    if len(error_rates) != len(mat_files):
-        print(f"  WARNING: chunk {chunk_id}: gnubg returned {len(error_rates)}/{len(mat_files)} results",
+    if len(overall) != len(mat_files):
+        print(f"  WARNING: chunk {chunk_id}: gnubg returned {len(overall)}/{len(mat_files)} results",
               flush=True)
-    return error_rates
+    return chequer, cube, overall
 
 
 # ── High-level evaluation ────────────────────────────────────────────────────
@@ -615,32 +618,38 @@ def evaluate_with_gnubg(
         print("Running gnubg analysis...")
 
     # Run gnubg
-    error_rates = run_gnubg_analysis(
+    chequer_rates, cube_rates, overall_rates = run_gnubg_analysis(
         mat_files, work_dir, gnubg_cmd=gnubg_cmd, verbose=verbose,
     )
 
     # Summarize results
-    white_errors = [er[0] for er in error_rates]
-    black_errors = [er[1] for er in error_rates]
-    all_errors = white_errors + black_errors
+    def _avg(rates):
+        w = [er[0] for er in rates]
+        b = [er[1] for er in rates]
+        a = w + b
+        return w, b, sum(a) / len(a) if a else None
+
+    chk_w, chk_b, chk_avg = _avg(chequer_rates)
+    cub_w, cub_b, cub_avg = _avg(cube_rates)
+    ovr_w, ovr_b, ovr_avg = _avg(overall_rates)
 
     results = {
-        "white_mEMG": white_errors,
-        "black_mEMG": black_errors,
-        "avg_mEMG": sum(all_errors) / len(all_errors) if all_errors else None,
-        "num_games": len(error_rates),
+        "chequer_mEMG": chk_avg,
+        "cube_mEMG": cub_avg,
+        "avg_mEMG": ovr_avg,
+        "num_games": len(overall_rates),
         "num_games_requested": num_games,
         "work_dir": work_dir,
     }
 
     if verbose:
-        if error_rates:
+        if overall_rates:
             print(f"\n{'='*50}")
-            print(f"  gnubg analysis: {len(error_rates)} games")
+            print(f"  gnubg analysis: {len(overall_rates)} games")
             print(f"{'='*50}")
-            print(f"  White avg mEMG: {sum(white_errors)/len(white_errors):.1f}")
-            print(f"  Black avg mEMG: {sum(black_errors)/len(black_errors):.1f}")
-            print(f"  Overall avg:    {results['avg_mEMG']:.1f}")
+            print(f"  Chequer mEMG:   {chk_avg:.1f}  (W={sum(chk_w)/len(chk_w):.1f}  B={sum(chk_b)/len(chk_b):.1f})")
+            print(f"  Cube mEMG:      {cub_avg:.1f}  (W={sum(cub_w)/len(cub_w):.1f}  B={sum(cub_b)/len(cub_b):.1f})")
+            print(f"  Overall mEMG:   {ovr_avg:.1f}  (W={sum(ovr_w)/len(ovr_w):.1f}  B={sum(ovr_b)/len(ovr_b):.1f})")
             print(f"{'='*50}")
         else:
             print("  WARNING: no error rates returned from gnubg.")
@@ -678,6 +687,8 @@ def evaluate_with_gnubg_parallel(
     gnubg_chunk_size: int = 50,
     cubeful: bool = False,
     jacoby: bool = True,
+    oneply: bool = False,
+    plies: int = 3,
 ) -> dict:
     """Parallel version: play games with multiple workers, analyze with multiple gnubg instances.
 
@@ -714,7 +725,7 @@ def evaluate_with_gnubg_parallel(
             n = num_games // workers + (1 if i < num_games % workers else 0)
             if n > 0:
                 games_per_worker.append(
-                    (model_path, n, work_dir, start_idx, cubeful, jacoby)
+                    (model_path, n, work_dir, start_idx, cubeful, jacoby, oneply)
                 )
                 start_idx += n
 
@@ -757,37 +768,67 @@ def evaluate_with_gnubg_parallel(
         chunk = mat_files[i:i + gnubg_chunk_size]
         chunk_dir = os.path.join(work_dir, f"chunk_{len(chunks)}")
         os.makedirs(chunk_dir, exist_ok=True)
-        chunks.append((chunk, chunk_dir, gnubg_cmd, len(chunks)))
+        chunks.append((chunk, chunk_dir, gnubg_cmd, len(chunks), plies))
 
     if gnubg_workers > 1 and len(chunks) > 1:
         ctx = mp.get_context('fork')  # fork is fine for gnubg subprocess calls
         with ctx.Pool(min(gnubg_workers, len(chunks))) as pool:
             chunk_results = pool.map(_gnubg_worker, chunks)
-        all_error_rates = [er for chunk in chunk_results for er in chunk]
+        all_chequer = [er for chk, _, _ in chunk_results for er in chk]
+        all_cube = [er for _, cub, _ in chunk_results for er in cub]
+        all_overall = [er for _, _, ovr in chunk_results for er in ovr]
     else:
-        all_error_rates = []
+        all_chequer, all_cube, all_overall = [], [], []
         for chunk_args in chunks:
-            all_error_rates.extend(_gnubg_worker(chunk_args))
+            chk, cub, ovr = _gnubg_worker(chunk_args)
+            all_chequer.extend(chk)
+            all_cube.extend(cub)
+            all_overall.extend(ovr)
 
     t_analyze = time.perf_counter() - t1
 
     # ── Summarize ──
-    white_errors = [er[0] for er in all_error_rates]
-    black_errors = [er[1] for er in all_error_rates]
-    all_errors = white_errors + black_errors
+    def _avg(rates):
+        w = [er[0] for er in rates]
+        b = [er[1] for er in rates]
+        a = w + b
+        return w, b, sum(a) / len(a) if a else None
+
+    chk_w, chk_b, chk_avg = _avg(all_chequer)
+    cub_w, cub_b, cub_avg = _avg(all_cube)
+    ovr_w, ovr_b, ovr_avg = _avg(all_overall)
+
+    # Bootstrap CIs for mEMG. Share one ProcessPool across all 3 calls.
+    from concurrent.futures import ProcessPoolExecutor
+    from stats import bootstrap_ci
+    ovr_per_game = [(w + b) / 2 for w, b in all_overall] if all_overall else []
+    chk_per_game = [(w + b) / 2 for w, b in all_chequer] if all_chequer else []
+    cub_per_game = [(w + b) / 2 for w, b in all_cube] if all_cube else []
+
+    n_jobs = min(os.cpu_count() or 1, 32)
+    with ProcessPoolExecutor(max_workers=n_jobs) as boot_pool:
+        ovr_ci = (bootstrap_ci(ovr_per_game, executor=boot_pool)
+                  if ovr_per_game else (0, 0, 1))
+        chk_ci = (bootstrap_ci(chk_per_game, executor=boot_pool)
+                  if chk_per_game else (0, 0, 1))
+        cub_ci = (bootstrap_ci(cub_per_game, executor=boot_pool)
+                  if cub_per_game else (0, 0, 1))
 
     results = {
-        "white_mEMG": white_errors,
-        "black_mEMG": black_errors,
-        "avg_mEMG": sum(all_errors) / len(all_errors) if all_errors else None,
-        "num_games": len(all_error_rates),
+        "chequer_mEMG": chk_avg,
+        "chequer_ci": (chk_ci[0], chk_ci[1]),
+        "cube_mEMG": cub_avg,
+        "cube_ci": (cub_ci[0], cub_ci[1]),
+        "avg_mEMG": ovr_avg,
+        "avg_ci": (ovr_ci[0], ovr_ci[1]),
+        "num_games": len(all_overall),
         "num_games_requested": num_games,
         "work_dir": work_dir,
     }
 
     if verbose:
-        if all_error_rates:
-            n_analyzed = len(all_error_rates)
+        if all_overall:
+            n_analyzed = len(all_overall)
             n_total = len(mat_files)
             print(f"  Analysis: {n_analyzed}/{n_total} games in {t_analyze:.1f}s "
                   f"({n_analyzed/t_analyze:.1f} games/sec)")
@@ -796,9 +837,9 @@ def evaluate_with_gnubg_parallel(
             print(f"\n{'='*50}")
             print(f"  gnubg analysis: {n_analyzed} games")
             print(f"{'='*50}")
-            print(f"  White avg mEMG: {sum(white_errors)/len(white_errors):.1f}")
-            print(f"  Black avg mEMG: {sum(black_errors)/len(black_errors):.1f}")
-            print(f"  Overall avg:    {results['avg_mEMG']:.1f}")
+            print(f"  Chequer mEMG:   {chk_avg:.1f}  [{chk_ci[0]:.1f}, {chk_ci[1]:.1f}]  (W={sum(chk_w)/len(chk_w):.1f}  B={sum(chk_b)/len(chk_b):.1f})")
+            print(f"  Cube mEMG:      {cub_avg:.1f}  [{cub_ci[0]:.1f}, {cub_ci[1]:.1f}]  (W={sum(cub_w)/len(cub_w):.1f}  B={sum(cub_b)/len(cub_b):.1f})")
+            print(f"  Overall mEMG:   {ovr_avg:.1f}  [{ovr_ci[0]:.1f}, {ovr_ci[1]:.1f}]  (W={sum(ovr_w)/len(ovr_w):.1f}  B={sum(ovr_b)/len(ovr_b):.1f})")
             print(f"{'='*50}")
         else:
             print("  WARNING: no error rates returned from gnubg.")
@@ -862,8 +903,8 @@ if __name__ == "__main__":
                         help="Play model vs random opponent instead of self-play")
     parser.add_argument("--workers", type=int, default=1,
                         help="Parallel game-playing workers (default: 1)")
-    parser.add_argument("--gnubg-workers", type=int, default=4,
-                        help="Parallel gnubg analysis workers (default: 4)")
+    parser.add_argument("--gnubg-workers", type=int, default=None,
+                        help="Parallel gnubg analysis workers (default: CPU count)")
     parser.add_argument("--gnubg-chunk-size", type=int, default=50,
                         help="Games per gnubg analysis chunk (default: 50)")
     parser.add_argument("--cubeful", action="store_true",
@@ -872,6 +913,10 @@ if __name__ == "__main__":
     parser.add_argument("--jacoby", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Jacoby rule for cubeful (default: on).")
+    parser.add_argument("--oneply", action="store_true",
+                        help="Use 1-ply lookahead during self-play game generation.")
+    parser.add_argument("--plies", type=int, default=3,
+                        help="gnubg analysis depth in plies (default: 3).")
     args = parser.parse_args()
 
     if args.random:
@@ -884,14 +929,14 @@ if __name__ == "__main__":
         from model import TDNetwork
         print(f"Loading model: {args.model}")
         net = TDNetwork.load(args.model)
-        agent_white = TDAgent(net)
+        agent_white = TDAgent(net, oneply=args.oneply)
 
         if args.vs_random:
             agent_black = _RandomAgent()
-            print("Mode: model (WHITE) vs random (BLACK)")
+            print(f"Mode: model (WHITE) vs random (BLACK){' [1-ply]' if args.oneply else ''}")
         else:
-            agent_black = TDAgent(net)
-            print("Mode: self-play (model vs itself)")
+            agent_black = TDAgent(net, oneply=args.oneply)
+            print(f"Mode: self-play (model vs itself){' [1-ply]' if args.oneply else ''}")
     else:
         parser.error("Either --model or --random is required")
 
@@ -924,10 +969,12 @@ if __name__ == "__main__":
             work_dir=args.work_dir,
             keep_files=args.keep_files,
             workers=args.workers,
-            gnubg_workers=args.gnubg_workers,
+            gnubg_workers=args.gnubg_workers or os.cpu_count(),
             gnubg_chunk_size=args.gnubg_chunk_size,
             cubeful=args.cubeful,
             jacoby=args.jacoby,
+            oneply=args.oneply,
+            plies=args.plies,
         )
     else:
         results = evaluate_with_gnubg(

@@ -6,6 +6,7 @@
  */
 
 #include "bg_engine.h"
+#include <assert.h>
 #include <string.h>  /* memcpy, memset */
 
 /* ── Board state ───────────────────────────────────────────────── */
@@ -806,6 +807,16 @@ static void generate_plays(
     int dice_used,
     GenContext *ctx
 ) {
+    /* Invariants: callers always pass num_current_moves + num_remaining
+     * ≤ initial dice count (≤4 for doubles, 2 otherwise), so neither
+     * exceeds MAX_MOVES_PER_PLAY. Asserting loudly is much safer than
+     * a silent early-return guard — see commit 72a964b for the bug
+     * that pattern caused (dropped every full-depth doubles play). */
+    assert(num_current_moves >= 0);
+    assert(num_remaining >= 0);
+    assert(num_current_moves <= MAX_MOVES_PER_PLAY);
+    assert(num_current_moves + num_remaining <= MAX_MOVES_PER_PLAY);
+
     int found = 0;
     int seen_die[7] = {0};  /* track which die values tried at this level */
     MoveList ml;
@@ -829,6 +840,7 @@ static void generate_plays(
             BoardState new_state;
             apply_move(state, &ml.moves[m], &new_state);
 
+            assert(num_current_moves < MAX_MOVES_PER_PLAY);
             current_moves[num_current_moves] = ml.moves[m];
 
             generate_plays(
@@ -879,7 +891,20 @@ static int play_uses_die(const Play *play, const BoardState *original, int die) 
     }
     if (dst == OFF_SENTINEL) {
         d = (player == WHITE) ? (src + 1) : (24 - src);
-        return die >= d;
+        if (die == d) return 1;  /* exact bear-off */
+        if (die > d) {
+            /* Over-bear: only valid from the farthest occupied point */
+            int i, farthest = -1;
+            if (player == WHITE) {
+                for (i = 5; i >= 0; i--)
+                    if (original->points[i] > 0) { farthest = i; break; }
+            } else {
+                for (i = 18; i < 24; i++)
+                    if (original->points[i] < 0) { farthest = i; break; }
+            }
+            return src == farthest;
+        }
+        return 0;
     }
     return dst == src + direction * die;
 }

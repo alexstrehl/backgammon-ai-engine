@@ -157,13 +157,21 @@ class Perspective196Encoder(Encoder):
         return x
 
 
-class CubefulEncoder(Encoder):
-    """Wraps a base encoder, appending a 3-feature one-hot for cube state.
+CUBE_FEATURES = 4  # 3-hot cube perspective + 1 is_cube_action bit
 
-    Features appended: [cube_centered, cube_mine, cube_theirs] —
-    exactly one is 1.0. Cube perspective is the on-roll player's view
-    (CENTERED / MINE / THEIRS), produced by `cube_perspective()` in
-    modes.py from the absolute CubeOwner.
+
+class CubefulEncoder(Encoder):
+    """Wraps a base encoder, appending cube state features.
+
+    Features appended (4 total):
+      [cube_centered, cube_mine, cube_theirs]  3  (one-hot)
+      is_cube_action                         1  (binary)
+
+    Cube perspective is the on-roll player's view (CENTERED / MINE /
+    THEIRS), produced by `cube_perspective()` in modes.py from the
+    absolute CubeOwner. is_cube_action=1 at the cube decision
+    point (before doubling/not-doubling), 0 at the checker decision
+    point.
     """
 
     def __init__(self, base_encoder_name: str = "perspective196"):
@@ -176,22 +184,31 @@ class CubefulEncoder(Encoder):
 
     @property
     def num_features(self) -> int:
-        return self._base.num_features + 3
+        return self._base.num_features + CUBE_FEATURES
 
-    def encode(self, state: BoardState, cube_state: CubePerspective) -> np.ndarray:
-        return self.encode_with_base(self._base.encode(state), cube_state)
+    def encode(
+        self, state: BoardState, cube_state: CubePerspective,
+        is_cube_action: bool = False,
+    ) -> np.ndarray:
+        return self.encode_with_base(
+            self._base.encode(state), cube_state, is_cube_action,
+        )
 
     def encode_with_base(
         self, base_features: np.ndarray, cube_state: CubePerspective,
+        is_cube_action: bool = False,
     ) -> np.ndarray:
-        """Append the cube one-hot to a precomputed base-encoder array.
+        """Append cube features to a precomputed base-encoder array.
         Lets callers reuse a fast (e.g. C) base encoding without
         re-running the Python base encoder.
         """
         x = np.empty(self.num_features, dtype=np.float32)
-        x[: base_features.shape[0]] = base_features
-        x[base_features.shape[0]:] = 0.0
-        x[base_features.shape[0] + int(cube_state)] = 1.0
+        n = base_features.shape[0]
+        x[:n] = base_features
+        x[n:] = 0.0
+        x[n + int(cube_state)] = 1.0
+        if is_cube_action:
+            x[n + 3] = 1.0
         return x
 
 

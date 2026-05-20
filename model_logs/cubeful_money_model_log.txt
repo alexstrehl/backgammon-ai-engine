@@ -1,34 +1,280 @@
 Cubeful Money Model Log
 =======================
 
-Current Best: cubeful_money_512_512_256_256.pt
+Current Best: cubeful_money_512_512_256_256.pt (r15_anneal)
   Architecture: [512, 512, 256, 256] — 562,433 parameters
-  Encoder: cubeful_perspective196 (199 inputs: 196 board + 3 cube one-hot)
+  Encoder: cubeful_perspective196 (200 inputs: 196 board + 3 cube + 1 is_cube_action)
   Output: equity (linear, per-unit normalized to cube_value=1)
   Activation: relu
 
-  Performance (0-ply, 100k games):
-    vs gnubg 0-ply cubeful: +24.1 mEq/game (p=0.016)
-    mEMG (self-play): ~3.3
+  Note on promotion: r15_anneal = r14_pA + 1M 1-ply (PROD recipe:
+  --oneply, 0-ply cube target) with LR linearly annealed from 8.1e-6 to
+  1e-6 over 1M episodes, no warmup. Trained 2026-05-17 (~2h23m on 72-worker
+  7995WX Zen 4, 116.4 ep/s).
 
-  Lineage (~63M total episodes):
-    [512,512] from scratch → depth-expand [512,512,256] → 16M 0-ply + 1-ply
-    → cubeful warm-start 35M with Boltzmann cube exploration + multiple
-    0-ply/1-ply cycles → depth-expand [512,512,256,256] → 10M+ 0-ply polish
-    + 1-ply cube refinement + 0-ply recovery.
-    All training: batch TD(0), Adam, C engine, GPU.
+  Performance vs r14_pA (pooled 8M H-H = two indep 4M runs):
+    win rate: 49.6% (CI [49.5, 49.6]) — slight WR drop, p<0.0001
+    equity: +0.7 mEq/game pooled (run 1 +0.4 p=0.77; run 2 +1.0 p=0.48)
+      — tied within noise, central consistently positive
+    mEMG (3-ply, 4000g): chequer 2.1 / cube 2.5 [1.9, 3.2] / overall 2.2
+      [2.1, 2.2] — overall ties r14_pA (2.1 [2.1, 2.2]) within CI.
 
-Best 3-layer: cubeful_money_512_512_256.pt
-  Architecture: [512, 512, 256] — 496,641 parameters
-  Encoder: cubeful_perspective196 (199 inputs)
-  Output: equity, relu
+  Verdict: equity-tied, slight WR drop offset by central equity lean
+  +0.7 mEq. Treated as a lateral move; promoted to lock in the slightly
+  later checkpoint for future continuations.
+
+  Previous entry (now superseded):
+  ---
+  r14 = r14_pA, unpolished (clean-april). Note on promotion: replaced the
+  previously-promoted r14_pB (polished) with r14_pA (post-1-ply, no polish).
+  Verification follow-up showed the polish step in this round didn't help
+  and may have slightly hurt — see "Polish helped?" section below.
 
   Performance:
-    mEMG (self-play): ~3.7 (world class)
-    H2H vs 4-layer best: -21.3 mEq/game (200k games, significant)
+    r14_pB (polished) vs r12 (10M H-H): trimmed +1.6 mEq, p=0.070
+      (borderline; was the basis for the original r14 promotion).
+    r14_pA (this checkpoint) vs r14_pB (4M direct H-H):
+      win rate: 50.40% — pA wins more games (p<0.001)
+      capped mean (±128):  -0.2 mEq for pB (CI [-3.0, +2.6], p=0.89)
+      trimmed mean (1%):   -0.5 mEq for pB (CI [-3.2, +2.2], p=0.72)
+      Equity statistically tied; win rate slightly favors pA.
+    r14_pA vs r12 not directly H-H tested. Transitively r14_pA's gain
+    over r12 should be ≈ r14_pB's (+1.6 mEq trimmed) since pA ≈ pB.
 
-  Lineage (~26.5M total cubeful episodes):
-    [512,512] from scratch → depth-expand [512,512,256] → 26M cubeful
-    episodes with Boltzmann cube exploration (eps 0.05) throughout
-    → 500k 1-ply refinement (lr 1e-5→5e-6).
-    All training: batch TD(0), Adam, C engine.
+  Independent quality signal (gnubg 3-ply self-play, 5000 games each):
+                              r14_pA (no polish)  r14_pB (polished)
+    Chequer mEMG:             2.2 [2.1, 2.2]      2.1 [2.1, 2.2]
+    Cube mEMG:                1.8 [1.5, 2.3]      2.1 [1.7, 2.5]   ← pA better
+    Overall mEMG:             2.1 [2.0, 2.2]      2.1 [2.1, 2.2]
+    Cube CIs overlap but pA's central estimate is 0.3 lower; CIs both
+    sit comfortably below 3.0 (world class). pA is at least as good as
+    pB and probably slightly better on cube.
+
+  Polish helped? Direct check answers: NO at this stage of the chain.
+    Under the new --oneply default (commit 924c21b) the 1-ply phase no
+    longer breaks cube_mEMG, so the polish phase's main historical role
+    (cleaning up post-1-ply cube damage) is no longer needed. The 5M
+    0-ply polish at lr 2.835e-6 → 2.835e-7 in this round consumed the
+    1-ply phase's gains rather than building on them.
+
+  Lineage:
+    prior r12 → r14 (10h budget, only 1-ply phase needed):
+      5M 1-ply @ constant lr 8.1e-6, warmup 20 (new --oneply default,
+      so cube targets are 0-ply).
+      Phase A throughput 158.7 ep/s, total Phase A 8h44m. The Phase B
+      polish (5M 0-ply @ lr 2.835e-6 → 2.835e-7, 1h30m) was applied
+      but later discarded in favor of the pre-polish checkpoint.
+      (r13, an interim 10M-0-ply-only experiment at lr 3.5e-6 → 3.5e-7
+      starting from r12, was rejected — H-H tied/slightly-negative,
+      central estimate -2.4 mEq capped.)
+    prior r11 → r12 (4h test of new --oneply default with 0-ply cube target):
+      A: 1.7M 1-ply @ constant lr 8.1e-6, warmup 20 (new --oneply default
+         which targets cube decisions at 0-ply rather than the prior 1-ply
+         lookahead — see commit 924c21b for rationale) →
+      B: 2M 0-ply polish @ lr 2.835e-6 → 2.835e-7, warmup 20.
+      Phase A throughput was 162.6 ep/s (vs ~138 ep/s under the old
+      --oneply default — ~18% faster from skipping value_oneply_checker
+      _cubeful at cube points). Cube_mEMG stayed clean across the 1-ply
+      phase (r12_pA cube 2.3 vs old phaseA_r7/r8 cube 3.1-3.2) — the
+      fix works as intended. Total training 3h28m. H-H validation
+      ~tied with r11 (CI ±2.8 mEq, underpowered) but cube_mEMG
+      noticeably better and training meaningfully faster.
+    prior r10_polish_only_2 → r11 (10h autonomous, 3 alternating rounds):
+      3 × (850k 1-ply + 5.5M 0-ply), per phase:
+        1-ply: constant lr 8.1e-6, warmup 20
+        0-ply: lr 2.835e-6 → 2.835e-7, warmup 20
+      ~1h44m per 1-ply phase + ~1h40m per 0-ply phase ≈ 3h24m per round.
+      Total training: 10h05m on this box.
+      Same LRs as r7/r8. Built on r10_polish_only_2 (not r8 directly).
+    prior r8 → r10_polish_only_2 (skipped Phase A entirely):
+      2 × (2M 0-ply with LR restart between phases):
+        lr 3.402e-6 → 2.835e-7 each phase (start +20% over r8's polish,
+        same end). Warmup 20.
+      Total: 4M 0-ply, ~71 min. Validated +3.3 mEq trimmed vs r8 (3M).
+    prior r7 → r8 (6h budget, same recipe shape, same LRs):
+      A: 2.8M 1-ply @ constant lr 8.1e-6, warmup 20 →
+      B: 1.1M 0-ply polish @ lr 2.835e-6 → 2.835e-7, warmup 20.
+      Phase A scaled 0.75× vs r7 (6h vs 8h budget). Same LRs as r7.
+      H-H validation reduced from 10M to 4M — underpowered for sole
+      promotion criterion, but the chain has been steadily giving
+      +2-3 mEq per round, so the +1.8 mEq central estimate is on
+      trend.
+    prior r6 → r7 (8h budget, LR −10%):
+      A: 3.75M 1-ply @ constant lr 8.1e-6, warmup 20 →
+      B: 1.5M 0-ply polish @ lr 2.835e-6 → 2.835e-7, warmup 20.
+      Phase A scaled 1.5× vs r5/r6 (8h vs 5h Phase A); Phase B also
+      scaled 1.5× (1.5M vs 1M episodes). Same A:B time ratio. LRs
+      reduced 10% from r5/r6 (9e-6 → 8.1e-6 / 3.15e-6 → 2.835e-6).
+      Per-round equity gain across the recent chain:
+      r4_long +4.9 → r5 +3.0 → r6 +2.3 → r7 +2.6 → r8 +1.8 (4M) —
+      consistently positive; the chain doesn't seem to plateau.
+    prior r5 → r6 (same recipe applied once more):
+      A: 2.5M 1-ply @ constant lr 9e-6, warmup 20 →
+      B: 1M 0-ply polish @ lr 3.15e-6 → 3.15e-7, warmup 20.
+      Identical recipe to r5; just another iteration.
+      Per-round equity gain trajectory across the recent chain:
+      r4_long +4.9 → r5 +3.0 → r6 +2.3 — diminishing but still
+      significant.
+    prior r4_long → r5 (mid-budget round, ~5h Phase A + standard polish):
+      A: 2.5M 1-ply @ constant lr 9e-6, warmup 20 →
+      B: 1M 0-ply polish @ lr 3.15e-6 → 3.15e-7, warmup 20.
+      Phase A budget halved vs r4_long (5h vs 9h); Phase B reverted to
+      the standard 1M-episode polish (~18min). Same LRs as r4_long.
+      Goal was to test whether more frequent shorter polish iterations
+      would compound — produced +3.0 mEq, ~60% of r4_long's gain in
+      ~half the wall-time.
+    prior short_round3 → r4_long (4.5× the budget, LR −10%):
+      A: 4.5M 1-ply @ constant lr 9e-6, warmup 20 →
+      B: 4.5M 0-ply polish @ lr 3.15e-6 → 3.15e-7, warmup 20.
+      Same constant-LR short-recipe shape as short_round{2,3}, but
+      scaled to ~10h of training (vs ~2h18m for the short rounds) and
+      LRs reduced 10% (1e-5 → 9e-6 for Phase A; polish LRs scaled
+      proportionally). The increased training budget produced ~3× the
+      per-round equity gain of short_round{2,3}.
+    prior short_round2 → short_round3 (same recipe applied once more):
+      A: 1M 1-ply @ constant lr 1e-5, warmup 20 →
+      B: 1M 0-ply polish @ lr 3.5e-6 → 3.5e-7, warmup 20.
+    prior short_round1 → short_round2 (constant LR variant):
+      A: 1M 1-ply @ constant lr 1e-5, warmup 20 →
+      B: 1M 0-ply polish @ lr 3.5e-6 → 3.5e-7, warmup 20.
+      Switched Phase A from decaying 2e-5→2e-6 (short_round1) to
+      constant 1e-5; produced 3× stronger H-H evidence vs short_round1.
+    prior R1_long_round2 → short_round1 (shorter recipe, ~⅓ the budget):
+      A: 1M 1-ply @ lr 2e-5 → 2e-6, warmup 20 →
+      B: 1M 0-ply polish @ lr 3.5e-6 → 3.5e-7, warmup 20.
+    R1_long_round2 was: prior R1_long → same recipe applied once more:
+      A: 2M 1-ply @ lr 1e-5 → 1e-6, warmup 20 →
+      B: 4M 0-ply polish @ lr 3.5e-6 → 3.5e-7, warmup 20.
+    R1_long itself was: prior 4L (post-polish_v11 chain) →
+      A: 2M 1-ply @ lr 1e-5 → 1e-6, warmup 20 →
+      B: 4M 0-ply polish @ lr 3.5e-6 → 3.5e-7, warmup 20
+    (R1_long_round2 promoted over R1_long at +2.6 mEq, p=0.042, 5M games;
+    R1_long was EPYC-validated over previous canonical at +4.1 mEq, p=0.002,
+    4M games; short_round1 promoted at +0.8 mEq, p=0.375, 10M games;
+    short_round2 promoted at trimmed +2.2 mEq, p=0.016, 10M games;
+    short_round3 promoted at capped +1.8 mEq, p=0.046, 10M games;
+    r4_long promoted at capped +4.9 mEq, p<0.001, 10M games;
+    r5 promoted at capped +3.0 mEq, p=0.001, 10M games;
+    r6 promoted at capped +2.3 mEq, p=0.013, 10M games;
+    r7 promoted at capped +2.6 mEq, p=0.005, 10M games.)
+    Training (r8, on EPYC 9K84 dual-socket, RTX 3060):
+      batch TD(0), Adam, C engine, batch=256.
+      Phase A: workers=256, bf16-collect (CPU-only collection).
+      Phase B: workers=176, bf16-collect, cuda master.
+      Wall: 5h39m (A) + 19m (B) = ~5h58m total training.
+      Validation: 1 × 4M H-H @ workers=128, ~25min (reduced from 10M
+                  this round to save time; underpowered).
+    Worker counts were tuned via bench_0ply_cubeful and bench_1ply_cubeful
+    sweeps for this 384-CPU box (defaults are sized for laptop-class).
+
+  Polish-chain history before short_round1 (preserved for context):
+    polish_v2 round 1 (500K 1-ply + 3M polish, lr 1e-5/3.5e-6) →
+    polish_v3 round 2 (same recipe) → polish_v4 (LR × 1.25) → v5/v6/v7
+    chain (cumulative +2.71 mEq EPYC-pooled) → R1_long supersedes
+    polish_v7 with EPYC-validated +4.1 mEq → R1_long_round2 supersedes
+    R1_long with +2.6 mEq (5M H-H) → short_round1 supersedes
+    R1_long_round2 with +0.8 mEq (10M H-H, judgment-call) →
+    short_round2 supersedes short_round1 with trimmed +2.2 mEq, p=0.016
+    (10M H-H) → short_round3 supersedes short_round2 with capped
+    +1.8 mEq, p=0.046 (10M H-H) → r4_long supersedes short_round3 with
+    capped +4.9 mEq, p<0.001 (10M H-H, 4.5× the training budget) →
+    r5 supersedes r4_long with capped +3.0 mEq, p=0.001 (10M H-H,
+    ~half the training budget of r4_long) → r6 supersedes r5 with
+    capped +2.3 mEq, p=0.013 (10M H-H, same recipe applied once more)
+    → r7 supersedes r6 with capped +2.6 mEq, p=0.005 (10M H-H, 8h
+    budget + LR −10%) → r8 supersedes r7 with capped +1.8 mEq, p=0.22
+    (4M H-H, underpowered judgment call) → r11 supersedes r8 with
+    trimmed +2.6 mEq, p=0.003 (10M H-H, 10h autonomous mixed recipe
+    on top of an r9/r10 polish-only chain) → r12 supersedes r11 with
+    equity ~tied at 4M H-H but cube_mEMG 1.7 [1.5, 1.8] vs r11's 2.1
+    [1.7, 2.5] (5k-game gnubg 3-ply self-play, non-overlapping CIs);
+    validates the cube-target fix in commit 924c21b → r14 supersedes
+    r12 with trimmed +1.6 mEq, p=0.070, capped +1.3, p=0.15 (10M H-H,
+    10h training at the same recipe shape; borderline judgment call,
+    diminishing-returns territory).
+
+Best 3-layer: cubeful_money_512_512_256.pt (r4_phaseA, 2026-05-12, unpolished)
+  Architecture: [512, 512, 256] — 497,153 parameters
+  Encoder: cubeful_perspective196 (200 inputs: 196 board + 3 cube + 1 is_cube_action)
+  Output: equity, relu
+
+  Note on promotion: this is a Phase-A-only model (2M 1-ply, no Phase B
+  polish), promoted in line with the 4L r14_pA finding above — under the
+  new --oneply default (commit 924c21b) the polish step's historical role
+  (cleaning up post-1-ply cube damage) is no longer needed. Win rate vs
+  long2_B3 is down 1.1pp (cube-discipline shift) but equity point estimate
+  is positive on all three mean variants; we expect the next-round H-H
+  baseline to confirm the equity gain holds.
+
+  Performance (1M direct H-H vs prior 3L best, long2_B3):
+    win rate:      48.95% [48.8, 49.0]              p<0.01 (lower, classic
+                                                            cube-discipline)
+    capped (±128): +5.3 mEq/game [−0.3, +10.8]      p=0.0660
+    trimmed (1%):  +3.8 mEq/game [−1.5, +9.0]       p=0.1662
+    raw mean:      +5.3 mEq/game [−0.3, +10.8]      p=0.0660
+    All three mean point estimates positive; CIs include 0 at the left
+    edge. Pattern (WR −1pp, equity +5 mEq) matches the historical
+    post-1-ply cube-discipline shift observed across this chain.
+
+  Lineage:
+    prior long2_B3 → r4_phaseA (4h budget, Phase A only):
+      A: 2M 1-ply @ constant lr=8.1e-6, warmup 20.
+      Phase B (1M 0-ply polish @ lr=2.835e-6 → 2.835e-7) was prepared but
+      cancelled mid-execution after the 4L r14_pA finding showed polish
+      consuming the 1-ply phase's gains under the new --oneply default.
+      Training: 3h15m Phase A @ 170.4 eps/s on TR PRO 7995WX + RTX 4090.
+      H-H 1M direct vs long2_B3: 10m @ 1689 g/s.
+    prior newcode → long2_B3 (~9.3h autonomous overnight, 3 alternating
+    rounds at LR −10%):
+      Per round:
+        A: 1.5M 1-ply @ constant lr=8.1e-6, warmup 20 →
+        B: 2.0M 0-ply       @ lr=2.835e-6 → 2.835e-7, warmup 20.
+      LR shape mirrors what worked on the 4L chain at this maturity (r7+
+      reduced 9e-6 → 8.1e-6 to make further gains). First 3L test of
+      that LR shift; cleared the apparent plateau seen on r2 (newcode +
+      1.5M 1-ply + 1M 0-ply at full LR, equity tied with newcode at
+      −3 mEq, p=0.235).
+      Training: 3 × (2h26-29m Phase A @ ~169 eps/s + 33m Phase B @
+                ~1015 eps/s) on TR PRO 7995WX + RTX 4090.
+      Total training: 9h01m. H-H 1M direct vs newcode: 10m @ 1667 g/s.
+      Total wall: 9h12m.
+    Prior 3L promotion chain (cumulative):
+      r1 = baseline + 1.4M 1-ply + 1M polish      (+11.3 mEq vs baseline, 2M)
+      polish2 = r1 + 1M 0-ply (same LR)           (+2.4 mEq vs r1, 2M)
+      polish3 = polish2 + 2M 0-ply @ +20% LR       (+3.8 mEq vs polish2, 2M)
+      long_B3 = polish3 + 3 × (450k 1-ply + 2M 0-ply, 9h42m autonomous)
+                                                   (+5.5 mEq vs polish3, 2M)
+      newcode = long_B3 + 2M 1-ply + 1M 0-ply      (+7.0 mEq vs long_B3, 1M)
+      long2_B3 = newcode + 3 × (1.5M 1-ply + 2M 0-ply) @ LR −10%
+                                                   (+10.0 mEq vs newcode, 1M)
+      r4_phaseA = long2_B3 + 2M 1-ply (no polish)  (+5.3 mEq capped vs
+                                                    long2_B3, p=0.066, 1M)
+      (r2 = newcode + 1.5M 1-ply + 1M 0-ply at full LR tied within noise
+       at −3.2 mEq trimmed, p=0.235 — not promoted; superseded by long2_B3
+       which scaled both time and LR.)
+
+  Historic performance (pre-r1 baseline of this model file, ~22.3M ep):
+
+  Performance (1M games vs gnubg 0-ply cubeful):
+    win rate: 50.1% (CI [50.0, 50.2])
+    equity:   +34.6 mEq/game (CI [+28.5, +40.8], p<0.0001)
+
+  Performance vs prior 3-layer best (v2 from commit 21d8c08):
+    direct 2M H-H: equity +2.4 mEq (CI [-1.6, +6.3], p=0.24); win rate -1.32% (p<0.0001)
+    inferred via common gnubg opponent: ~+6.6 mEq (propagated SE ~4.4)
+    Prior v2 vs same gnubg (1M): +28.0 mEq (CI [+22.1, +34.0])
+    Both signals lean positive; win-rate gap reflects style (cube-aggression)
+    rather than equity.
+
+  Pre-r1 lineage (~22.3M cubeful episodes; oracle-style recipe on v11 cubeless warm-start):
+    best cubeless_money [512,512,256] (v11) → --warm-start-cubeful
+    (196→200 inputs, output re-init to equity) →
+    Round 0 (initial): 2M 0-ply @ lr 1e-4 →
+    Round 1: +8M 0-ply @ lr 5e-5 → 5e-6 →
+    Round 2: 10M 0-ply @ lr 3.5e-6 → 3.5e-7 (low-LR continuation) →
+    Round 3: 300K 1-ply @ lr 1.05e-5 → 1.05e-6, 20-round warmup →
+    Round 4: 2M 0-ply polish @ lr 3.5e-6 → 3.5e-7.
+    Training: batch TD(0), Adam, C engine, cuda master, workers=144.
+    Notes: recipe mirrors the oracle_cubeful best-model recipe (two 0-ply
+    phases + 1-ply + polish). Total ~22.3M cubeful episodes vs ~15.5M for
+    the prior v2 — more training, similar lineage.
