@@ -8,6 +8,7 @@ logs/
 datasets/
 *.pt
 !best_models/**/*.pt
+!benchmarks/models/*.pt
 # Ignore everything in models/ except .pt checkpoints + .gitkeep
 # (prevents stray .log/.json/.npz/etc. from being accidentally committed).
 models/**/*

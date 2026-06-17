@@ -11,16 +11,13 @@ Run with: pytest tests/test_model.py -v
 
 import tempfile
 import os
-import random
 import numpy as np
 import torch
 import pytest
 
 from model import TDNetwork
 from encoding import NUM_FEATURES, ENCODERS, get_encoder, CubePerspective, CubefulEncoder
-from backgammon_engine import BoardState, WHITE, BLACK, get_legal_plays, switch_turn
-from agents import RandomAgent
-from td_agent import TDAgent
+from backgammon_engine import BoardState
 
 
 # ── Architecture Unit Tests ──────────────────────────────────────────────────
@@ -248,17 +245,18 @@ class TestCubefulEncoder:
                      CubePerspective.MINE,
                      CubePerspective.THEIRS):
             x = enc.encode(state, cube)
-            assert x.shape == (200,)
-            assert x[196 + int(cube)] == 1.0
+            # Layout: NUM_FEATURES base + 3 cube one-hot + 1 is_cube_action.
+            assert x.shape == (NUM_FEATURES + 4,)
+            assert x[NUM_FEATURES + int(cube)] == 1.0
             # Cube one-hot (3) + is_cube_action (0) = 1.0 total
-            assert x[196:199].sum() == 1.0
-            assert x[199] == 0.0  # is_cube_action defaults to False
+            assert x[NUM_FEATURES:NUM_FEATURES + 3].sum() == 1.0
+            assert x[NUM_FEATURES + 3] == 0.0  # is_cube_action defaults to False
 
     def test_base_features_match_perspective196(self):
-        """First 196 features must equal Perspective196Encoder output."""
+        """First NUM_FEATURES features must equal Perspective196Encoder output."""
         cubeful = get_encoder("cubeful_perspective196")
         base = get_encoder("perspective196")
         state = BoardState.initial()
         x = cubeful.encode(state, CubePerspective.CENTERED)
-        np.testing.assert_array_equal(x[:196], base.encode(state))
+        np.testing.assert_array_equal(x[:NUM_FEATURES], base.encode(state))
 

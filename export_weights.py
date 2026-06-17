@@ -7,13 +7,18 @@ Binary format (.bin):
     4 bytes:  magic "BGNN"
     int32:    num_hidden_layers
     int32:    input_size
-    int32:    activation (0=relu, 1=sigmoid, 2=tanh, 3=leaky_relu)
-    int32:    output_mode (0=probability [sigmoid], 1=equity [linear])
+    int32:    activation (0=relu, 1=sigmoid, 2=tanh, 3=leaky_relu, 4=hardsigmoid)
+    int32:    output_mode (0=probability [sigmoid], 1=equity [linear],
+                           2=prob5 [5 sigmoid outputs -> money equity])
     int32[]:  hidden_sizes (num_hidden_layers entries)
 
     Then for each layer (hidden_0 ... hidden_N-1, output):
         float32[out * in]:  weight matrix (row-major)
         float32[out]:       bias vector
+
+    The output layer has 1 neuron except for prob5 (output_mode 2), which
+    has 5. The C reader (nn_eval.c) applies sigmoid + the nested-event
+    clamp + equity reduction for prob5.
 
 Usage:
     python export_weights.py model.pt model.bin
@@ -25,17 +30,19 @@ import sys
 import numpy as np
 import os
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-# Also add the repo root for model.py imports
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import torch.nn as nn
 
-from model import TDNetwork
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from model import ProbNetwork, load_model
+
 
 ACTIVATION_MAP = {
     "relu": 0,
     "sigmoid": 1,
     "tanh": 2,
     "leaky_relu": 3,
+    "hardsigmoid": 4,
 }
 
 OUTPUT_MODE_MAP = {
@@ -43,10 +50,12 @@ OUTPUT_MODE_MAP = {
     "equity": 1,
 }
 
+OUTPUT_MODE_PROB5 = 2
+
 
 def export_model(model_path: str, output_path: str):
-    """Load a .pt TDNetwork and write binary weights."""
-    model = TDNetwork.load(model_path)
+    """Load a .pt model (TDNetwork or prob5 ProbNetwork) and write binary weights."""
+    model = load_model(model_path)
     model.eval()
 
     act_id = ACTIVATION_MAP.get(model.activation)
@@ -54,7 +63,20 @@ def export_model(model_path: str, output_path: str):
         raise ValueError(f"Unsupported activation '{model.activation}' for C export. "
                          f"Supported: {list(ACTIVATION_MAP.keys())}")
 
-    output_mode_id = OUTPUT_MODE_MAP.get(model.output_mode, 0)
+    if isinstance(model, ProbNetwork):
+        # prob5: hidden linears live in `trunk` (Linear/activation pairs),
+        # the 5-output layer is `head`. C applies sigmoid to all 5.
+        hidden_layers = [m for m in model.trunk if isinstance(m, nn.Linear)]
+        output_layer = model.head
+        output_mode_id = OUTPUT_MODE_PROB5
+        n_out = output_layer.out_features
+        mode_label = "prob5"
+    else:
+        hidden_layers = list(model.hidden_layers)
+        output_layer = model.fc_output
+        output_mode_id = OUTPUT_MODE_MAP.get(model.output_mode, 0)
+        n_out = 1
+        mode_label = model.output_mode
 
     with open(output_path, "wb") as f:
         # Header
@@ -66,27 +88,20 @@ def export_model(model_path: str, output_path: str):
         for hs in model.hidden_sizes:
             f.write(struct.pack("<i", hs))
 
-        # Hidden layers
+        # Hidden layers, then output layer
         total_params = 0
-        for i, layer in enumerate(model.hidden_layers):
+        for layer in hidden_layers + [output_layer]:
             w = layer.weight.detach().cpu().numpy()  # shape [out, in]
             b = layer.bias.detach().cpu().numpy()     # shape [out]
             f.write(w.astype(np.float32).tobytes())
             f.write(b.astype(np.float32).tobytes())
             total_params += w.size + b.size
 
-        # Output layer
-        w = model.fc_output.weight.detach().cpu().numpy()
-        b = model.fc_output.bias.detach().cpu().numpy()
-        f.write(w.astype(np.float32).tobytes())
-        f.write(b.astype(np.float32).tobytes())
-        total_params += w.size + b.size
-
     file_size = os.path.getsize(output_path)
     print(f"Exported: {output_path}")
-    print(f"  Architecture: [{model.input_size}] -> {model.hidden_sizes} -> [1]")
+    print(f"  Architecture: [{model.input_size}] -> {model.hidden_sizes} -> [{n_out}]")
     print(f"  Activation: {model.activation}")
-    print(f"  Output mode: {model.output_mode}")
+    print(f"  Output mode: {mode_label}")
     print(f"  Parameters: {total_params:,}")
     print(f"  File size: {file_size:,} bytes ({file_size / 1024:.1f} KB)")
 
@@ -94,16 +109,22 @@ def export_model(model_path: str, output_path: str):
 def verify_export(model_path: str, bin_path: str):
     """Quick sanity check: print Python output on a test input."""
     import torch
-    model = TDNetwork.load(model_path)
+    model = load_model(model_path)
     model.eval()
 
     np.random.seed(42)
     test_input = np.random.randn(model.input_size).astype(np.float32)
     with torch.no_grad():
-        py_out = model(torch.tensor(test_input)).item()
-
-    print(f"  Verification: Python output = {py_out:.8f}")
-    print(f"  (Run C inference on same input to compare)")
+        out = model(torch.tensor(test_input)[None, :])
+        if isinstance(model, ProbNetwork):
+            from model import prob5_postprocess, prob5_to_equity
+            if model.raw_logits:
+                out = torch.sigmoid(out)
+            py_out = float(prob5_to_equity(prob5_postprocess(out))[0])
+            print(f"  Verification: Python prob5 equity = {py_out:.8f}")
+        else:
+            print(f"  Verification: Python output = {float(out.reshape(-1)[0]):.8f}")
+    print("  (Run C inference on same input to compare)")
 
 
 if __name__ == "__main__":

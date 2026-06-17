@@ -366,6 +366,13 @@ class GnubgNNCubefulAgent(Agent):
         """
         from modes import cube_perspective, CubePerspective
         persp = cube_perspective(match_state.cube_owner, on_roll_player)
+        # Owned cubes are always passed to gnubg as 2, NOT the real
+        # cube_value: money cube decisions are per-unit (invariant to
+        # the current cube level), and the 21pt 0-0 simulation only
+        # approximates money play while the cube turn stays far from
+        # the match horizon. Feeding the real value (4, 8, ...) would
+        # push the simulated redouble toward match-deciding MWC
+        # territory and distort the decision.
         if persp == CubePerspective.CENTERED:
             gnubg_nn.set.cube(1, b'X')   # owner ignored at cube=1
         elif persp == CubePerspective.MINE:

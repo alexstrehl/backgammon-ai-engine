@@ -36,8 +36,8 @@ torch.set_num_threads(1)
 
 from td_agent import TDAgent
 from train_cli import (
-    add_common_args, build_mode, build_network, eval_vs_random,
-    resolve_save_path,
+    add_common_args, apply_cubeful_money_upgrades, build_mode, build_network,
+    eval_vs_random, resolve_save_path,
 )
 from trainer import Trainer
 
@@ -59,22 +59,7 @@ def main():
                         help="Print recent step loss every N episodes (0 to disable).")
     args = parser.parse_args()
 
-    # Same cubeful-money auto-upgrade as train_batch.py.
-    if args.game_mode == "cubeful-money" and not args.resume:
-        if args.encoder == "perspective196":
-            args.encoder = "cubeful_perspective196"
-        elif not args.encoder.startswith("cubeful_"):
-            raise ValueError(
-                f"cubeful-money requires a cubeful_* encoder; "
-                f"got --encoder {args.encoder!r}"
-            )
-        if args.output_mode == "probability":
-            args.output_mode = "equity"
-        elif args.output_mode != "equity":
-            raise ValueError(
-                f"cubeful-money requires --output-mode equity; "
-                f"got {args.output_mode!r}"
-            )
+    apply_cubeful_money_upgrades(args)
 
     if args.torch_seed is not None:
         torch.manual_seed(args.torch_seed)

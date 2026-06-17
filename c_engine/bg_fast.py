@@ -125,6 +125,18 @@ _lib.encode_state.argtypes = [
 ]
 _lib.encode_state.restype = None
 
+_HAS_EXPAND21 = hasattr(_lib, "get_legal_plays_encoded_21")
+if _HAS_EXPAND21:
+    _lib.get_legal_plays_encoded_21.argtypes = [
+        ctypes.POINTER(_CBoardState),
+        ctypes.POINTER(ctypes.c_float),  # out_feats
+        ctypes.POINTER(ctypes.c_int),    # out_dice_counts[21]
+        ctypes.POINTER(ctypes.c_int),    # out_reply_gr[max_replies]
+        ctypes.c_int,                    # max_rows
+        ctypes.c_int,                    # max_replies
+    ]
+    _lib.get_legal_plays_encoded_21.restype = ctypes.c_int
+
 
 # ── Pre-allocated buffers ───────────────────────────────────────────
 #
@@ -270,3 +282,57 @@ def get_legal_plays_encoded(state: BoardState, dice, encoder=None):
     # can hold onto it across subsequent calls.
     features = _feature_buf[: count * NUM_FEATURES].reshape(count, NUM_FEATURES).copy()
     return features, _LazyNextStates(count)
+
+
+# ── 1-ply inner expansion (all 21 opponent dice in one C call) ──────
+
+# Reusable buffers for expand_21. Sized for a generous worst case; the
+# C call returns -1 on overflow and the caller falls back to the
+# per-dice path. ~47 MB feats + small int buffers, allocated once.
+_EXP21_MAX_ROWS = 60000
+_EXP21_MAX_REPLIES = 80000
+if _HAS_EXPAND21:
+    _exp21_feats = np.zeros(_EXP21_MAX_ROWS * NUM_FEATURES, dtype=np.float32)
+    _exp21_feats_ptr = _exp21_feats.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    _exp21_counts = np.zeros(21, dtype=np.int32)
+    _exp21_counts_ptr = _exp21_counts.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+    _exp21_gr = np.zeros(_EXP21_MAX_REPLIES, dtype=np.int32)
+    _exp21_gr_ptr = _exp21_gr.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+
+
+def expand_21(next_state: BoardState):
+    """All-21-opponent-dice 1-ply inner expansion in one C call.
+
+    Returns `(base_feats, dice_counts, reply_gr, n_rows)`:
+        base_feats:  (n_rows, 196) float32 — copy of the non-terminal
+                     reply encodings, packed in reply order.
+        dice_counts: (21,) int32 — replies per dice bucket (>=1).
+        reply_gr:    (n_replies,) int32 — 0 for a non-terminal reply
+                     (consumes the next base_feats row), else 1/2/3 for
+                     a terminal reply (no row).
+        n_rows:      number of base_feats rows (== count of gr == 0).
+
+    Returns None if the C function is unavailable or a buffer overflows
+    (caller should fall back to the per-dice path).
+    """
+    if not _HAS_EXPAND21:
+        return None
+    c_state = _python_to_c(next_state)
+    n_replies = _lib.get_legal_plays_encoded_21(
+        ctypes.byref(c_state),
+        _exp21_feats_ptr,
+        _exp21_counts_ptr,
+        _exp21_gr_ptr,
+        _EXP21_MAX_ROWS,
+        _EXP21_MAX_REPLIES,
+    )
+    if n_replies < 0:
+        return None
+    gr = _exp21_gr[:n_replies].copy()
+    n_rows = int(np.count_nonzero(gr == 0))
+    base_feats = (
+        _exp21_feats[: n_rows * NUM_FEATURES]
+        .reshape(n_rows, NUM_FEATURES)
+        .copy()
+    )
+    return base_feats, _exp21_counts.copy(), gr, n_rows

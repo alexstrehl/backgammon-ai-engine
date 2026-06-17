@@ -50,6 +50,31 @@ def build_mode(name: str, jacoby: bool = True):
     raise ValueError(f"Unknown game mode: {name}")
 
 
+def apply_cubeful_money_upgrades(args) -> None:
+    """In-place cubeful-money auto-upgrades on parsed CLI args: the
+    encoder must include the cube one-hot and the output must be equity.
+    Overrides silently if the user left the defaults; errors if they set
+    conflicting flags. No-op unless game_mode == "cubeful-money" (and not
+    resuming, where the saved architecture wins). Shared by train_online
+    and train_batch.
+    """
+    if args.game_mode == "cubeful-money" and not args.resume:
+        if args.encoder == "perspective196":
+            args.encoder = "cubeful_perspective196"
+        elif not args.encoder.startswith("cubeful_"):
+            raise ValueError(
+                f"cubeful-money requires a cubeful_* encoder; "
+                f"got --encoder {args.encoder!r}"
+            )
+        if args.output_mode == "probability":
+            args.output_mode = "equity"
+        elif args.output_mode != "equity":
+            raise ValueError(
+                f"cubeful-money requires --output-mode equity; "
+                f"got {args.output_mode!r}"
+            )
+
+
 def build_network(args) -> TDNetwork:
     """Construct, resume, or expand a TDNetwork from CLI args.
 

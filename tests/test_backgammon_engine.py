@@ -7,6 +7,21 @@ from backgammon_engine import (
 )
 
 
+def _bg_fast_or_skip():
+    """Import the built C engine, or skip the calling test if it isn't
+    available. Shared by every C-engine parity test below."""
+    import sys
+    sys.path.insert(0, "c_engine")
+    try:
+        import bg_fast
+        import importlib
+        importlib.reload(bg_fast)
+        return bg_fast
+    except (ImportError, OSError):
+        import pytest
+        pytest.skip("C engine not built")
+
+
 def test_starting_position_checker_count():
     b = BoardState.initial()
     assert sum(max(v, 0) for v in b.points) == NUM_CHECKERS
@@ -174,15 +189,7 @@ def test_bearoff_45_python():
 
 def test_bearoff_45_c_engine():
     """Same bear-off test using the C engine."""
-    import sys
-    sys.path.insert(0, "c_engine")
-    try:
-        import bg_fast
-        import importlib
-        importlib.reload(bg_fast)
-    except (ImportError, OSError):
-        import pytest
-        pytest.skip("C engine not built")
+    bg_fast = _bg_fast_or_skip()
 
     state = _bearoff_position()
     feats, states = bg_fast.get_legal_plays_encoded(state, (4, 5))
@@ -198,15 +205,7 @@ def test_midgame_double1s_python():
 
 def test_midgame_double1s_c_engine():
     """Mid-game double 1s: 536 distinct legal plays (C engine)."""
-    import sys
-    sys.path.insert(0, "c_engine")
-    try:
-        import bg_fast
-        import importlib
-        importlib.reload(bg_fast)
-    except (ImportError, OSError):
-        import pytest
-        pytest.skip("C engine not built")
+    bg_fast = _bg_fast_or_skip()
 
     state = _midgame_position()
     feats, states = bg_fast.get_legal_plays_encoded(state, (1, 1))
@@ -233,15 +232,7 @@ def test_bearoff_52_python():
 
 def test_bearoff_52_c_engine():
     """Same bear-off 5-2 test using the C engine."""
-    import sys
-    sys.path.insert(0, "c_engine")
-    try:
-        import bg_fast
-        import importlib
-        importlib.reload(bg_fast)
-    except (ImportError, OSError):
-        import pytest
-        pytest.skip("C engine not built")
+    bg_fast = _bg_fast_or_skip()
     state = _bearoff_position_2()
     feats, states = bg_fast.get_legal_plays_encoded(state, (5, 2))
     assert len(states) == 3, f"Expected 3, got {len(states)}"
@@ -249,15 +240,7 @@ def test_bearoff_52_c_engine():
 
 def test_bearoff_and_midgame_engines_agree():
     """Python and C engines produce the same move count for all test positions."""
-    import sys
-    sys.path.insert(0, "c_engine")
-    try:
-        import bg_fast
-        import importlib
-        importlib.reload(bg_fast)
-    except (ImportError, OSError):
-        import pytest
-        pytest.skip("C engine not built")
+    bg_fast = _bg_fast_or_skip()
 
     for state, dice, label in [
         (_bearoff_position(), (4, 5), "bearoff 4-5"),
@@ -269,19 +252,6 @@ def test_bearoff_and_midgame_engines_agree():
         assert len(py_plays) == len(c_states), (
             f"{label}: Python={len(py_plays)} vs C={len(c_states)}"
         )
-
-
-def _bg_fast_or_skip():
-    import sys
-    sys.path.insert(0, "c_engine")
-    try:
-        import bg_fast
-        import importlib
-        importlib.reload(bg_fast)
-        return bg_fast
-    except (ImportError, OSError):
-        import pytest
-        pytest.skip("C engine not built")
 
 
 def test_initial_doubles_c_engine_nonzero():

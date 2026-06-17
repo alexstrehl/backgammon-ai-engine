@@ -18,6 +18,12 @@ static inline float act_relu(float x)        { return x > 0.0f ? x : 0.0f; }
 static inline float act_sigmoid(float x)     { return 1.0f / (1.0f + expf(-x)); }
 static inline float act_tanh_(float x)       { return tanhf(x); }
 static inline float act_leaky_relu(float x)  { return x > 0.0f ? x : 0.01f * x; }
+/* Matches torch.nn.functional.hardsigmoid: 0 for x<=-3, 1 for x>=3, else x/6+1/2 */
+static inline float act_hardsigmoid(float x) {
+    if (x <= -3.0f) return 0.0f;
+    if (x >= 3.0f)  return 1.0f;
+    return x / 6.0f + 0.5f;
+}
 
 typedef float (*act_fn)(float);
 
@@ -27,6 +33,7 @@ static act_fn get_activation(int act) {
         case NN_ACTIVATION_SIGMOID:     return act_sigmoid;
         case NN_ACTIVATION_TANH:        return act_tanh_;
         case NN_ACTIVATION_LEAKY_RELU:  return act_leaky_relu;
+        case NN_ACTIVATION_HARDSIGMOID: return act_hardsigmoid;
         default:                        return act_relu;
     }
 }
@@ -60,6 +67,15 @@ int nn_load(NNModel *model, const char *path) {
         return -1;
     }
 
+    if (model->output_mode != NN_OUTPUT_PROBABILITY &&
+        model->output_mode != NN_OUTPUT_EQUITY &&
+        model->output_mode != NN_OUTPUT_PROB5) {
+        fprintf(stderr, "nn_load: unknown output_mode=%d (expected 0/1/2)\n",
+                model->output_mode);
+        fclose(f);
+        return -1;
+    }
+
     if (model->num_hidden < 1 || model->num_hidden > NN_MAX_LAYERS) {
         fprintf(stderr, "nn_load: bad num_hidden=%d\n", model->num_hidden);
         fclose(f);
@@ -85,9 +101,13 @@ int nn_load(NNModel *model, const char *path) {
         prev = model->hidden_sizes[i];
         if (prev > max_dim) max_dim = prev;
     }
-    /* Output layer: 1 neuron */
+    /* Output layer: 5 neurons for prob5, else 1 */
     model->layer_in[model->num_hidden] = prev;
-    model->layer_out[model->num_hidden] = 1;
+    model->layer_out[model->num_hidden] =
+        (model->output_mode == NN_OUTPUT_PROB5) ? NN_PROB5_OUTPUTS : 1;
+    /* Scratch buffers must also hold the output layer's width. */
+    if (model->layer_out[model->num_hidden] > max_dim)
+        max_dim = model->layer_out[model->num_hidden];
 
     /* Allocate and read weights/biases */
     for (int i = 0; i < total_layers; i++) {
@@ -146,7 +166,9 @@ void nn_free(NNModel *model) {
 
 /* ── Forward pass ──────────────────────────────────────────────── */
 
-float nn_forward(const NNModel *model, const float *input) {
+/* Run all layers; returns a pointer to the (sigmoid/linear-applied)
+ * output layer values living in one of the model's scratch buffers. */
+static const float *forward_raw(const NNModel *model, const float *input) {
     act_fn activate = get_activation(model->activation);
     const float *in = input;
     float *out = model->buf_a;
@@ -167,7 +189,8 @@ float nn_forward(const NNModel *model, const float *input) {
             if (L < model->num_hidden) {
                 out[i] = activate(sum);
             } else {
-                /* Output layer: sigmoid for probability, linear for equity */
+                /* Output layer: linear for equity, sigmoid otherwise
+                 * (probability and prob5 are both sigmoid). */
                 out[i] = (model->output_mode == NN_OUTPUT_EQUITY)
                          ? sum : act_sigmoid(sum);
             }
@@ -177,5 +200,36 @@ float nn_forward(const NNModel *model, const float *input) {
         out = (out == model->buf_a) ? model->buf_b : model->buf_a;
     }
 
-    return in[0];
+    return in;
+}
+
+/* prob5: clamp nested-event inequalities then reduce to cubeless money
+ * equity. Mirrors model.prob5_postprocess + model.prob5_to_equity. If
+ * out != NULL, writes the 5 postprocessed probabilities. */
+static float prob5_reduce(const float *raw, float *out) {
+    float p0 = raw[0], p1 = raw[1], p2 = raw[2], p3 = raw[3], p4 = raw[4];
+    if (p1 > p0) p1 = p0;            /* P(wg)  <= P(win)   */
+    float lose = 1.0f - p0;
+    if (p3 > lose) p3 = lose;        /* P(lg)  <= 1-P(win) */
+    if (p2 > p1) p2 = p1;            /* P(wbg) <= P(wg)    */
+    if (p4 > p3) p4 = p3;            /* P(lbg) <= P(lg)    */
+    if (out) { out[0] = p0; out[1] = p1; out[2] = p2; out[3] = p3; out[4] = p4; }
+    return 2.0f * p0 + p1 + p2 - p3 - p4 - 1.0f;
+}
+
+float nn_forward(const NNModel *model, const float *input) {
+    const float *o = forward_raw(model, input);
+    if (model->output_mode == NN_OUTPUT_PROB5)
+        return prob5_reduce(o, NULL);
+    return o[0];
+}
+
+float nn_forward_prob5(const NNModel *model, const float *input,
+                       float probs[NN_PROB5_OUTPUTS]) {
+    if (model->output_mode != NN_OUTPUT_PROB5) {
+        for (int k = 0; k < NN_PROB5_OUTPUTS; k++) probs[k] = 0.0f;
+        return nn_forward(model, input);
+    }
+    const float *o = forward_raw(model, input);
+    return prob5_reduce(o, probs);
 }

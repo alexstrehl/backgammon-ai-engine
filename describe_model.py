@@ -22,43 +22,58 @@ def describe(path: str) -> None:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     size_mb = os.path.getsize(path) / (1024 * 1024)
 
+    is_prob5 = checkpoint.get("model_type") == "prob5"
     hidden = checkpoint.get("hidden_sizes", [])
     input_size = checkpoint.get("input_size", 196)
     activation = checkpoint.get("activation", "relu")
     encoder = checkpoint.get("encoder_name", "perspective196")
-    output_mode = checkpoint.get("output_mode", "probability")
     train_params = checkpoint.get("train_params", {})
+    if is_prob5:
+        n_out = 5
+        output_mode = "raw logits" if checkpoint.get("raw_logits") else "probability"
+    else:
+        n_out = 1
+        output_mode = checkpoint.get("output_mode", "probability")
 
     # Count parameters from state_dict
     state_dict = checkpoint.get("state_dict", {})
     total_params = sum(v.numel() for v in state_dict.values())
-    trainable_params = total_params  # all params are trainable in TDNetwork
 
-    # Layer-by-layer breakdown
+    # Layer-by-layer breakdown. prob5 nets store linears as trunk.{2i}/head;
+    # scalar nets as hidden_layers.{i}/fc_output.
     layers = []
     prev_size = input_size
     for i, h in enumerate(hidden):
-        w_key = f"hidden_layers.{i}.weight"
-        b_key = f"hidden_layers.{i}.bias"
-        w_params = state_dict[w_key].numel() if w_key in state_dict else 0
-        b_params = state_dict[b_key].numel() if b_key in state_dict else 0
+        prefix = f"trunk.{2 * i}" if is_prob5 else f"hidden_layers.{i}"
+        w = state_dict.get(f"{prefix}.weight")
+        b = state_dict.get(f"{prefix}.bias")
         layers.append({
             "name": f"hidden_{i}",
             "type": f"Linear({prev_size} → {h})",
             "activation": activation,
-            "params": w_params + b_params,
+            "params": (w.numel() if w is not None else 0) + (b.numel() if b is not None else 0),
         })
         prev_size = h
 
     # Output layer
-    out_w = state_dict.get("fc_output.weight")
-    out_b = state_dict.get("fc_output.bias")
+    out_prefix = "head" if is_prob5 else "fc_output"
+    out_w = state_dict.get(f"{out_prefix}.weight")
+    out_b = state_dict.get(f"{out_prefix}.bias")
     out_params = (out_w.numel() if out_w is not None else 0) + \
                  (out_b.numel() if out_b is not None else 0)
-    out_act = "sigmoid" if output_mode == "probability" else "linear"
+    if is_prob5:
+        # prob5 always applies sigmoid + nested-event clamp at inference,
+        # regardless of raw_logits (which only moves the sigmoid out of forward()).
+        out_act = "5x sigmoid + nested-event clamp (inference)"
+    elif output_mode == "raw logits":
+        out_act = "linear"
+    elif output_mode == "probability":
+        out_act = "sigmoid"
+    else:
+        out_act = "linear"
     layers.append({
         "name": "output",
-        "type": f"Linear({prev_size} → 1)",
+        "type": f"Linear({prev_size} → {n_out})",
         "activation": out_act,
         "params": out_params,
     })
@@ -74,7 +89,12 @@ def describe(path: str) -> None:
     print(f"  Input:       {input_size} features ({encoder})")
     print(f"  Hidden:      {hidden}")
     print(f"  Activation:  {activation}")
-    print(f"  Output mode: {output_mode} ({'sigmoid [0,1]' if output_mode == 'probability' else 'linear (unbounded)'})")
+    if is_prob5:
+        print(f"  Output mode: prob5 ({n_out} outputs: P(win),P(wg),P(wbg),"
+              f"P(lg),P(lbg); sigmoid + nested-event clamp at inference"
+              f"{'; stored as raw logits' if checkpoint.get('raw_logits') else ''})")
+    else:
+        print(f"  Output mode: {output_mode} ({'sigmoid [0,1]' if output_mode == 'probability' else 'linear (unbounded)'})")
     print(f"  Parameters:  {total_params:,}")
     print()
 

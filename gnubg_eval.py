@@ -8,14 +8,8 @@ Workflow:
     4. Run gnubg once in batch mode to analyze all games.
     5. Parse the mEMG error rates from gnubg's output.
 
-The mEMG (millipoints Error per Move in Equivalent Money Game) is the
+The mEMG (millipoints Error per Move in Equivalent Money Game) is a
 standard metric used by the backgammon community to measure play quality.
-Lower is better:
-    mEMG < 3    : world class
-    mEMG 3-5    : expert
-    mEMG 5-8    : advanced
-    mEMG 8-12   : intermediate
-    mEMG > 12   : beginner
 
 Platform support:
     Set GNUBG_CMD to the path of your gnubg CLI executable.
@@ -27,7 +21,6 @@ Usage:
     python gnubg_eval.py --model td_model_final.pt --games 10
 """
 
-import math
 import multiprocessing as mp
 import os
 import platform
@@ -94,6 +87,47 @@ class GameRecord:
     ended_by_drop: bool = False    # True if game ended on a drop
 
 
+def assert_cubeful_supported(model_path: str, cubeful: bool) -> None:
+    """Reject prob5 + cubeful early (in the parent, before workers spawn).
+
+    Raising inside a multiprocessing pool worker surfaces as an opaque
+    pool exception (or a hang); callers validate once up front instead.
+    """
+    if not cubeful:
+        return
+    from model import load_model, ProbNetwork
+    if isinstance(load_model(model_path), ProbNetwork):
+        raise ValueError(
+            f"{model_path}: prob5 is cubeless-only and has no cube policy; "
+            "cubeful gnubg analysis is not supported.")
+
+
+def _load_eval_agent(model_path: str, oneply: bool = False, cubeful: bool = False):
+    """Load a checkpoint and wrap it in the right agent for analysis:
+    prob5 -> ProbAgent (cubeless money only), scalar -> TDAgent."""
+    from model import load_model, ProbNetwork
+    net = load_model(model_path)
+    if isinstance(net, ProbNetwork):
+        if cubeful:  # backstop; parent should validate before spawning workers
+            raise ValueError(
+                f"{model_path}: prob5 is cubeless-only and has no cube policy; "
+                "cubeful gnubg analysis is not supported.")
+        from prob_agent import ProbAgent
+        return ProbAgent(net, plies=1 if oneply else 0)
+    from td_agent import TDAgent
+    return TDAgent(net, oneply=oneply)
+
+
+def _avg_rates(rates):
+    """Split a list of (white, black) error-rate tuples into per-side
+    lists plus the combined mean. Returns (white_list, black_list, mean)
+    where mean is None when there are no rates."""
+    w = [er[0] for er in rates]
+    b = [er[1] for er in rates]
+    a = w + b
+    return w, b, sum(a) / len(a) if a else None
+
+
 def play_and_record(agent_white, agent_black) -> GameRecord:
     """Play a full cubeless game, recording every dice roll and move.
 
@@ -132,12 +166,18 @@ def play_and_record(agent_white, agent_black) -> GameRecord:
 
 def play_and_record_cubeful(
     agent_white, agent_black, jacoby: bool = True,
+    record_moves: bool = True,
 ) -> GameRecord:
     """Play a full cubeful money game, recording dice, moves, and
     cube actions. Both agents must be cubeful TDAgents supporting
     offer_double / respond_to_double / choose_checker_action_cubeful.
+
+    When `record_moves=False`, skips the per-move Play recording —
+    saves a `get_legal_plays` call per turn. Use False for stat-only
+    runs (the cube actions and final result are still recorded so stake
+    computation works).
     """
-    from modes import MatchState, CubeOwner, cube_perspective  # local
+    from modes import MatchState, CubeOwner  # local
 
     state, opening_dice = opening_roll()
     record = GameRecord()
@@ -192,21 +232,23 @@ def play_and_record_cubeful(
         )
         if result is not None:
             next_state, _bootstrap = result
-            # Find the matching Play object (engine gives us both).
-            plays = get_legal_plays(state, (d1, d2))
-            play = ()
-            for p, s in plays:
-                if s == next_state:
-                    play = p
-                    break
-            record.moves.append(MoveRecord(
-                player=player, dice=(d1, d2), play=play,
-            ))
+            if record_moves:
+                # Find the matching Play object (engine gives us both).
+                plays = get_legal_plays(state, (d1, d2))
+                play = ()
+                for p, s in plays:
+                    if s == next_state:
+                        play = p
+                        break
+                record.moves.append(MoveRecord(
+                    player=player, dice=(d1, d2), play=play,
+                ))
             state = next_state
         else:
-            record.moves.append(MoveRecord(
-                player=player, dice=(d1, d2), play=(),
-            ))
+            if record_moves:
+                record.moves.append(MoveRecord(
+                    player=player, dice=(d1, d2), play=(),
+                ))
             state = switch_turn(state)
         is_opening = False
 
@@ -420,10 +462,12 @@ def run_gnubg_analysis(
     gnubg_cmd: Optional[str] = None,
     verbose: bool = True,
     plies: int = 3,
-) -> List[Tuple[float, float]]:
+) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]],
+           List[Tuple[float, float]]]:
     """Run gnubg in batch mode on a list of .mat files.
 
-    Returns a list of (white_mEMG, black_mEMG) tuples, one per game.
+    Returns (chequer_rates, cube_rates, overall_rates), where each is a
+    list of (white_mEMG, black_mEMG) tuples, one per game.
     mEMG = millipoints Error per Move in Equivalent Money Game.
     """
     if gnubg_cmd is None:
@@ -476,15 +520,8 @@ def run_gnubg_analysis(
                 print(f"  {line.rstrip()}")
         print("  --- end mEMG lines ---")
 
-    # Parse mEMG lines from output.
-    #
-    # Per game, gnubg prints 3 "Error rate mEMG" lines (all with both players):
-    #   1) Chequer play:  Error rate mEMG (MWC)  -201.4  (-10.069%)  -183.1  (-9.153%)
-    #   2) Cube decisions: Error rate mEMG (MWC)   -0.0  ( -0.000%)    -0.0  (-0.000%)
-    #   3) Overall total: Error rate mEMG (MWC)  -201.4  (-10.069%)  -183.1  (-9.153%)
-    #
-    # Since we play without the doubling cube, lines 2 and 3 are redundant.
-    # We collect all 3, then take every 3rd (the overall) per game.
+    # gnubg prints 3 mEMG lines/game (chequer, cube, overall); we split
+    # them into the three series and return all.
     all_error_lines = []
 
     for line in output.splitlines():
@@ -519,11 +556,7 @@ def _play_games_worker(args):
     model_path, num_games, work_dir, start_idx, cubeful, jacoby, oneply = args
 
     os.environ["OMP_NUM_THREADS"] = "1"
-    from model import TDNetwork
-    from td_agent import TDAgent
-
-    net = TDNetwork.load(model_path)
-    agent = TDAgent(net, oneply=oneply)
+    agent = _load_eval_agent(model_path, oneply=oneply, cubeful=cubeful)
 
     mat_files = []
     for i in range(num_games):
@@ -592,7 +625,6 @@ def evaluate_with_gnubg(
         print(f"Playing {num_games} evaluation games...")
 
     # Play and record games
-    records = []
     mat_files = []
     for i in range(num_games):
         if cubeful:
@@ -601,7 +633,6 @@ def evaluate_with_gnubg(
             )
         else:
             record = play_and_record(agent_white, agent_black)
-        records.append(record)
 
         # Export to .mat
         mat_content = export_mat(record, game_id=i + 1, money_game=cubeful)
@@ -623,15 +654,9 @@ def evaluate_with_gnubg(
     )
 
     # Summarize results
-    def _avg(rates):
-        w = [er[0] for er in rates]
-        b = [er[1] for er in rates]
-        a = w + b
-        return w, b, sum(a) / len(a) if a else None
-
-    chk_w, chk_b, chk_avg = _avg(chequer_rates)
-    cub_w, cub_b, cub_avg = _avg(cube_rates)
-    ovr_w, ovr_b, ovr_avg = _avg(overall_rates)
+    chk_w, chk_b, chk_avg = _avg_rates(chequer_rates)
+    cub_w, cub_b, cub_avg = _avg_rates(cube_rates)
+    ovr_w, ovr_b, ovr_avg = _avg_rates(overall_rates)
 
     results = {
         "chequer_mEMG": chk_avg,
@@ -703,6 +728,7 @@ def evaluate_with_gnubg_parallel(
         gnubg_workers:    Number of parallel gnubg analysis processes.
         gnubg_chunk_size: Games per gnubg analysis chunk.
     """
+    assert_cubeful_supported(model_path, cubeful)
     if gnubg_cmd is None:
         gnubg_cmd = GNUBG_CMD
 
@@ -734,10 +760,7 @@ def evaluate_with_gnubg_parallel(
             results = pool.map(_play_games_worker, games_per_worker)
         mat_files = [f for chunk in results for f in chunk]
     else:
-        from model import TDNetwork
-        from td_agent import TDAgent
-        net = TDNetwork.load(model_path)
-        agent = TDAgent(net)
+        agent = _load_eval_agent(model_path, oneply=oneply, cubeful=cubeful)
 
         mat_files = []
         for i in range(num_games):
@@ -788,15 +811,9 @@ def evaluate_with_gnubg_parallel(
     t_analyze = time.perf_counter() - t1
 
     # ── Summarize ──
-    def _avg(rates):
-        w = [er[0] for er in rates]
-        b = [er[1] for er in rates]
-        a = w + b
-        return w, b, sum(a) / len(a) if a else None
-
-    chk_w, chk_b, chk_avg = _avg(all_chequer)
-    cub_w, cub_b, cub_avg = _avg(all_cube)
-    ovr_w, ovr_b, ovr_avg = _avg(all_overall)
+    chk_w, chk_b, chk_avg = _avg_rates(all_chequer)
+    cub_w, cub_b, cub_avg = _avg_rates(all_cube)
+    ovr_w, ovr_b, ovr_avg = _avg_rates(all_overall)
 
     # Bootstrap CIs for mEMG. Share one ProcessPool across all 3 calls.
     from concurrent.futures import ProcessPoolExecutor
@@ -925,17 +942,14 @@ if __name__ == "__main__":
         agent_black = _RandomAgent()
         print("Mode: random vs random (no model)")
     elif args.model:
-        from td_agent import TDAgent
-        from model import TDNetwork
         print(f"Loading model: {args.model}")
-        net = TDNetwork.load(args.model)
-        agent_white = TDAgent(net, oneply=args.oneply)
+        agent_white = _load_eval_agent(args.model, oneply=args.oneply, cubeful=args.cubeful)
 
         if args.vs_random:
             agent_black = _RandomAgent()
             print(f"Mode: model (WHITE) vs random (BLACK){' [1-ply]' if args.oneply else ''}")
         else:
-            agent_black = TDAgent(net, oneply=args.oneply)
+            agent_black = agent_white  # self-play (model vs itself)
             print(f"Mode: self-play (model vs itself){' [1-ply]' if args.oneply else ''}")
     else:
         parser.error("Either --model or --random is required")

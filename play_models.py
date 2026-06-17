@@ -21,12 +21,30 @@ import multiprocessing as mp
 from typing import Tuple
 
 from backgammon_engine import (
-    BoardState, WHITE, BLACK,
+    BoardState, WHITE,
     get_legal_plays, switch_turn,
 )
 from agents import Agent, RandomAgent, GnubgNNAgent, GnubgNNCubefulAgent
 from td_agent import TDAgent
-from model import TDNetwork
+from model import ProbNetwork, load_model
+from prob_agent import ProbAgent
+
+
+def _load_agent(path: str, oneply: bool = False, twoply_k: int = 0,
+                bf16: bool = False) -> Agent:
+    """Build the right agent for a checkpoint, dispatching on model_type.
+
+    prob5 checkpoints -> ProbAgent (cubeless money equity, like the
+    scalar cubeless-money models); everything else -> TDAgent. twoply_k>0
+    maps to ProbAgent 2-ply (it uses its own prune_threshold, not
+    top-K). bf16 enables bf16 inference for ProbAgent (~1.5x faster);
+    ignored for TDAgent.
+    """
+    net = load_model(path)
+    if isinstance(net, ProbNetwork):
+        plies = 2 if twoply_k > 0 else (1 if oneply else 0)
+        return ProbAgent(net, plies=plies, bf16_inference=bf16)
+    return TDAgent(net, oneply=oneply, twoply_k=twoply_k)
 
 
 def play_game(
@@ -48,9 +66,13 @@ def play_game(
     and returns the GameRecord when `record=True`.
     """
     if cubeful:
-        from gnubg_eval import play_and_record_cubeful, CubeRecord
+        from gnubg_eval import play_and_record_cubeful
+        # When caller doesn't want the GameRecord, skip per-move Play
+        # bookkeeping — avoids a get_legal_plays call per turn (the
+        # dominant remaining cost after the C cubeful fast path).
         game_record = play_and_record_cubeful(
             agent_white, agent_black, jacoby=jacoby,
+            record_moves=record,
         )
         winner = game_record.winner
         if game_record.ended_by_drop:
@@ -123,10 +145,9 @@ def _play_matches_worker(args):
     _torch.set_num_threads(1)
     (model1_path, model2_path, num_games, model2_type, plies,
      cubeless_money, cubeful, jacoby, oneply1, oneply2,
-     extreme_threshold) = args
+     twoply_k1, twoply_k2, extreme_threshold, bf16) = args
 
-    net1 = TDNetwork.load(model1_path)
-    agent1 = TDAgent(net1, oneply=oneply1)
+    agent1 = _load_agent(model1_path, oneply=oneply1, twoply_k=twoply_k1, bf16=bf16)
 
     if model2_type == "random":
         agent2 = RandomAgent()
@@ -135,8 +156,7 @@ def _play_matches_worker(args):
     elif model2_type == "gnubg-cubeful":
         agent2 = GnubgNNCubefulAgent(plies=plies)
     else:
-        net2 = TDNetwork.load(model2_path)
-        agent2 = TDAgent(net2, oneply=oneply2)
+        agent2 = _load_agent(model2_path, oneply=oneply2, twoply_k=twoply_k2, bf16=bf16)
 
     a1_wins = 0
     a2_wins = 0
@@ -229,7 +249,10 @@ def play_matches_parallel(
     jacoby: bool = True,
     oneply1: bool = False,
     oneply2: bool = False,
+    twoply_k1: int = 0,
+    twoply_k2: int = 0,
     extreme_threshold: float = 0.0,
+    bf16: bool = False,
 ):
     """Play games in parallel across multiple workers.
     Returns (a1_wins, a2_wins, eq_sum, eq_sq_sum, per_game, extremes).
@@ -243,7 +266,8 @@ def play_matches_parallel(
 
     args_list = [
         (model1_path, model2_path, n, model2_type, plies, cubeless_money,
-         cubeful, jacoby, oneply1, oneply2, extreme_threshold)
+         cubeful, jacoby, oneply1, oneply2, twoply_k1, twoply_k2,
+         extreme_threshold, bf16)
         for n in game_counts
     ]
 
@@ -316,22 +340,24 @@ def get_verdict(wins: int, total: int) -> str:
     """
     Determine verdict based on Wilson 95% confidence interval.
 
-    Rules:
-    1. "Model1 wins" — CI entirely above 50%
-    2. "Model2 wins" — CI entirely below 50%
-    3. "Tied" — CI includes 50% AND CI width is tight (< 2%)
-    4. "Inconclusive" — CI includes 50% but too wide to call
+    Returns one of:
+    1. "Model1 is significantly stronger (p<0.05)" — CI entirely above 50%
+    2. "Model2 is significantly stronger (p<0.05)" — CI entirely below 50%
+    3. "Models are effectively tied (difference < 1%)" — CI includes 50%
+       AND CI width is tight (< 2%)
+    4. "Inconclusive — need more games to determine winner" — CI includes
+       50% but too wide to call
     """
     lower, upper = wilson_ci(wins, total, z=1.96)
     ci_width = upper - lower
 
     # Check if CI is entirely above 50%
     if lower > 0.50:
-        return "Model1 is significantly stronger (p<0.01)"
+        return "Model1 is significantly stronger (p<0.05)"
 
     # Check if CI is entirely below 50%
     if upper < 0.50:
-        return "Model2 is significantly stronger (p<0.01)"
+        return "Model2 is significantly stronger (p<0.05)"
 
     # CI includes 50%. Only call "tied" if we have enough data
     # (tight CI) AND the point estimate is close to 50%.
@@ -447,8 +473,25 @@ def main():
         help="1-ply lookahead for BOTH models (shorthand for --oneply1 --oneply2).",
     )
     parser.add_argument(
+        "--twoply-k1", type=int, default=0,
+        help="2-ply checker/cube decisions for model1 with top-K 1-ply "
+             "filter at the depth-2 expansion (0 = off). Works for both "
+             "cubeful-money and dmp/cubeless modes. Takes precedence over "
+             "--oneply1 for move selection.",
+    )
+    parser.add_argument(
+        "--twoply-k2", type=int, default=0,
+        help="2-ply checker/cube decisions for model2 with top-K 1-ply "
+             "filter (0 = off; ignored when model2 is gnubg or random).",
+    )
+    parser.add_argument(
         "--n-bootstrap", type=int, default=10000,
         help="Number of bootstrap resamples for equity CI (default: 10000).",
+    )
+    parser.add_argument(
+        "--bf16", action="store_true",
+        help="Use bf16 inference for prob5 (ProbAgent) models (~1.5x faster, "
+             "negligible strength loss; ignored for scalar models).",
     )
     args = parser.parse_args()
     if args.oneply:
@@ -470,9 +513,10 @@ def main():
 
     # Load model1
     print(f"Loading model1: {args.model1}")
-    net1 = TDNetwork.load(args.model1)
-    agent1 = TDAgent(net1, oneply=args.oneply1)
-    if args.oneply1:
+    agent1 = _load_agent(args.model1, oneply=args.oneply1, twoply_k=args.twoply_k1, bf16=args.bf16)
+    if args.twoply_k1 > 0:
+        print(f"  Model1 using 2-ply lookahead (K={args.twoply_k1})")
+    elif args.oneply1:
         print("  Model1 using 1-ply lookahead")
 
     # Load model2 (or use random / gnubg)
@@ -488,11 +532,22 @@ def main():
         model2_label = f"GnubgNN-cubeful ({args.plies}-ply)"
     else:
         print(f"Loading model2: {args.model2}")
-        net2 = TDNetwork.load(args.model2)
-        agent2 = TDAgent(net2, oneply=args.oneply2)
+        agent2 = _load_agent(args.model2, oneply=args.oneply2, twoply_k=args.twoply_k2, bf16=args.bf16)
         model2_label = args.model2
-        if args.oneply2:
+        if args.twoply_k2 > 0:
+            print(f"  Model2 using 2-ply lookahead (K={args.twoply_k2})")
+        elif args.oneply2:
             print("  Model2 using 1-ply lookahead")
+
+    _has_prob5 = isinstance(agent1, ProbAgent) or isinstance(agent2, ProbAgent)
+    if cubeful and _has_prob5:
+        parser.error("prob5 (ProbAgent) is cubeless-only and has no cube policy; "
+                     "drop --gnubg-cubeful / cubeful mode for prob5 models.")
+    if args.game_mode == "dmp" and _has_prob5:
+        parser.error("prob5 (ProbAgent) is a cubeless-MONEY model: it selects moves "
+                     "by money equity, not P(win), so --game-mode dmp would silently "
+                     "mismatch (DMP scoring + money-equity move selection). "
+                     "Use --game-mode cubeless-money for prob5 models.")
 
     print(f"\nPlaying {args.games} games...")
     print(f"  Model1: {args.model1}")
@@ -527,7 +582,8 @@ def main():
                 cubeless_money=cubeless_money,
                 cubeful=cubeful, jacoby=args.jacoby,
                 oneply1=args.oneply1, oneply2=args.oneply2,
-                extreme_threshold=extreme_threshold,
+                twoply_k1=args.twoply_k1, twoply_k2=args.twoply_k2,
+                extreme_threshold=extreme_threshold, bf16=args.bf16,
             )
 
             if args.save_extreme_games and extremes:

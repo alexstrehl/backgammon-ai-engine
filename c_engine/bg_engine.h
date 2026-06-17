@@ -164,6 +164,22 @@ int get_legal_plays_encoded(const BoardState *state, int d1, int d2,
 void get_play_resulting_state(const Play *plays, int index,
                               BoardState *out_state);
 
+/*
+ * One-shot 1-ply inner expansion for a candidate resulting state
+ * (opponent on roll): enumerates all 21 opponent dice, encodes every
+ * non-terminal reply's 196-feature base vector into out_feats (packed
+ * row-major in reply order), fills out_dice_counts[21] and per-reply
+ * out_reply_gr (0 = non-terminal row; 1/2/3 = terminal, no row).
+ * Returns total replies, or -1 on overflow. See bg_engine.c for the
+ * reply/row mapping contract.
+ */
+int get_legal_plays_encoded_21(const BoardState *next_state,
+                               float *out_feats,
+                               int *out_dice_counts,
+                               int *out_reply_gr,
+                               int max_rows,
+                               int max_replies);
+
 #ifdef __cplusplus
 }
 #endif

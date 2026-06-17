@@ -1,16 +1,15 @@
 """Parity harness for value_oneply_checker_cubeful.
 
 Generates a deterministic fixture of cubeful-money states via seeded
-self-play with a fixed-weight network, then locks in reference values
-for value_oneply_checker_cubeful. A future C/fast path for 1-ply
-target computation must match the reference values at ~1e-5
-tolerance.
+self-play with a fixed-weight network, then runs current-vs-current
+checks on value_oneply_checker_cubeful: determinism (repeated calls
+agree exactly), bounded outputs, and bf16 inference parity with the
+fp32 reference.
 
 The fixture is regenerated on each test run (seeded), so there is no
-on-disk golden file to keep in sync. If the reference implementation
-changes in a way that alters outputs, this test will catch it; if
-that change is intentional, the `REF_VALUES_*` constants below must
-be updated.
+on-disk golden file to keep in sync. A future C/fast path for 1-ply
+target computation can plug into the same fixture and assert against
+the current Python reference at ~1e-5 tolerance.
 """
 
 import random
@@ -24,7 +23,16 @@ import torch
 from backgammon_engine import BoardState, opening_roll, switch_turn
 from modes import CubefulMoneyMode, MatchState, CubeOwner
 from model import TDNetwork
-from td_agent import TDAgent
+from td_agent import TDAgent, cpu_supports_fast_bf16
+
+# bf16 inference is auto-disabled on CPUs without bf16 ISA support
+# (torch emulation is ~20x slower than fp32), so its behavior can only
+# be tested on hosts that have it.
+requires_bf16 = pytest.mark.skipif(
+    not cpu_supports_fast_bf16(),
+    reason="CPU lacks bf16 ISA (avx512_bf16/amx_bf16); "
+           "TDAgent auto-disables bf16 inference on this host",
+)
 
 
 def _make_fixed_net(seed: int = 12345) -> TDNetwork:
@@ -101,18 +109,9 @@ def _generate_states(
     return out
 
 
-# ── Reference values (regenerated, golden) ────────────────────────────
-#
-# When the fast path lands, this test asserts
-# `fast_value(s, m) ≈ reference_value(s, m)` at ~1e-5 tolerance, with
-# the *current* Python path defining the reference. These constants are
-# a cheap integrity check that the fixture itself didn't drift (e.g.
-# engine rng changed), NOT a tolerance check on the fast path.
-#
-# Update if the fixture generator or net init changes intentionally.
+# Number of fixture states generated per run (seed=42).
 N_STATES = 200
-# First 10 reference values from the fixture with (seed=42, net_seed=12345).
-# Filled in below via a self-check on first import; see test_ref_stable.
+
 
 class TestOneplyCubefulParity:
     """Current-vs-current determinism checks, plus a hook for the
@@ -160,6 +159,7 @@ class TestOneplyCubefulParity:
             assert -3.0 - 1e-6 <= v <= 3.0 + 1e-6, \
                 f"value {v} out of [-3, 3] bounds for state {s}"
 
+    @requires_bf16
     def test_bf16_inference_parity(self, fixture):
         """Bf16 inference path must match fp32 reference within a bf16-
         precision tolerance. Bf16 has ~3 decimal digits of mantissa
@@ -194,6 +194,7 @@ class TestOneplyCubefulParity:
             f"bf16 1-ply mean error too high: {mean_abs:.2e}"
         )
 
+    @requires_bf16
     def test_bf16_refresh_after_weight_change(self, fixture):
         """After the fp32 weights change and refresh_bf16_inference()
         is called, bf16 outputs must track the new weights (not stay

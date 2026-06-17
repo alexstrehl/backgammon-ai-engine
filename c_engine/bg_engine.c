@@ -1022,6 +1022,90 @@ void get_play_resulting_state(const Play *plays, int index,
     memcpy(out_state, &plays[index].resulting_state, sizeof(BoardState));
 }
 
+/* ── Game result (1/2/3) for a terminal state, winner's POV ─────────
+ * Mirrors BoardState.game_result in backgammon_engine.py exactly. */
+static int game_result_c(const BoardState *s) {
+    int w = (s->off[WHITE] == NUM_CHECKERS) ? WHITE
+          : (s->off[BLACK] == NUM_CHECKERS) ? BLACK : -1;
+    if (w < 0) return 0;
+    int loser = 1 - w;
+    if (s->off[loser] > 0) return 1;               /* normal */
+    int loser_in_opp_home = 0;
+    if (loser == WHITE) {
+        for (int i = 18; i < 24; i++)
+            if (s->points[i] > 0) { loser_in_opp_home = 1; break; }
+    } else {
+        for (int i = 0; i < 6; i++)
+            if (s->points[i] < 0) { loser_in_opp_home = 1; break; }
+    }
+    if (s->bar[loser] > 0 || loser_in_opp_home) return 3;  /* backgammon */
+    return 2;                                              /* gammon */
+}
+
+/*
+ * One-shot 1-ply inner expansion for a single candidate's resulting
+ * state (opponent on roll). Enumerates all 21 distinct opponent dice
+ * outcomes (d1=1..6, d2=d1..6 — same order as _DICE_OUTCOMES in
+ * td_agent.py); for each, generates the opponent's legal replies and
+ * writes:
+ *   - out_feats:        196-float base encoding of every NON-TERMINAL
+ *                       reply (and the back-to-us state on a forced
+ *                       pass), packed row-major in reply order.
+ *   - out_dice_counts:  [21] number of replies per dice bucket
+ *                       (>=1 always: a forced pass counts as 1).
+ *   - out_reply_gr:     per reply, 0 if non-terminal, else the winner's
+ *                       game_result (1/2/3) — a terminal reply writes
+ *                       NO row to out_feats.
+ *
+ * Reply ordering is dice-major; within a dice, opponent-play order.
+ * Non-terminal replies consume rows of out_feats sequentially, so the
+ * caller maps the k-th non-terminal reply to row k.
+ *
+ * Returns the total number of replies, or -1 on buffer overflow.
+ */
+int get_legal_plays_encoded_21(const BoardState *next_state,
+                               float *out_feats,
+                               int *out_dice_counts,
+                               int *out_reply_gr,
+                               int max_rows,
+                               int max_replies) {
+    static Play splays[MAX_PLAYS];
+    int row = 0, rep = 0, di = 0;
+    for (int d1 = 1; d1 <= 6; d1++) {
+        for (int d2 = d1; d2 <= 6; d2++) {
+            int cnt = get_legal_plays(next_state, d1, d2, splays, MAX_PLAYS);
+            if (cnt == 0) {
+                /* Forced pass — opponent can't move, play returns to us. */
+                if (row >= max_rows || rep >= max_replies) return -1;
+                BoardState back = *next_state;
+                board_switch_turn(&back);
+                encode_state(&back, out_feats + (size_t)row * NUM_FEATURES_196);
+                out_reply_gr[rep] = 0;
+                row++; rep++;
+                out_dice_counts[di] = 1;
+            } else {
+                for (int i = 0; i < cnt; i++) {
+                    if (rep >= max_replies) return -1;
+                    const BoardState *rs = &splays[i].resulting_state;
+                    if (board_is_game_over(rs)) {
+                        out_reply_gr[rep] = game_result_c(rs);
+                    } else {
+                        if (row >= max_rows) return -1;
+                        encode_state(rs,
+                            out_feats + (size_t)row * NUM_FEATURES_196);
+                        out_reply_gr[rep] = 0;
+                        row++;
+                    }
+                    rep++;
+                }
+                out_dice_counts[di] = cnt;
+            }
+            di++;
+        }
+    }
+    return rep;
+}
+
 /* ── Combined get-plays + 210-feature encode ──────────────────── */
 
 int get_legal_plays_encoded_210(const BoardState *state, int d1, int d2,

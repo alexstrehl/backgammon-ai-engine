@@ -43,6 +43,30 @@ from model import TDNetwork
 # All 21 distinct dice outcomes with probabilities (used by value_oneply_checker).
 _DICE_OUTCOMES = [(d1, d2) for d1 in range(1, 7) for d2 in range(d1, 7)]
 
+# Per-dice probabilities (doubles 1/36, non-doubles 2/36); aligned with
+# _DICE_OUTCOMES order. Used by the expand_21 fast path's vectorized reduction.
+_ONEPLY_PROBS = np.array(
+    [(1.0 / 36.0) if d1 == d2 else (2.0 / 36.0) for d1, d2 in _DICE_OUTCOMES],
+    dtype=np.float64,
+)
+
+
+def cpu_supports_fast_bf16() -> bool:
+    """True if the CPU has bf16 matmul ISA support (AVX512-BF16 or
+    AMX-BF16). Without it torch emulates bf16 in software — measured
+    ~20x SLOWER than fp32 (e.g. on Zen 2) — so bf16 inference must
+    not be enabled on such hosts.
+    """
+    try:
+        with open("/proc/cpuinfo") as f:
+            flags = f.read()
+        return "avx512_bf16" in flags or "amx_bf16" in flags
+    except OSError:
+        return False
+
+
+_BF16_UNSUPPORTED_WARNED = False
+
 # Optional C engine fast path. Loaded lazily so a missing/unbuildable
 # library doesn't prevent TDAgent from being importable.
 try:
@@ -100,6 +124,7 @@ class TDAgent(Agent):
         loss_fn: Optional[Callable] = None,
         use_fast_engine: bool = True,
         oneply: bool = False,
+        twoply_k: int = 0,
         boltzmann_temp: float = 0.0,
         bf16_inference: bool = False,
     ):
@@ -116,6 +141,15 @@ class TDAgent(Agent):
                 the device is CPU. Set False to use python engine.
             oneply: when True, use 1-ply lookahead for cube decisions
                 (offer_double / respond_to_double).
+            twoply_k: when > 0, use 2-ply chequer move selection with
+                top-K 1-ply filter. Works for both cubeful and
+                cubeless (DMP) modes. "2-ply" matches gnubg's
+                convention: two dice+move expansions before static
+                eval. The k value is the inner top-K 1-ply filter at
+                the depth-2 expansion; root candidates are always
+                fully expanded. Mutually exclusive with oneply for
+                move selection — twoply_k > 0 takes precedence over
+                oneply on chequer choice.
             boltzmann_temp: temperature for Boltzmann (softmax)
                 exploration in checker play. 0.0 (default) = greedy
                 argmin. Higher values = more exploration.
@@ -150,6 +184,7 @@ class TDAgent(Agent):
                 f"got {self.output_mode!r}."
             )
         self.oneply = oneply
+        self.twoply_k = int(twoply_k)
         self.boltzmann_temp = boltzmann_temp
         self._loss_fn = loss_fn if loss_fn is not None else td_mse_loss
         # Pick the fused move-gen + encode impl. C and Python versions
@@ -209,9 +244,30 @@ class TDAgent(Agent):
         # Built once from the current fp32 weights; re-build via
         # `refresh_bf16_inference()` after any state_dict reload.
         self.bf16_inference = bool(bf16_inference)
+        if self.bf16_inference and self._device_is_cpu \
+                and not cpu_supports_fast_bf16():
+            global _BF16_UNSUPPORTED_WARNED
+            if not _BF16_UNSUPPORTED_WARNED:
+                print(
+                    "[td_agent] bf16 inference requested but this CPU has no "
+                    "bf16 ISA (avx512_bf16/amx_bf16); torch emulation is "
+                    "~20x slower than fp32 — disabling bf16 inference.",
+                    flush=True,
+                )
+                _BF16_UNSUPPORTED_WARNED = True
+            self.bf16_inference = False
         self._bf16_net: Optional[nn.Module] = None
         if self.bf16_inference:
             self._build_bf16_net()
+
+        # Transposition table for 2-ply cubeless search. Memoizes the
+        # 1-ply value of a position keyed by its canonical board key.
+        # The network is frozen during play, so a position's 1-ply
+        # value is a pure function of the board — caching it is EXACT
+        # (no fidelity loss) and skips a full batched forward on every
+        # hit. Only allocated when 2-ply move selection is active.
+        self._tt_oneply: Optional[dict] = {} if self.twoply_k > 0 else None
+        self._tt_max = 2_000_000  # entry cap; cleared wholesale if exceeded
 
     def _build_bf16_net(self) -> None:
         """(Re)build the bf16 inference copy from self.network."""
@@ -292,10 +348,21 @@ class TDAgent(Agent):
           eval scripts that need the Play for logging. The agent
           encodes the supplied successors itself.
         """
+        if self.twoply_k > 0 and not self.is_cubeful:
+            return self._choose_checker_twoply_cubeless(
+                state, dice, actions=actions,
+            )
         if self.oneply and not self.is_cubeful:
             return self._choose_checker_oneply_cubeless(
                 state, dice, actions=actions, with_target=with_target,
             )
+        if actions is None and self.is_cubeful:
+            # The fused move-gen+encode path emits base features only;
+            # cubeful agents need the cube columns appended, so take the
+            # explicit-actions path below.
+            actions = get_legal_plays(state, dice)
+            if not actions:
+                return None
         if actions is None:
             features, next_states = self._get_legal_plays_encoded(state, dice)
             if not next_states:
@@ -314,7 +381,15 @@ class TDAgent(Agent):
 
         if not actions:
             return None
-        features = np.stack([self.encoder.encode(s) for _, s in actions])
+        if self.is_cubeful:
+            # Checker decision in a cube-less context (e.g. eval scripts):
+            # encode with a centered cube.
+            features = np.stack([
+                self.encoder.encode(s, CubePerspective.CENTERED)
+                for _, s in actions
+            ])
+        else:
+            features = np.stack([self.encoder.encode(s) for _, s in actions])
         t = torch.from_numpy(features)
         t = self._to_device(t)
         with torch.no_grad():
@@ -428,35 +503,16 @@ class TDAgent(Agent):
         assert not state.is_game_over(), \
             "value_oneply_checker called on a terminal state"
 
-        if self.output_mode == "probability":
-            def flip(opp_value: float) -> float:
-                return 1.0 - opp_value
-
-            def terminal_opp_value(next_state: BoardState) -> float:
-                return 0.0
-        elif self.output_mode == "equity":
-            def flip(opp_value: float) -> float:
-                return -opp_value
-
-            def terminal_opp_value(next_state: BoardState) -> float:
-                # next_state.turn == opponent (engine switched), but
-                # the WINNER is the previous mover. game_result()
-                # returns 1/2/3 for single/gammon/backgammon based on
-                # the board, independent of perspective.
-                return -float(next_state.game_result())
-        else:
-            raise ValueError(f"Unknown output_mode: {self.output_mode}")
-
         oneply_sum = 0.0
-        for d1, d2 in _DICE_OUTCOMES:
-            prob = (1.0 / 36.0) if d1 == d2 else (2.0 / 36.0)
+        for idx, (d1, d2) in enumerate(_DICE_OUTCOMES):
+            prob = float(_ONEPLY_PROBS[idx])
             features, next_states = self._get_legal_plays_encoded(state, (d1, d2))
 
             if len(next_states) == 0:
                 # Forced pass: opponent gets the dice on the same
                 # position. Evaluate from opponent's view.
                 v_opp = self.evaluate(switch_turn(state))
-                oneply_sum += prob * flip(v_opp)
+                oneply_sum += prob * self._flip_value(v_opp)
                 continue
 
             t = torch.from_numpy(features)
@@ -474,10 +530,10 @@ class TDAgent(Agent):
                 # Clone to avoid in-place edits to the network output buffer.
                 values = values.clone()
                 for i in torch.nonzero(terminal_mask).flatten().tolist():
-                    values[i] = terminal_opp_value(next_states[i])
+                    values[i] = self._terminal_opp_value(next_states[i])
 
             best_for_next = torch.min(values).item()
-            oneply_sum += prob * flip(best_for_next)
+            oneply_sum += prob * self._flip_value(best_for_next)
 
         return oneply_sum
 
@@ -629,10 +685,7 @@ class TDAgent(Agent):
         else:
             net_values = np.empty(0)
 
-        probs = [
-            (1.0 / 36.0) if d1 == d2 else (2.0 / 36.0)
-            for d1, d2 in _DICE_OUTCOMES
-        ]
+        probs = _ONEPLY_PROBS.tolist()
 
         best_idx = 0
         best_val = float("-inf")
@@ -659,6 +712,331 @@ class TDAgent(Agent):
             # which is OUR view of the chosen action's expected value.
             return chosen_play, chosen_state, best_val
         return chosen_play, chosen_state
+
+    def _forward_inference(self, t: torch.Tensor) -> torch.Tensor:
+        """Run a forward in bf16 if a bf16 inference net exists,
+        else fp32. Returns an fp32 tensor either way so callers
+        don't have to think about dtype downstream. ~3-4x faster
+        than fp32 at large batches with ~1e-3 drift, which doesn't
+        change argmin selections in practice. Always wrapped in
+        no_grad — only meant for value queries.
+        """
+        with torch.no_grad():
+            if self.bf16_inference and self._bf16_net is not None:
+                return self._bf16_net(t.to(torch.bfloat16)).to(torch.float32)
+            return self.network(t)
+
+    def _value_oneply_checker_batched(self, state: BoardState) -> float:
+        """Same semantics as value_oneply_checker but issues ONE
+        batched forward across all 21 inner dice, instead of 21
+        per-dice forwards. Used by value_twoply_checker to cut
+        dispatch overhead. Uses bf16 when available.
+        """
+        assert not state.is_game_over(), \
+            "_value_oneply_checker_batched called on a terminal state"
+
+        # Transposition lookup: exact memo of this position's 1-ply
+        # value (network is frozen during play). On a hit we skip the
+        # entire enumeration + batched forward below.
+        tt = self._tt_oneply
+        if tt is not None:
+            tt_key = state._key()
+            hit = tt.get(tt_key)
+            if hit is not None:
+                return hit
+
+        # Phase 1: enumerate per-dice; collect features for non-pass
+        # outcomes into one big stack. Forced passes are resolved
+        # against the 0-ply opp value (we already burned one ply by
+        # being here; the swap_turn eval is the static estimate).
+        feat_chunks: List[np.ndarray] = []
+        dice_slices: List[
+            Tuple[Optional[int], Optional[int], float, Optional[float]]
+        ] = []
+        term_overrides: List[Tuple[int, float]] = []  # (global_idx, value)
+        pos = 0
+        for idx, (d1, d2) in enumerate(_DICE_OUTCOMES):
+            prob = float(_ONEPLY_PROBS[idx])
+            features, next_states_view = self._get_legal_plays_encoded(
+                state, (d1, d2),
+            )
+
+            if len(next_states_view) == 0:
+                # Forced pass: opp's static value at swapped state.
+                v_opp = self.evaluate(switch_turn(state))
+                dice_slices.append((None, None, prob, self._flip_value(v_opp)))
+                continue
+
+            n = len(next_states_view)
+            # Mark terminals — need the materialized state to read
+            # game_result(), so we materialize lazily only for those.
+            terminal_mask_np = (
+                features[:, OPP_OFF_INDEX] >= TERMINAL_OFF_THRESHOLD
+            )
+            if terminal_mask_np.any():
+                for i in np.nonzero(terminal_mask_np)[0]:
+                    term_overrides.append(
+                        (pos + int(i),
+                         self._terminal_opp_value(next_states_view[int(i)])),
+                    )
+
+            feat_chunks.append(features)
+            end = pos + n
+            dice_slices.append((pos, end, prob, None))
+            pos = end
+
+        # If every dice was a forced pass (extremely rare but
+        # possible), bail out without a forward.
+        if pos == 0:
+            total = 0.0
+            for _, _, prob, forced in dice_slices:
+                if forced is not None:
+                    total += prob * forced
+            if tt is not None:
+                if len(tt) >= self._tt_max:
+                    tt.clear()
+                tt[tt_key] = total
+            return total
+
+        big_feat = (
+            feat_chunks[0] if len(feat_chunks) == 1
+            else np.concatenate(feat_chunks, axis=0)
+        )
+        t = torch.from_numpy(big_feat)
+        t = self._to_device(t)
+        values = self._forward_inference(t)
+
+        if term_overrides:
+            values = values.clone()
+            for idx, v in term_overrides:
+                values[idx] = v
+
+        oneply_sum = 0.0
+        for start, end, prob, forced in dice_slices:
+            if forced is not None:
+                oneply_sum += prob * forced
+                continue
+            best_for_next = torch.min(values[start:end]).item()
+            oneply_sum += prob * self._flip_value(best_for_next)
+
+        if tt is not None:
+            if len(tt) >= self._tt_max:
+                tt.clear()
+            tt[tt_key] = oneply_sum
+        return oneply_sum
+
+    def value_twoply_checker(
+        self, state: BoardState, k: int = 3,
+    ) -> float:
+        """2-ply estimate of V(state) for a cubeless CHECKER decision point.
+
+        "2-ply" here matches gnubg's convention: TWO dice+move
+        expansions before static evaluation. From mover's view at
+        `state`:
+            E_{D1}[ max_{m1} ( flip( E_{D2}[ max_{m2}( flip( V(s2) ) ) ] ) ) ]
+        where m1 is mover's choice after dice D1, and m2 is opp's
+        choice after dice D2 at state s1 = result(state, D1, m1).
+
+        Inner expansion uses a top-K 1-ply filter (matching
+        value_twoply_checker_cubeful_filtered): rank the mover-side
+        candidates at depth 1 by 0-ply static value, then deepen
+        only the top-K to a 1-ply call. Terminal candidates are
+        scored from game_result() and never deepened.
+
+        Cost per call ≈ 21 × (1 batched 0-ply + K calls to
+        value_oneply_checker). K=1 is fastest and vulnerable to
+        0-ply ranking errors; K=3 is a reasonable safety margin.
+        """
+        assert not state.is_game_over(), \
+            "value_twoply_checker called on a terminal state"
+        assert k >= 1, f"k must be >= 1, got {k}"
+
+        # Phase 1: gather all outer-dice candidates into one big
+        # tensor, do ONE batched forward for 0-ply ranking. Saves 21
+        # per-dice dispatch overheads at the cost of a single
+        # bigger matmul (which is per-element faster, especially
+        # with bf16).
+        feat_chunks: List[np.ndarray] = []
+        per_dice: List[
+            Tuple[Optional[int], Optional[int], float, Optional[float], list]
+        ] = []  # (start, end, prob, forced_val_or_None, materialized_next_states)
+        term_overrides: List[Tuple[int, float]] = []  # (global_idx, value)
+        pos = 0
+        for idx, (d1, d2) in enumerate(_DICE_OUTCOMES):
+            prob = float(_ONEPLY_PROBS[idx])
+            features, next_states_view = self._get_legal_plays_encoded(
+                state, (d1, d2),
+            )
+
+            if len(next_states_view) == 0:
+                # Forced pass: opp gets the dice on the same position.
+                # Resolve later with a batched 1-ply call (still bf16).
+                # Defer to a post-pass to avoid breaking the big-batch
+                # flow — pass a sentinel and resolve after the forward.
+                per_dice.append((None, None, prob, None, []))  # sentinel "forced"
+                continue
+
+            # Materialize next_states immediately — the shared C
+            # buffer is invalidated by any subsequent _bg_fast call.
+            n = len(next_states_view)
+            next_states = [next_states_view[i] for i in range(n)]
+
+            terminal_mask_np = (
+                features[:, OPP_OFF_INDEX] >= TERMINAL_OFF_THRESHOLD
+            )
+            if terminal_mask_np.any():
+                for i in np.nonzero(terminal_mask_np)[0]:
+                    term_overrides.append(
+                        (pos + int(i),
+                         self._terminal_opp_value(next_states[int(i)])),
+                    )
+
+            feat_chunks.append(features)
+            end = pos + n
+            per_dice.append((pos, end, prob, None, next_states))
+            pos = end
+
+        # Resolve forced-pass dice with a batched 1-ply call AFTER
+        # the main forward (so the big-batch flow isn't broken).
+        # Reuse the same swap_turn(state) result across all
+        # forced-pass dice — the underlying value is identical
+        # for each.
+        forced_resolved: Optional[float] = None
+        # Big-batch forward for the 0-ply rank phase.
+        if pos > 0:
+            big_feat = (
+                feat_chunks[0] if len(feat_chunks) == 1
+                else np.concatenate(feat_chunks, axis=0)
+            )
+            t = torch.from_numpy(big_feat)
+            t = self._to_device(t)
+            all_values = self._forward_inference(t).clone()
+            if term_overrides:
+                for idx, v in term_overrides:
+                    all_values[idx] = v
+        else:
+            all_values = None
+
+        # Phase 2: per dice, compute best opp-view value (mover wants
+        # min); deepen the top-K non-terminal candidates to 1-ply.
+        twoply_sum = 0.0
+        for start, end, prob, forced, next_states in per_dice:
+            if forced is None and start is None:
+                # Sentinel forced pass.
+                if forced_resolved is None:
+                    forced_resolved = self._value_oneply_checker_batched(
+                        switch_turn(state),
+                    )
+                twoply_sum += prob * self._flip_value(forced_resolved)
+                continue
+            if forced is not None:
+                twoply_sum += prob * forced
+                continue
+
+            slc = all_values[start:end]
+            # Recompute terminal mask cheaply from the original
+            # features array — but we don't have direct access here
+            # without indexing back. Use a global per-row flag: any
+            # entry in term_overrides for this slice is terminal.
+            # Build a fast lookup once per dice.
+            #
+            # In practice terminal rows are rare; a quick scan over
+            # term_overrides is fine.
+            best_opp_view = float("inf")
+
+            # Build terminal mask for this slice if needed.
+            slice_terms = [
+                (idx - start, v) for idx, v in term_overrides
+                if start <= idx < end
+            ]
+            terminal_local = {i for i, _ in slice_terms}
+
+            # Min over terminals (already overwritten in all_values).
+            if slice_terms:
+                term_min = min(v for _, v in slice_terms)
+                if term_min < best_opp_view:
+                    best_opp_view = term_min
+
+            non_term_idx = [
+                i for i in range(end - start) if i not in terminal_local
+            ]
+            if non_term_idx:
+                if len(non_term_idx) <= k:
+                    top_k_local = non_term_idx
+                else:
+                    nt_pairs = [(float(slc[i].item()), i) for i in non_term_idx]
+                    nt_pairs.sort(key=lambda x: x[0])
+                    top_k_local = [i for _, i in nt_pairs[:k]]
+
+                for li in top_k_local:
+                    cand = next_states[li]
+                    opp_oneply = self._value_oneply_checker_batched(cand)
+                    if opp_oneply < best_opp_view:
+                        best_opp_view = opp_oneply
+
+            twoply_sum += prob * self._flip_value(best_opp_view)
+
+        return twoply_sum
+
+    def _choose_checker_twoply_cubeless(
+        self, state, dice, actions=None,
+    ):
+        """Cubeless 2-ply chequer move selection.
+
+        For each root candidate move m → next_state:
+          - if next_state is terminal: mover already won, use the
+            terminal mover-value;
+          - else: compute opp's 2-ply value at next_state via
+            value_twoply_checker. Flip to mover's frame.
+        Pick m maximizing mover's value.
+
+        `twoply_k` (from the TDAgent ctor) is forwarded as the inner
+        top-K filter at the depth-2 expansion (NOT a filter on root
+        candidates — root is always fully expanded).
+
+        Returns `(Play_or_None, next_state)` matching the contract
+        of `choose_checker_action` (no with_target — 2-ply skips
+        target collection).
+        """
+        if actions is None:
+            features, next_states = self._get_legal_plays_encoded(state, dice)
+            if not next_states:
+                return None
+            plays = [(None, ns) for ns in next_states]
+        else:
+            plays = actions
+            if not plays:
+                return None
+
+        is_equity = self.output_mode == "equity"
+
+        def our_terminal_value(s: BoardState) -> float:
+            # s is terminal after our move. game_result() returns
+            # 1/2/3 for single/gammon/backgammon.
+            if is_equity:
+                return float(s.game_result())
+            return 1.0
+
+        k = max(self.twoply_k, 1)
+
+        best_value = float("-inf")
+        best_idx = 0
+        for m_idx, (_, next_state) in enumerate(plays):
+            if next_state.is_game_over():
+                mover_eq = our_terminal_value(next_state)
+            else:
+                # Opp on-roll at next_state. Compute opp's 2-ply
+                # value (= opp dice + opp move + my dice + my move +
+                # static), then flip to mover's frame.
+                opp_value = self.value_twoply_checker(next_state, k=k)
+                mover_eq = self._flip_value(opp_value)
+
+            if mover_eq > best_value:
+                best_value = mover_eq
+                best_idx = m_idx
+
+        chosen = plays[best_idx]
+        return chosen[0], chosen[1]
 
     # ── cubeful primitives ────────────────────────────────────────────
     #
@@ -745,8 +1123,44 @@ class TDAgent(Agent):
         if no_double_persp not in (CubePerspective.CENTERED, CubePerspective.MINE):
             return CubeOffer(should_double=False, _cache=None)
 
-        v_no_double = self.evaluate_cubeful(state, no_double_persp, is_cube_action=False)
-        v_double_take = 2.0 * self.evaluate_cubeful(state, CubePerspective.THEIRS, is_cube_action=False)
+        if self.twoply_k > 0:
+            # 2-ply cube: use the 2-ply chequer expectimax value with the
+            # current vs theirs match_state. Matches the depth of the
+            # chequer move selector and removes the 0-ply-cube/2-ply-chequer
+            # depth-asymmetry vs gnubg-nn (which uses 2-ply for both).
+            from dataclasses import replace
+            from modes import CubeOwner
+            opponent = 1 - player
+            theirs_ms = replace(
+                match_state, cube_owner=CubeOwner(opponent + 1),
+            )
+            v_no_double = self.value_twoply_checker_cubeful_filtered(
+                state, match_state, k=self.twoply_k,
+            )
+            v_double_take = 2.0 * self.value_twoply_checker_cubeful_filtered(
+                state, theirs_ms, k=self.twoply_k,
+            )
+            should_double = self._money_cube_decision(
+                v_no_double, v_double_take, no_double_persp, match_state.jacoby,
+            )
+            return CubeOffer(
+                should_double=should_double,
+                _cache={
+                    "v_double_take_2ply": v_double_take,
+                    "v_no_double_2ply": v_no_double,
+                },
+            )
+
+        # Batch the two needed evaluations into one forward (batch=2)
+        # — saves a kernel launch / Python dispatch per cube offer.
+        x_nd = self._encode_cubeful(state, no_double_persp, is_cube_action=False)
+        x_dt = self._encode_cubeful(state, CubePerspective.THEIRS, is_cube_action=False)
+        t = torch.from_numpy(np.stack([x_nd, x_dt]))
+        t = self._to_device(t)
+        with torch.no_grad():
+            values = self.network(t).flatten()
+        v_no_double = float(values[0].item())
+        v_double_take = 2.0 * float(values[1].item())
         should_double = self._money_cube_decision(
             v_no_double, v_double_take, no_double_persp, match_state.jacoby,
         )
@@ -775,9 +1189,24 @@ class TDAgent(Agent):
             return super().respond_to_double(state, match_state, hint=hint)
         # Read cached v_double_take at the matching resolution,
         # or recompute if not available.
-        key = "v_double_take_1ply" if self.oneply else "v_double_take_0ply"
+        if self.twoply_k > 0:
+            key = "v_double_take_2ply"
+        elif self.oneply:
+            key = "v_double_take_1ply"
+        else:
+            key = "v_double_take_0ply"
         if hint is not None and hint._cache is not None and key in hint._cache:
             v_double_take = hint._cache[key]
+        elif self.twoply_k > 0:
+            from dataclasses import replace
+            from modes import CubeOwner
+            opponent = 1 - state.turn
+            theirs_ms = replace(
+                match_state, cube_owner=CubeOwner(opponent + 1),
+            )
+            v_double_take = 2.0 * self.value_twoply_checker_cubeful_filtered(
+                state, theirs_ms, k=self.twoply_k,
+            )
         elif self.oneply:
             from dataclasses import replace
             from modes import CubeOwner
@@ -836,28 +1265,55 @@ class TDAgent(Agent):
                 state, dice, match_state,
             )
 
-        plays = get_legal_plays(state, dice)
-        if not plays:
-            return None
-
-        if self.oneply:
-            return self._choose_checker_oneply_cubeful(
-                state, plays, match_state,
+        # 2-ply: needs the full Play objects, can't use the C fast path
+        # below (which hands the 1-ply consumer (None, next_state)).
+        if self.twoply_k > 0:
+            plays = get_legal_plays(state, dice)
+            if not plays:
+                return None
+            return self._choose_checker_twoply_cubeful(
+                state, plays, match_state, k=self.twoply_k,
             )
+
+        # Fast path: use the C move-gen + encode in one call, eagerly
+        # materializing successor states. Saves the Python _generate_plays
+        # / encode_state loop (~50% of cubeful self-play time per profile).
+        # The 1-ply downstream consumer only reads `next_state` from each
+        # (play_obj, next_state) tuple, so handing it (None, next_state)
+        # is safe.
+        if self._c_base_available:
+            base_feats, _lazy = _bg_fast.get_legal_plays_encoded(state, dice)
+            n_plays = len(_lazy)
+            if n_plays == 0:
+                return None
+            # Materialize immediately — the shared C buffer is invalidated
+            # by the next bg_fast call (incl. the opponent's turn or any
+            # downstream 1-ply inner enumeration).
+            next_states = [_lazy[i] for i in range(n_plays)]
+            if self.oneply:
+                plays = [(None, ns) for ns in next_states]
+                return self._choose_checker_oneply_cubeful(
+                    state, plays, match_state,
+                )
+            # 0-ply continues below with base_feats + next_states already set
+        else:
+            plays = get_legal_plays(state, dice)
+            if not plays:
+                return None
+
+            if self.oneply:
+                return self._choose_checker_oneply_cubeful(
+                    state, plays, match_state,
+                )
+
+            next_states = [s for _, s in plays]
+            base = self.encoder._base
+            base_feats = np.stack([base.encode(s) for s in next_states])
 
         from modes import CubeOwner, cube_perspective
         opponent = 1 - state.turn
         opp_persp = cube_perspective(match_state.cube_owner, opponent)
         opp_cube_action = match_state.can_offer(opponent)
-
-        next_states = [s for _, s in plays]
-        if self._c_base_available:
-            base_feats = np.stack([
-                _bg_fast.encode_state(s) for s in next_states
-            ])
-        else:
-            base = self.encoder._base
-            base_feats = np.stack([base.encode(s) for s in next_states])
         # Append cube one-hot (3) + is_cube_action bit (1)
         from encoding import CUBE_FEATURES
         extra = np.zeros((len(next_states), CUBE_FEATURES), dtype=np.float32)
@@ -928,7 +1384,6 @@ class TDAgent(Agent):
         # our_persp at after_opp is MINE and we can always offer there.
         # Cube is owned (not centered) → gammons always count.
         our_persp_B = CubePerspective.MINE
-        gammons_count_B = True
 
         base = self.encoder._base
         n_feat = self.encoder.num_features
@@ -1099,8 +1554,7 @@ class TDAgent(Agent):
         else:
             net_values = np.empty(0)
 
-        probs = [(1.0 / 36.0) if d1 == d2 else (2.0 / 36.0)
-                 for d1, d2 in _DICE_OUTCOMES]
+        probs = _ONEPLY_PROBS.tolist()
         assert abs(sum(probs) - 1.0) < 1e-9, \
             "dice probabilities must sum to 1"
 
@@ -1178,6 +1632,164 @@ class TDAgent(Agent):
         chosen = plays[best_idx][1]
         return chosen, best_val
 
+    def _expand_cubeful_level1(
+        self, state, opp_persp, opp_cube_action, gammons_count,
+        track_next_states,
+    ):
+        """Shared level-1 dice expansion for the cubeful 1-ply and 2-ply
+        value methods.
+
+        Enumerates all 21 dice outcomes; for each builds a per-dice list
+        of mover per-unit equities (terminal successors scored by
+        game_result, or +1 when gammons don't count), encodes every
+        non-terminal/forced-pass successor with the opponent cube
+        perspective, runs ONE batched forward across all of them, and
+        fills in the non-terminal equities as -V(opp).
+
+        Returns `(dice_results, dice_nonterm_indices, dice_next_states)`,
+        each a list indexed by dice outcome. `dice_next_states` is
+        populated only when `track_next_states` is True (the 2-ply path
+        needs the successors for top-K deepening; the 1-ply path does
+        not), otherwise it is None.
+        """
+        base = self.encoder._base
+        n_feat = self.encoder.num_features
+        n_base = base.num_features
+        opp_col = int(opp_persp)
+
+        dice_results: List[Optional[List[float]]] = [None] * len(_DICE_OUTCOMES)
+        dice_nonterm_indices: List[Optional[np.ndarray]] = [None] * len(_DICE_OUTCOMES)
+        dice_next_states: Optional[List[Optional[list]]] = (
+            [None] * len(_DICE_OUTCOMES) if track_next_states else None
+        )
+        enc_chunks: List[np.ndarray] = []
+        chunk_dice_idx: List[int] = []
+
+        for dice_idx, (d1, d2) in enumerate(_DICE_OUTCOMES):
+            if self._c_base_available:
+                # Fused C call: move-gen + 196-feature encode in one shot.
+                base_feats, next_states_view = (
+                    _bg_fast.get_legal_plays_encoded(state, (d1, d2))
+                )
+                n = len(next_states_view)
+                if n == 0:
+                    # Forced pass: encode the opponent-on-roll position
+                    # once and store as a single-element chunk.
+                    opp_view = switch_turn(state)
+                    base_enc = _bg_fast.encode_state(opp_view)
+                    enc = self.encoder.encode_with_base(base_enc, opp_persp, opp_cube_action)
+                    dice_results[dice_idx] = [0.0]
+                    dice_nonterm_indices[dice_idx] = np.array([0], dtype=np.int64)
+                    if track_next_states:
+                        dice_next_states[dice_idx] = [opp_view]
+                    enc_chunks.append(enc.reshape(1, -1))
+                    chunk_dice_idx.append(dice_idx)
+                    continue
+
+                # Terminal detection: feature[OPP_OFF_INDEX] is mover's off/15;
+                # ≥1 means the successor terminates with mover winning.
+                terminal_mask = base_feats[:, OPP_OFF_INDEX] >= TERMINAL_OFF_THRESHOLD
+                results_list: List[float] = [0.0] * n
+                if terminal_mask.any():
+                    if gammons_count:
+                        for i in np.nonzero(terminal_mask)[0]:
+                            results_list[int(i)] = float(
+                                next_states_view[int(i)].game_result()
+                            )
+                    else:
+                        for i in np.nonzero(terminal_mask)[0]:
+                            results_list[int(i)] = 1.0
+                    non_term_idx = np.nonzero(~terminal_mask)[0]
+                else:
+                    non_term_idx = np.arange(n, dtype=np.int64)
+
+                dice_results[dice_idx] = results_list
+                dice_nonterm_indices[dice_idx] = non_term_idx
+                if track_next_states:
+                    # Materialise the non-terminal next_states (the C fast
+                    # path returns a view; copy refs so they survive past
+                    # the function-local scope).
+                    dice_next_states[dice_idx] = [
+                        next_states_view[int(i)] for i in non_term_idx
+                    ]
+                if len(non_term_idx) > 0:
+                    # Build the (n_nonterm, 199) chunk: base feats +
+                    # cube one-hot column, vectorised.
+                    chunk = np.zeros(
+                        (len(non_term_idx), n_feat),
+                        dtype=np.float32,
+                    )
+                    chunk[:, :n_base] = base_feats[non_term_idx]
+                    chunk[:, n_base + opp_col] = 1.0
+                    if opp_cube_action:
+                        chunk[:, n_base + 3] = 1.0
+                    enc_chunks.append(chunk)
+                    chunk_dice_idx.append(dice_idx)
+            else:
+                plays = get_legal_plays(state, (d1, d2))
+                if not plays:
+                    opp_view = switch_turn(state)
+                    base_enc = base.encode(opp_view)
+                    enc = self.encoder.encode_with_base(base_enc, opp_persp, opp_cube_action)
+                    dice_results[dice_idx] = [0.0]
+                    dice_nonterm_indices[dice_idx] = np.array([0], dtype=np.int64)
+                    if track_next_states:
+                        dice_next_states[dice_idx] = [opp_view]
+                    enc_chunks.append(enc.reshape(1, -1))
+                    chunk_dice_idx.append(dice_idx)
+                    continue
+                next_states = [s for _, s in plays]
+                results_list = [0.0] * len(next_states)
+                non_term_list: List[int] = []
+                for i, ns in enumerate(next_states):
+                    if ns.is_game_over():
+                        if gammons_count:
+                            results_list[i] = float(ns.game_result())
+                        else:
+                            results_list[i] = 1.0
+                    else:
+                        non_term_list.append(i)
+                dice_results[dice_idx] = results_list
+                if track_next_states:
+                    dice_next_states[dice_idx] = [next_states[i] for i in non_term_list]
+                if non_term_list:
+                    chunk = np.stack([
+                        self.encoder.encode_with_base(
+                            base.encode(next_states[i]), opp_persp,
+                            opp_cube_action,
+                        )
+                        for i in non_term_list
+                    ])
+                    dice_nonterm_indices[dice_idx] = np.asarray(
+                        non_term_list, dtype=np.int64,
+                    )
+                    enc_chunks.append(chunk)
+                    chunk_dice_idx.append(dice_idx)
+
+        # ONE batched forward pass for every non-terminal / pass encoding.
+        if enc_chunks:
+            batch = np.concatenate(enc_chunks, axis=0)
+            t = torch.from_numpy(batch)
+            t = self._to_device(t)
+            with torch.no_grad():
+                if self.bf16_inference and self._bf16_net is not None:
+                    opp_values = (
+                        self._bf16_net(t.to(torch.bfloat16))
+                        .to(torch.float32).cpu().numpy()
+                    )
+                else:
+                    opp_values = self.network(t).cpu().numpy()
+            offset = 0
+            for chunk, di in zip(enc_chunks, chunk_dice_idx):
+                n_rows = chunk.shape[0]
+                idxs = dice_nonterm_indices[di]
+                results_list = dice_results[di]
+                for j in range(n_rows):
+                    results_list[int(idxs[j])] = -float(opp_values[offset + j])
+                offset += n_rows
+
+        return dice_results, dice_nonterm_indices, dice_next_states
+
     def value_oneply_checker_cubeful(
         self, state: BoardState, match_state,
     ) -> float:
@@ -1214,129 +1826,49 @@ class TDAgent(Agent):
             or match_state.cube_owner != CubeOwner.CENTERED
         )
 
-        # Per-dice results (list of equities, one per legal move) plus
-        # per-dice chunks of non-terminal encodings. All chunks are
-        # concatenated ONCE at the end and fed through the network in
-        # a single forward pass.
-        dice_results: List[Optional[List[float]]] = [None] * len(_DICE_OUTCOMES)
-        dice_nonterm_indices: List[Optional[np.ndarray]] = [None] * len(_DICE_OUTCOMES)
-        enc_chunks: List[np.ndarray] = []
-        chunk_dice_idx: List[int] = []  # dice_idx per chunk (for fill-in)
-        probs: List[float] = []
-        opp_col = int(opp_persp)
-
-        for dice_idx, (d1, d2) in enumerate(_DICE_OUTCOMES):
-            probs.append((1.0 / 36.0) if d1 == d2 else (2.0 / 36.0))
-
-            if self._c_base_available:
-                # Fused C call: move-gen + 196-feature encode in one shot.
-                base_feats, next_states_view = (
-                    _bg_fast.get_legal_plays_encoded(state, (d1, d2))
-                )
-                n = len(next_states_view)
-                if n == 0:
-                    # Forced pass: encode the opponent-on-roll position
-                    # once and store as a single-element chunk.
-                    opp_view = switch_turn(state)
-                    base_enc = _bg_fast.encode_state(opp_view)
-                    enc = self.encoder.encode_with_base(base_enc, opp_persp, opp_cube_action)
-                    dice_results[dice_idx] = [0.0]
-                    dice_nonterm_indices[dice_idx] = np.array([0], dtype=np.int64)
-                    enc_chunks.append(enc.reshape(1, -1))
-                    chunk_dice_idx.append(dice_idx)
-                    continue
-
-                # Terminal detection: feature[OPP_OFF_INDEX] is mover's off/15;
-                # ≥1 means the successor terminates with mover winning.
-                terminal_mask = base_feats[:, OPP_OFF_INDEX] >= TERMINAL_OFF_THRESHOLD
-                results_list: List[float] = [0.0] * n
-                if terminal_mask.any():
-                    if gammons_count:
-                        for i in np.nonzero(terminal_mask)[0]:
-                            results_list[int(i)] = float(
-                                next_states_view[int(i)].game_result()
-                            )
-                    else:
-                        for i in np.nonzero(terminal_mask)[0]:
-                            results_list[int(i)] = 1.0
-                    non_term_idx = np.nonzero(~terminal_mask)[0]
-                else:
-                    non_term_idx = np.arange(n, dtype=np.int64)
-
-                dice_results[dice_idx] = results_list
-                dice_nonterm_indices[dice_idx] = non_term_idx
-                if len(non_term_idx) > 0:
-                    # Build the (n_nonterm, 199) chunk: base feats +
-                    # cube one-hot column, vectorised.
-                    chunk = np.zeros(
-                        (len(non_term_idx), n_feat),
-                        dtype=np.float32,
-                    )
-                    chunk[:, :n_base] = base_feats[non_term_idx]
-                    chunk[:, n_base + opp_col] = 1.0
+        # Fast path: one C 21-dice expansion of `state` + vectorized
+        # per-dice max reduction. Single cube scenario (opp on roll
+        # after the mover's move). Falls through to the per-dice path
+        # below if the C expansion is unavailable / overflows.
+        if self._c_base_available:
+            exp = _bg_fast.expand_21(state)
+            if exp is not None:
+                base_feats, counts, gr, n_rows = exp
+                opp_col = int(opp_persp)
+                if n_rows:
+                    feat = np.zeros((n_rows, n_feat), dtype=np.float32)
+                    feat[:, :n_base] = base_feats
+                    feat[:, n_base + opp_col] = 1.0
                     if opp_cube_action:
-                        chunk[:, n_base + 3] = 1.0
-                    enc_chunks.append(chunk)
-                    chunk_dice_idx.append(dice_idx)
-            else:
-                plays = get_legal_plays(state, (d1, d2))
-                if not plays:
-                    opp_view = switch_turn(state)
-                    base_enc = base.encode(opp_view)
-                    enc = self.encoder.encode_with_base(base_enc, opp_persp, opp_cube_action)
-                    dice_results[dice_idx] = [0.0]
-                    dice_nonterm_indices[dice_idx] = np.array([0], dtype=np.int64)
-                    enc_chunks.append(enc.reshape(1, -1))
-                    chunk_dice_idx.append(dice_idx)
-                    continue
-                next_states = [s for _, s in plays]
-                results_list = [0.0] * len(next_states)
-                non_term_list: List[int] = []
-                for i, ns in enumerate(next_states):
-                    if ns.is_game_over():
-                        if gammons_count:
-                            results_list[i] = float(ns.game_result())
-                        else:
-                            results_list[i] = 1.0
-                    else:
-                        non_term_list.append(i)
-                dice_results[dice_idx] = results_list
-                if non_term_list:
-                    chunk = np.stack([
-                        self.encoder.encode_with_base(
-                            base.encode(next_states[i]), opp_persp,
-                            opp_cube_action,
-                        )
-                        for i in non_term_list
-                    ])
-                    dice_nonterm_indices[dice_idx] = np.asarray(
-                        non_term_list, dtype=np.int64,
-                    )
-                    enc_chunks.append(chunk)
-                    chunk_dice_idx.append(dice_idx)
-
-        # ONE batched forward pass for every non-terminal / pass encoding.
-        if enc_chunks:
-            batch = np.concatenate(enc_chunks, axis=0)
-            t = torch.from_numpy(batch)
-            t = self._to_device(t)
-            with torch.no_grad():
-                if self.bf16_inference and self._bf16_net is not None:
-                    opp_values = (
-                        self._bf16_net(t.to(torch.bfloat16))
-                        .to(torch.float32).cpu().numpy()
-                    )
+                        feat[:, n_base + 3] = 1.0
+                    V = self._forward_inference(
+                        self._to_device(torch.from_numpy(feat))
+                    ).cpu().numpy().ravel()
                 else:
-                    opp_values = self.network(t).cpu().numpy()
-            offset = 0
-            for chunk, di in zip(enc_chunks, chunk_dice_idx):
-                n_rows = chunk.shape[0]
-                idxs = dice_nonterm_indices[di]
-                results_list = dice_results[di]
-                for k in range(n_rows):
-                    results_list[int(idxs[k])] = -float(opp_values[offset + k])
-                offset += n_rows
+                    V = np.empty(0, dtype=np.float32)
+                nonterm = gr == 0
+                # Mover's per-unit equity per reply: non-terminal -> -V
+                # (flip opp view); terminal -> +game_result (or +1 when
+                # gammons don't count). Mover picks the max per dice.
+                vmover = gr.astype(np.float64)
+                if not gammons_count:
+                    vmover[~nonterm] = 1.0
+                vmover[nonterm] = -V
+                seg = np.empty(counts.shape[0], dtype=np.int64)
+                seg[0] = 0
+                np.cumsum(counts[:-1], out=seg[1:])
+                dice_max = np.maximum.reduceat(vmover, seg)
+                return float(_ONEPLY_PROBS @ dice_max)
 
+        # Per-dice 0-ply expansion + single batched forward (shared with
+        # the 2-ply method). The 1-ply path doesn't need the successors,
+        # so track_next_states=False.
+        dice_results, _, _ = self._expand_cubeful_level1(
+            state, opp_persp, opp_cube_action, gammons_count,
+            track_next_states=False,
+        )
+
+        probs = _ONEPLY_PROBS.tolist()
         oneply_sum = 0.0
         for di, prob in enumerate(probs):
             equities = dice_results[di]
@@ -1344,6 +1876,232 @@ class TDAgent(Agent):
                 oneply_sum += prob * max(equities)
 
         return oneply_sum
+
+    def _choose_checker_twoply_cubeful(
+        self, state: BoardState, plays, match_state, k: int = 1,
+    ):
+        """2-ply K=k cubeful chequer move selection.
+
+        For each candidate move m, compute opp's value at the resulting
+        state using value_twoply_checker_cubeful_filtered (which itself
+        includes opp's cube decision at level 2 per the post-fix
+        implementation). Pick the move maximizing mover equity.
+
+        Simpler than the 1-ply chequer selector (no per-candidate batching
+        across opp dice) — each candidate just calls the 2-ply value
+        function, which does its own internal batching. Cost per call is
+        higher: roughly k+1 calls to value_oneply_checker_cubeful inside.
+
+        With k=1 on prod 4L on the test machine: ~42 ms per evaluation
+        of one candidate's resulting state. Self-play games with this
+        move selector are ~24-30x slower than 0-ply self-play.
+        """
+        from modes import CubeOwner
+
+        if not plays:
+            return None
+
+        gammons_count = (
+            not match_state.jacoby
+            or match_state.cube_owner != CubeOwner.CENTERED
+        )
+
+        best_value = float("-inf")
+        best_idx = 0
+        for m_idx, (_, next_state) in enumerate(plays):
+            if next_state.is_game_over():
+                # Mover wins this move outright.
+                mover_eq = (
+                    float(next_state.game_result()) if gammons_count else 1.0
+                )
+            else:
+                # Opp is on roll at next_state. The 2-ply value function
+                # returns opp's per-unit equity (now including opp's
+                # cube decision in the level-2 expansion).
+                import os as _os
+                if _os.environ.get("TWOPLY_IMMEDIATE_CUBE", "0") == "1":
+                    opp_value = self.value_twoply_with_immediate_cube(
+                        next_state, match_state, k=k,
+                    )
+                else:
+                    opp_value = self.value_twoply_checker_cubeful_filtered(
+                        next_state, match_state, k=k,
+                    )
+                mover_eq = -opp_value
+
+            if mover_eq > best_value:
+                best_value = mover_eq
+                best_idx = m_idx
+
+        chosen = plays[best_idx][1]
+        return chosen, best_value
+
+    def value_twoply_with_immediate_cube(
+        self, state: BoardState, match_state, k: int = 3,
+    ) -> float:
+        """value_twoply_checker_cubeful_filtered + on-roll player's own
+        immediate cube decision at this state.
+
+        The base function enumerates the OPPONENT's cube decision at
+        level-2 (after on-roll player's move). It does NOT enumerate
+        the on-roll player's cube decision RIGHT NOW (before rolling).
+        This wrapper adds that level-1 enumeration via the standard
+        max(no_double, min(2·v_after_take, 1)) analytical formula.
+
+        Cost: two calls to the base function (vs one). Roughly 2x slower
+        when the on-roll player is cube-eligible; same cost when not.
+        """
+        v_no_double = self.value_twoply_checker_cubeful_filtered(
+            state, match_state, k=k,
+        )
+        if not match_state.can_offer(state.turn):
+            return v_no_double
+        # On-roll doubles → opp takes/passes. On take: cube=2, opp owns.
+        # Recompute 2-ply value at same state under new cube state.
+        after_take_ms = match_state.after_take(state.turn)
+        v_after_take = self.value_twoply_checker_cubeful_filtered(
+            state, after_take_ms, k=k,
+        )
+        # Opp picks min for on-roll: payoff after doubling = min(2·v, 1)
+        v_double_response = min(2.0 * v_after_take, 1.0)
+        return max(v_no_double, v_double_response)
+
+    def value_twoply_checker_cubeful_filtered(
+        self, state: BoardState, match_state, k: int = 3,
+    ) -> float:
+        """2-ply per-unit equity at `state` with 1-ply top-K move filter.
+
+        For each of the 21 dice outcomes:
+          1. Enumerate all legal moves (level-1 candidates)
+          2. Compute 0-ply value for each candidate via batched forward
+             (terminals scored by game_result + Jacoby; non-terminals
+             by -V(opp))
+          3. Filter to the top-K non-terminal candidates by 0-ply
+             mover equity (= the 1-ply move filter)
+          4. For each top-K candidate, compute 1-ply value of its
+             successor (= opponent's optimal 1-ply response)
+          5. Mover's best per dice = max over (terminal candidates
+             level-1 values, top-K candidates level-2 values)
+        Then weighted sum across dice.
+
+        Cost: each state evaluation does 1 level-1 batched forward
+        (cheap, same as 1-ply) + K calls to value_oneply_checker_cubeful
+        per non-terminal-rich dice outcome. Roughly K+1 = 4x slower
+        than 1-ply at K=3.
+
+        K=1: pick best 0-ply move, evaluate at 1-ply. Cheap but
+        vulnerable to 0-ply ranking errors.
+        K = max_candidates: exact 2-ply (no filter); much slower.
+        K=3 is a reasonable safety margin — the true best is almost
+        always in the 0-ply top-3 for a trained network.
+
+        Intended for cubeful money training only. Matchplay needs a
+        score-aware variant.
+        """
+        assert self.is_cubeful, \
+            "value_twoply_checker_cubeful_filtered requires a CubefulEncoder agent"
+        assert not state.is_game_over(), \
+            "value_twoply_checker_cubeful_filtered called on a terminal state"
+        assert k >= 1, f"k must be >= 1, got {k}"
+
+        from modes import CubeOwner, cube_perspective
+
+        player = state.turn
+        opponent = 1 - player
+        opp_persp = cube_perspective(match_state.cube_owner, opponent)
+        opp_cube_action = match_state.can_offer(opponent)
+
+        gammons_count = (
+            not match_state.jacoby
+            or match_state.cube_owner != CubeOwner.CENTERED
+        )
+
+        # Per-dice 0-ply expansion + single batched forward (shared with
+        # the 1-ply method). track_next_states=True keeps the non-terminal
+        # successors for the level-2 top-K deepening below.
+        dice_results, dice_nonterm_indices, dice_next_states = (
+            self._expand_cubeful_level1(
+                state, opp_persp, opp_cube_action, gammons_count,
+                track_next_states=True,
+            )
+        )
+        probs = _ONEPLY_PROBS.tolist()
+
+        # Level-2: for each dice, take the top-K non-terminal candidates
+        # by level-1 mover equity, compute their 1-ply opponent response,
+        # then pick the best across {terminal candidates, top-K level-2}.
+        twoply_sum = 0.0
+        for di, prob in enumerate(probs):
+            equities = dice_results[di]
+            if not equities:
+                continue
+            non_term_idx = dice_nonterm_indices[di]
+            non_term_states = dice_next_states[di]
+
+            # Identify terminal-vs-non-terminal candidates so we know
+            # which ones can be re-evaluated at level-2.
+            if non_term_idx is None or len(non_term_idx) == 0:
+                # All terminal — same answer as 1-ply (no deeper search).
+                twoply_sum += prob * max(equities)
+                continue
+
+            non_term_idx_set = set(int(i) for i in non_term_idx)
+            terminal_values = [
+                v for i, v in enumerate(equities) if i not in non_term_idx_set
+            ]
+
+            # Sort non-terminal candidates by 0-ply mover equity, take top-K.
+            ranked = sorted(
+                range(len(non_term_idx)),
+                key=lambda j: -equities[int(non_term_idx[j])],  # descending
+            )
+            top_k = ranked[: min(k, len(ranked))]
+
+            # Level-2 evaluation: for each top-K candidate, the opponent
+            # is on roll at `non_term_states[j]`. Simulate opp's optimal
+            # cube decision (if cube-eligible) plus their 1-ply chequer
+            # value; mover equity = -opp_optimal_value.
+            #
+            # Critical: value_oneply_checker_cubeful alone evaluates ONLY
+            # the chequer play — it does NOT enumerate opp's cube decision
+            # at the intermediate node. The 1-ply target avoids this by
+            # using V_theta(next, cube_action=True), which is trained to
+            # include opp's cube decision. At level 2 we must enumerate
+            # the cube decision explicitly, otherwise we systematically
+            # undervalue opp (and overvalue our move), biasing targets
+            # upward. Per-unit equities throughout (cube_value=1
+            # normalization).
+            level2_values = []
+            for j in top_k:
+                opp_next_state = non_term_states[j]
+                opp_at_next = opp_next_state.turn  # = opponent
+
+                # Opp's no-double value (chequer-only 1-ply lookahead).
+                v_no_double = self.value_oneply_checker_cubeful(
+                    opp_next_state, match_state,
+                )
+
+                if match_state.can_offer(opp_at_next):
+                    # Opp may double; I respond optimally.
+                    after_take_ms = match_state.after_take(opp_at_next)
+                    v_after_take = self.value_oneply_checker_cubeful(
+                        opp_next_state, after_take_ms,
+                    )
+                    # Per old cube unit: take -> 2 * v_after_take to opp;
+                    # pass -> +1 to opp. I pick min for opp.
+                    v_double_response = min(2.0 * v_after_take, 1.0)
+                    v_opp_optimal = max(v_no_double, v_double_response)
+                else:
+                    v_opp_optimal = v_no_double
+
+                level2_values.append(-v_opp_optimal)
+
+            best = max(terminal_values + level2_values) if (
+                terminal_values or level2_values
+            ) else 0.0
+            twoply_sum += prob * best
+
+        return twoply_sum
 
     # ── fast online TD update (bypass loss + optimizer machinery) ─────
 

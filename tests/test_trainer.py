@@ -99,28 +99,6 @@ class TestValueOneplyCheckerEquityTerminals:
     Probability mode collapses them all to 1.0 so it doesn't need
     this differentiation."""
 
-    @staticmethod
-    def _near_bear_off(black_off: int, black_in_white_home: bool) -> BoardState:
-        """Build a synthetic position where WHITE has 14 of 15 borne
-        off and one checker on point 1 — every dice roll bears that
-        last checker off and ends the game with WHITE winning. The
-        kind of win depends on BLACK's borne-off count and whether
-        BLACK still has any checkers in WHITE's home board:
-          - black_off=1: single (1)
-          - black_off=0, no checker in white's home: gammon (2)
-          - black_off=0, checker in white's home: backgammon (3)
-        """
-        state = BoardState(
-            points=[0] * 24, bar=[0, 0], off=[14, black_off], turn=0,
-        )
-        state.points[0] = 1  # white's last checker
-        if black_in_white_home:
-            state.points[5] = -1
-            state.points[23] = -(15 - black_off - 1)
-        else:
-            state.points[23] = -(15 - black_off)
-        return state
-
     def _eval_equity_oneply(self, state):
         # torch_seed pinned so the network init is deterministic; the
         # test only depends on terminal-detection logic, not the
@@ -131,26 +109,26 @@ class TestValueOneplyCheckerEquityTerminals:
         return agent.value_oneply_checker(state)
 
     def test_single_win_returns_one(self):
-        state = self._near_bear_off(black_off=1, black_in_white_home=False)
+        state = _near_bear_off_white(black_off=1, black_in_white_home=False)
         assert self._eval_equity_oneply(state) == pytest.approx(1.0)
 
     def test_gammon_win_returns_two(self):
-        state = self._near_bear_off(black_off=0, black_in_white_home=False)
+        state = _near_bear_off_white(black_off=0, black_in_white_home=False)
         assert self._eval_equity_oneply(state) == pytest.approx(2.0)
 
     def test_backgammon_win_returns_three(self):
-        state = self._near_bear_off(black_off=0, black_in_white_home=True)
+        state = _near_bear_off_white(black_off=0, black_in_white_home=True)
         assert self._eval_equity_oneply(state) == pytest.approx(3.0)
 
     def test_gammon_strictly_greater_than_single(self):
         single = self._eval_equity_oneply(
-            self._near_bear_off(black_off=1, black_in_white_home=False)
+            _near_bear_off_white(black_off=1, black_in_white_home=False)
         )
         gammon = self._eval_equity_oneply(
-            self._near_bear_off(black_off=0, black_in_white_home=False)
+            _near_bear_off_white(black_off=0, black_in_white_home=False)
         )
         backgammon = self._eval_equity_oneply(
-            self._near_bear_off(black_off=0, black_in_white_home=True)
+            _near_bear_off_white(black_off=0, black_in_white_home=True)
         )
         assert single < gammon < backgammon
 
@@ -475,7 +453,7 @@ def _mixed_terminal_position():
     return state
 
 
-def _stub_network_terminal_looks_good(orig_forward):
+def _stub_network_terminal_looks_good():
     """Wrap a forward fn so terminal encodings (OPP_OFF ≥ threshold)
     return a HIGH value (0.9) and non-terminals return LOW (0.1).
     Pre-fix argmin would pick the non-terminal — the very bug we're
@@ -518,7 +496,7 @@ class TestZeroPlyTerminalMask:
         match_state = MatchState(cube_owner=CubeOwner.CENTERED, jacoby=True)
 
         orig = agent.network.forward
-        agent.network.forward = _stub_network_terminal_looks_good(orig)
+        agent.network.forward = _stub_network_terminal_looks_good()
         try:
             result = agent.choose_checker_action_cubeful(
                 state, (6, 1), match_state,
@@ -543,7 +521,7 @@ class TestZeroPlyTerminalMask:
         agent = TDAgent(net)
 
         orig = agent.network.forward
-        agent.network.forward = _stub_network_terminal_looks_good(orig)
+        agent.network.forward = _stub_network_terminal_looks_good()
         try:
             result = agent.choose_checker_action(
                 state, (6, 1), with_target=True,
@@ -568,7 +546,7 @@ class TestZeroPlyTerminalMask:
         plays = get_legal_plays(state, (6, 1))
 
         orig = agent.network.forward
-        agent.network.forward = _stub_network_terminal_looks_good(orig)
+        agent.network.forward = _stub_network_terminal_looks_good()
         try:
             result = agent.choose_checker_action(
                 state, (6, 1), actions=plays, with_target=True,

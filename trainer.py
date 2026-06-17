@@ -20,6 +20,7 @@ import multiprocessing as mp
 import os
 import random
 import time
+from dataclasses import replace
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -27,7 +28,8 @@ import torch
 
 from agents import Agent
 from backgammon_engine import BoardState, opening_roll, switch_turn
-from modes import GameMode
+from encoding import CubePerspective
+from modes import CubeOwner, GameMode, cube_perspective
 
 
 # ── Episode collection (mode-agnostic, agent-driven) ──────────────────
@@ -139,10 +141,6 @@ def _collect_episode_cubeful_money(
 
     All targets are per-unit equity (cube_value = 1).
     """
-    from dataclasses import replace
-    from encoding import CubePerspective
-    from modes import CubeOwner, cube_perspective
-
     state, dice = opening_roll(rng)
     enc_list: List[np.ndarray] = []
     targets: List[float] = []
@@ -183,12 +181,20 @@ def _collect_episode_cubeful_money(
                     # Default: 0-ply cube targets while keeping 1-ply for
                     # the checker phase. Avoids the 1-ply cube-target
                     # inflation that produced r8_tmp's cube_mEMG regression.
-                    v_no_double = agent.evaluate_cubeful(
+                    # Batched into one forward(batch=2) — saves one network
+                    # dispatch per cube-eligible turn.
+                    x_nd = agent._encode_cubeful(
                         state, pre_persp, is_cube_action=False,
                     )
-                    v_double_take = 2.0 * agent.evaluate_cubeful(
+                    x_dt = agent._encode_cubeful(
                         state, CubePerspective.THEIRS, is_cube_action=False,
                     )
+                    t = torch.from_numpy(np.stack([x_nd, x_dt]))
+                    t = agent._to_device(t)
+                    with torch.no_grad():
+                        values = agent.network(t).flatten()
+                    v_no_double = float(values[0].item())
+                    v_double_take = 2.0 * float(values[1].item())
                     # leave oneply_no_double = None so checker_target
                     # below recomputes via 1-ply (don't reuse 0-ply v_nd)
                 do_double = agent._money_cube_decision(
@@ -470,6 +476,7 @@ class Trainer:
         save_every: int = 0,
         metrics_out: Optional[dict] = None,
         cube_targets_1ply: bool = False,
+        pipeline_collect: bool = False,
     ) -> List[float]:
         """Round-based batch TD(0). A round collects
         `episodes_per_round` episodes, then trains `epochs_per_round`
@@ -489,6 +496,15 @@ class Trainer:
         `warmup_cycles` rounds. Useful when starting from a depth-
         expanded model whose new layer needs gentle initial steps.
         Composes with `end_lr` (multiplicative).
+
+        `pipeline_collect`: when True (and workers > 1), overlap the
+        worker collection of round N+1 with the master training step
+        of round N. Workers for round N+1 see weights from end of
+        round N-1 (one-round stale targets); the staleness is
+        negligible at typical 1-ply LRs (1e-6 to 1e-5) but should be
+        validated when changing recipes. Reproducibility is preserved
+        (the rng.randint() sequence for worker seeds is unchanged).
+        No effect with workers <= 1.
 
         Returns a flat list of per-batch losses.
         """
@@ -564,6 +580,38 @@ class Trainer:
         output_mode = getattr(net, "output_mode", "probability")
         encoder_name = getattr(net, "encoder_name", "perspective196")
 
+        # Helper: build worker_args for a given round_size using current
+        # net weights. Called either eagerly (pipeline pre-submit) or
+        # lazily (sync path).
+        def _build_worker_args(round_size: int):
+            splits = _split_episodes(round_size, workers)
+            state_dict = {
+                k: v.detach().cpu()
+                for k, v in net.state_dict().items()
+            }
+            return [
+                (state_dict, hidden_sizes, input_size, output_mode,
+                 encoder_name,
+                 mode, n_eps, rng.randint(0, 2**31 - 1),
+                 oneply, oneply_acting, boltzmann_temp,
+                 bf16_collect, cube_targets_1ply)
+                for n_eps in splits
+            ]
+
+        # Pipeline pre-roll: if pipelining and we have a worker pool,
+        # start round 0's collect before entering the loop. The loop
+        # will then wait for "pending" results at the top of each
+        # iteration and submit the NEXT round's collect before training.
+        # No-op when pool is None or pipeline_collect is False.
+        use_pipeline = pipeline_collect and pool is not None
+        pending = None
+        pending_round_size = 0
+        if use_pipeline:
+            pending_round_size = min(episodes_per_round, num_episodes)
+            pending = pool.map_async(
+                _collect_worker, _build_worker_args(pending_round_size),
+            )
+
         try:
             num_rounds = math.ceil(num_episodes / episodes_per_round)
             episodes_played = 0
@@ -610,22 +658,34 @@ class Trainer:
                         if len(encs) > 0:
                             enc_chunks.append(encs)
                             tgt_chunks.append(tgts)
+                elif use_pipeline:
+                    # Pipelined: this round's collect was started in the
+                    # previous iteration (or pre-loop for round 0). Submit
+                    # the NEXT round's collect BEFORE training, so workers
+                    # run in parallel with the master's GPU train step.
+                    # The next round's workers see CURRENT weights (V_N
+                    # before this iter trains), making their targets one
+                    # round stale relative to a strict sync schedule.
+                    next_pending = None
+                    next_round_size = 0
+                    if round_idx + 1 < num_rounds:
+                        next_round_size = min(
+                            episodes_per_round,
+                            num_episodes - (episodes_played + round_size),
+                        )
+                        next_pending = pool.map_async(
+                            _collect_worker, _build_worker_args(next_round_size),
+                        )
+                    for w_enc, w_tgt in pending.get():
+                        if len(w_enc) > 0:
+                            enc_chunks.append(w_enc)
+                            tgt_chunks.append(w_tgt)
+                    pending = next_pending
+                    pending_round_size = next_round_size
                 else:
-                    splits = _split_episodes(round_size, workers)
-                    state_dict = {
-                        k: v.detach().cpu()
-                        for k, v in net.state_dict().items()
-                    }
-                    worker_args = [
-                        (state_dict, hidden_sizes, input_size, output_mode,
-                         encoder_name,
-                         mode, n_eps, rng.randint(0, 2**31 - 1),
-                         oneply, oneply_acting, boltzmann_temp,
-                         bf16_collect, cube_targets_1ply)
-                        for n_eps in splits
-                    ]
+                    # Non-pipelined parallel: submit and wait synchronously.
                     for w_enc, w_tgt in pool.map(
-                        _collect_worker, worker_args,
+                        _collect_worker, _build_worker_args(round_size),
                     ):
                         if len(w_enc) > 0:
                             enc_chunks.append(w_enc)
@@ -780,9 +840,6 @@ class Trainer:
         very next forward pass (checker selection after a take, or
         the next turn's cube decision) uses the updated weights.
         """
-        from modes import cube_perspective
-        from encoding import CubePerspective
-
         rng = random.Random(seed)
         lr = self.optimizer.param_groups[0]["lr"]
         losses: List[float] = []
@@ -791,12 +848,13 @@ class Trainer:
         for episode in range(1, num_episodes + 1):
             state, dice = opening_roll(rng)
             match_state = mode.initial_match_state()
+            is_opening = True  # no doubling on the opening roll
 
             while not mode.is_episode_over(state):
                 player = state.turn
 
                 # ── Cube decision phase (if eligible) ──────────
-                if match_state.can_offer(player):
+                if not is_opening and match_state.can_offer(player):
                     pre_persp = cube_perspective(
                         match_state.cube_owner, player,
                     )
@@ -868,6 +926,7 @@ class Trainer:
                     state = opp_view
 
                 dice = (rng.randint(1, 6), rng.randint(1, 6))
+                is_opening = False
 
             if log_every and episode % log_every == 0:
                 recent = losses[-100:] if losses else [0.0]

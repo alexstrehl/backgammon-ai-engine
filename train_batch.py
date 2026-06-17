@@ -38,8 +38,8 @@ torch.set_num_threads(1)
 
 from td_agent import TDAgent
 from train_cli import (
-    add_common_args, build_mode, build_network, eval_vs_random,
-    resolve_save_path,
+    add_common_args, apply_cubeful_money_upgrades, build_mode, build_network,
+    eval_vs_random, resolve_save_path,
 )
 from trainer import Trainer
 
@@ -104,6 +104,14 @@ def main():
                               "(evaluate_cubeful at is_cube_action=False) for "
                               "cube targets, which empirically gives much "
                               "better cube_mEMG. No effect without --oneply.")
+    g_batch.add_argument("--pipeline-collect", action="store_true",
+                         help="Overlap worker collection of round N+1 with the "
+                              "master training step of round N. Workers in round "
+                              "N+1 see weights from end of round N-1 (one-round "
+                              "stale targets). Negligible TD impact at typical "
+                              "1-ply LRs but should be validated when changing "
+                              "recipes. Reproducibility preserved. Requires "
+                              "--workers > 1; no-op otherwise.")
     g_batch.add_argument("--save-every", type=int, default=0, metavar="N",
                          help="Checkpoint at the first round boundary on "
                               "or after every N episodes (effective "
@@ -116,24 +124,7 @@ def main():
                         help="Print recent batch loss every N rounds (0 to disable).")
     args = parser.parse_args()
 
-    # Cubeful-money auto-upgrades: the encoder must include the cube
-    # one-hot and the output must be equity. Override silently if the
-    # user left the defaults; error if they set conflicting flags.
-    if args.game_mode == "cubeful-money" and not args.resume:
-        if args.encoder == "perspective196":
-            args.encoder = "cubeful_perspective196"
-        elif not args.encoder.startswith("cubeful_"):
-            raise ValueError(
-                f"cubeful-money requires a cubeful_* encoder; "
-                f"got --encoder {args.encoder!r}"
-            )
-        if args.output_mode == "probability":
-            args.output_mode = "equity"
-        elif args.output_mode != "equity":
-            raise ValueError(
-                f"cubeful-money requires --output-mode equity; "
-                f"got {args.output_mode!r}"
-            )
+    apply_cubeful_money_upgrades(args)
 
     if args.torch_seed is not None:
         torch.manual_seed(args.torch_seed)
@@ -206,6 +197,7 @@ def main():
         save_path=resolved_save,
         save_every=args.save_every,
         cube_targets_1ply=args.cube_targets_1ply,
+        pipeline_collect=args.pipeline_collect,
     )
     elapsed = time.perf_counter() - t0
     eps_per_s = args.num_episodes / elapsed if elapsed > 0 else 0.0
