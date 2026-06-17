@@ -218,11 +218,12 @@ def _collect_one_episode(
         features, next_states = gpe_fn(state, dice)
 
         if oneply:
-            tgts.append(_oneply_target_vec(
-                state, network, encode_fn, gpe_fn, device,
-            ))
-            # Move selection (0-ply): pick the move with best derived
-            # equity from mover's view.
+            # Move selection (0-ply): pick the move with best derived equity
+            # from the mover's view. This MUST run *before* `_oneply_target_vec`
+            # below: that call re-invokes `gpe_fn` 21 times, and the C fast path
+            # (`bg_fast.get_legal_plays_encoded`) reuses an internal successor
+            # buffer -- so `features` and the `next_states` objects are only
+            # valid until the next `gpe_fn` call.
             if len(next_states):
                 with torch.no_grad():
                     x = torch.from_numpy(features).to(device)
@@ -238,9 +239,19 @@ def _collect_one_episode(
                 for j, ns in enumerate(next_states):
                     if ns.is_game_over():
                         opp_eq[j] = -float(ns.game_result())
-                state = next_states[int(np.argmin(opp_eq))]
+                chosen = next_states[int(np.argmin(opp_eq))]
+                # Independent copy: `_oneply_target_vec` overwrites the pooled
+                # successor objects on its next `gpe_fn` call.
+                next_state = BoardState(
+                    points=list(chosen.points), bar=list(chosen.bar),
+                    off=list(chosen.off), turn=chosen.turn,
+                )
             else:
-                state = switch_turn(state)
+                next_state = switch_turn(state)
+            tgts.append(_oneply_target_vec(
+                state, network, encode_fn, gpe_fn, device,
+            ))
+            state = next_state
         else:
             if len(next_states):
                 with torch.no_grad():

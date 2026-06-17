@@ -195,7 +195,7 @@ class ProbAgent(Agent):
         # records (prob, start, end, features, next_states) into the buffer; the
         # per-chunk min/terminal-correction is done in numpy afterwards.
         feat_chunks: List[np.ndarray] = []
-        chunk_meta: List[tuple] = []   # (prob, start, end, features, next_states)
+        chunk_meta: List[tuple] = []   # (prob, start, end, term_overrides)
         pass_prob = 0.0
         offset = 0
         for d1, d2 in _DICE_OUTCOMES:
@@ -209,7 +209,18 @@ class ProbAgent(Agent):
                 continue
             n = len(next_states)
             feat_chunks.append(features)
-            chunk_meta.append((prob, offset, offset + n, features, next_states))
+            # Terminal correction (a successor that ends the game gets its exact
+            # result) reads `next_states`, but the C fast path reuses its
+            # successor objects on the *next* `get_legal_plays_encoded` call --
+            # so capture terminal magnitudes NOW, while `next_states` is valid.
+            # (`features` arrays each get their own buffer and stay valid.)
+            term = {
+                int(j): -self._terminal_mag(next_states[int(j)])
+                for j in np.flatnonzero(
+                    features[:, OPP_OFF_INDEX] >= TERMINAL_OFF_THRESHOLD
+                )
+            }
+            chunk_meta.append((prob, offset, offset + n, term))
             offset += n
 
         # Forced-pass dice (deduped): opponent's 0-ply view at switch_turn(state);
@@ -226,15 +237,13 @@ class ProbAgent(Agent):
             if not self._device_is_cpu:
                 t = t.to(self.device, dtype=torch.float32)
             opp_views_all = self._score(self._probs(t)).detach().cpu().numpy()
-            for prob, s, e, features, next_states in chunk_meta:
+            for prob, s, e, term in chunk_meta:
                 opp_views = opp_views_all[s:e]
-                # Terminal correction via the encoding (OPP_OFF feature ~1 means
-                # the mover just bore off all 15 → opp, on roll here, lost),
-                # avoiding materialising every successor. Opp view = -result.
-                for j in np.flatnonzero(
-                    features[:, OPP_OFF_INDEX] >= TERMINAL_OFF_THRESHOLD
-                ):
-                    opp_views[j] = -self._terminal_mag(next_states[int(j)])
+                # Apply the terminal corrections captured during the loop
+                # (OPP_OFF feature ~1 means the mover just bore off all 15 →
+                # opp, on roll here, lost; opp view = -result).
+                for j, tv in term.items():
+                    opp_views[j] = tv
                 # Current player picks the move minimising opp view.
                 oneply_sum += prob * (-float(np.min(opp_views)))
         return oneply_sum
