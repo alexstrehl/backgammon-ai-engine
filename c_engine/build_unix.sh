@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build the C backgammon engine as a shared library.
 set -e
+cd "$(dirname "$0")"   # allow invocation from any directory
 
 echo "Building libbg_engine.so ..."
 gcc -O2 -shared -fPIC -o libbg_engine.so bg_engine.c -Wall

@@ -1,4 +1,10 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _ROOT)
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "slow: long-running test (deselect with -m 'not slow')")

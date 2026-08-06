@@ -108,14 +108,6 @@ class BoardState:
 
     # ── Queries ──────────────────────────────────────────────────────────
 
-    def checker_count(self, player: int, idx: int) -> int:
-        """Number of *player*'s checkers on point index *idx* (0-based)."""
-        v = self.points[idx]
-        if player == WHITE:
-            return max(v, 0)
-        else:
-            return max(-v, 0)
-
     def is_game_over(self) -> bool:
         return self.off[WHITE] == NUM_CHECKERS or self.off[BLACK] == NUM_CHECKERS
 
@@ -145,15 +137,6 @@ class BoardState:
             return 3  # backgammon
         return 2  # gammon
 
-    # ── Mutation helpers (operate on copies) ─────────────────────────────
-
-    def _add(self, player: int, idx: int, count: int = 1):
-        """Place *count* of *player*'s checkers on index *idx*."""
-        self.points[idx] += count if player == WHITE else -count
-
-    def _remove(self, player: int, idx: int, count: int = 1):
-        self._add(player, idx, -count)
-
     # ── Display ──────────────────────────────────────────────────────────
 
     def __repr__(self) -> str:
@@ -162,60 +145,6 @@ class BoardState:
             f"bar={self.bar}, off={self.off})"
         )
 
-    def show(self) -> str:
-        """ASCII art board for debugging."""
-        lines = []
-        lines.append("+13-14-15-16-17-18--+---+--19-20-21-22-23-24--+")
-
-        # Top half (points 13-24 going left to right)
-        for row in range(6):
-            parts_left = []
-            for i in range(12, 18):   # points 13-18
-                parts_left.append(self._cell(i, row))
-            parts_right = []
-            for i in range(18, 24):   # points 19-24
-                parts_right.append(self._cell(i, row))
-            bar_ch = self._bar_cell(row, top=True)
-            lines.append(
-                f"|{'  '.join(parts_left)}  |{bar_ch}|  {'  '.join(parts_right)}  |"
-            )
-
-        lines.append("|                   |   |                      |")
-
-        # Bottom half (points 12-1 going left to right)
-        for row in range(5, -1, -1):
-            parts_left = []
-            for i in range(11, 5, -1):   # points 12-7
-                parts_left.append(self._cell(i, row))
-            parts_right = []
-            for i in range(5, -1, -1):   # points 6-1
-                parts_right.append(self._cell(i, row))
-            bar_ch = self._bar_cell(row, top=False)
-            lines.append(
-                f"|{'  '.join(parts_left)}  |{bar_ch}|  {'  '.join(parts_right)}  |"
-            )
-
-        lines.append("+12-11-10--9--8--7--+---+---6--5--4--3--2--1--+")
-
-        lines.append(
-            f"  White bar: {self.bar[WHITE]}   Black bar: {self.bar[BLACK]}   "
-            f"White off: {self.off[WHITE]}   Black off: {self.off[BLACK]}   "
-            f"Turn: {'WHITE' if self.turn == WHITE else 'BLACK'}"
-        )
-        return "\n".join(lines)
-
-    def _cell(self, idx: int, row: int) -> str:
-        v = self.points[idx]
-        count = abs(v)
-        if row < count:
-            return "W" if v > 0 else "B"
-        return "."
-
-    def _bar_cell(self, row: int, top: bool) -> str:
-        if top:
-            return "B" if row < self.bar[BLACK] else " "
-        else:
-            return "W" if row < self.bar[WHITE] else " "
 
 
 # ── Move generation ──────────────────────────────────────────────────────────

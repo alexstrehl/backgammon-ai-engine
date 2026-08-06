@@ -27,16 +27,13 @@ extern "C" {
 #define NUM_POINTS     24
 #define NUM_CHECKERS   15
 #define NUM_FEATURES_196   196
-#define NUM_FEATURES_210   210
-#define NUM_FEATURES_224   224
-#define NUM_FEATURES_246   246
 #define NUM_FEATURES       196   /* default for backward compat */
 
 #define BAR_SENTINEL   (-1)
 #define OFF_SENTINEL   (-2)
 
 #define MAX_MOVES_PER_PLAY  4
-#define MAX_PLAYS         1024  /* generous upper bound */
+#define MAX_PLAYS         4096  /* generous upper bound: max distinct legal plays observed ~1200 (blot-heavy doublet boards); 4096 gives >3x headroom. Keep in sync with bg_fast.py MAX_PLAYS. */
 
 /* ── Board state ───────────────────────────────────────────────── */
 
@@ -99,37 +96,6 @@ int get_legal_plays(const BoardState *state, int d1, int d2,
  */
 void encode_state(const BoardState *state, float *features);
 
-/*
- * Encode a board state into a 210-element float vector:
- * 196 base features + 14 gnubg Group-1 expert features.
- */
-void encode_state_210(const BoardState *state, float *features);
-
-/*
- * Combined: get all legal plays AND encode with 210-feature encoding.
- */
-int get_legal_plays_encoded_210(const BoardState *state, int d1, int d2,
-                                Play *plays, int max_plays,
-                                float *encoded_features);
-
-/*
- * Encode a board state into a 224-element float vector:
- * 196 base + 14 Group-1 + 14 Group-2 features.
- */
-void encode_state_224(const BoardState *state, float *features);
-
-/*
- * Combined: get all legal plays AND encode with 224-feature encoding.
- */
-int get_legal_plays_encoded_224(const BoardState *state, int d1, int d2,
-                                Play *plays, int max_plays,
-                                float *encoded_features);
-
-void encode_state_246(const BoardState *state, float *features);
-
-int get_legal_plays_encoded_246(const BoardState *state, int d1, int d2,
-                                Play *plays, int max_plays,
-                                float *encoded_features);
 
 /*
  * Flip the turn (WHITE <-> BLACK) in place.

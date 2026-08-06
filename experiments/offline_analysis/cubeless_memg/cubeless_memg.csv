@@ -1,0 +1,8 @@
+player,config,chequer_mEMG,ci_lo,ci_hi,n_games
+prob5-0ply,prod prob5,1.343,1.312,1.375,4000
+prob5-1ply,full-width 1-ply,0.694,0.675,0.713,4000
+gnubg-ext-0ply,gnubg 1.08 ext,2.932,2.875,2.989,4000
+gnubg-ext-1ply,gnubg 1.08 ext full/unpruned,1.648,1.611,1.686,4000
+sage-0ply,native production filter,3.043,2.981,3.106,4000
+sage-1ply,SAGE_UNPRUNED (paper row),1.669,1.613,1.731,4000
+sage-1ply,production filter (robustness),1.768,1.697,1.850,4000

@@ -23,7 +23,7 @@ Examples:
 # Pin BLAS / PyTorch to a single thread BEFORE importing torch. Online
 # TD(0) is dominated by tiny single-sample forward passes; with 64
 # BLAS threads contending on every step the wall clock balloons by
-# ~10x for no benefit. Matches the legacy td_train.py convention.
+# ~10x for no benefit.
 import os
 if "OMP_NUM_THREADS" not in os.environ:
     os.environ["OMP_NUM_THREADS"] = "1"

@@ -1,0 +1,8 @@
+player,config,chequer_mEMG,chequer_lo,chequer_hi,cube_mEMG,cube_lo,cube_hi,overall_mEMG,overall_lo,overall_hi,n_games
+ours-0ply,4L cubeful R11a,1.968,1.903,2.036,1.873,1.655,2.128,1.936,1.871,2.007,4000
+ours-1ply,4L cubeful R11a,0.987,0.952,1.022,1.411,0.978,2.062,1.027,0.971,1.093,4000
+gnubg-ext-0ply,gnubg 1.08 ext,4.011,3.913,4.109,3.819,3.129,4.675,3.898,3.779,4.027,4000
+gnubg-ext-1ply,gnubg 1.08 ext full/unpruned,2.022,1.970,2.075,2.145,1.781,2.739,1.997,1.936,2.067,4000
+sage-analyzer-1ply,SAGE_UNPRUNED (paper row),1.974,1.903,2.050,5.758,5.458,6.075,2.258,2.189,2.330,4000
+sage-analyzer-0ply,analyzer pooled raw shards,3.795,3.699,3.894,7.048,6.695,7.412,4.020,3.926,4.114,6664
+sage-analyzer-1ply,production filter (robustness),1.938,1.862,2.025,5.630,5.336,5.946,2.238,2.167,2.317,4000

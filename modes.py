@@ -17,7 +17,6 @@ New modes can extend TerminalOutcome.
   | DMP           | equity      | 1.0                    | ✓ equiv    |
   | CubelessMoney | equity      | 1 / 2 / 3              | ✓ exact    |
   | CubefulMoney  | equity      | game_result × cube_val | ✓ exact    |
-  | Matchplay     | -           | -                      | future     |
 
 Terminal call convention: at terminal `state.turn` is the LOSER
 because the engine already switched after the winning move; the
@@ -59,29 +58,13 @@ def cube_perspective(cube_owner: CubeOwner, on_roll_player: int) -> CubePerspect
 
 @dataclass(frozen=True)
 class MatchState:
-    """State outside the BoardState: cube + optional match score.
-
-    Money modes use match_length=0 (score fields ignored).
-    Matchplay modes set match_length > 0 and track away-scores.
-    """
+    """Cube state outside the BoardState (money play)."""
     cube_owner: CubeOwner = CubeOwner.CENTERED
     cube_value: int = 1
     jacoby: bool = True
-    # Matchplay fields (ignored when match_length=0):
-    match_length: int = 0
-    my_away: int = 0
-    opp_away: int = 0
-    is_crawford: bool = False
-
-    @property
-    def is_matchplay(self) -> bool:
-        return self.match_length > 0
 
     def can_offer(self, on_roll_player: int) -> bool:
-        """Can the on-roll player offer a double?
-        Crawford game: no doubling allowed."""
-        if self.is_crawford:
-            return False
+        """Can the on-roll player offer a double?"""
         persp = cube_perspective(self.cube_owner, on_roll_player)
         return persp in (CubePerspective.CENTERED, CubePerspective.MINE)
 
@@ -94,46 +77,6 @@ class MatchState:
             cube_owner=CubeOwner(opponent + 1),
             cube_value=self.cube_value * 2,
         )
-
-    def start_game(self) -> "MatchState":
-        """Reset cube for a new game within a match. Sets Crawford
-        flag when one side is exactly 1-away."""
-        crawford = (
-            not self.is_crawford  # Crawford only happens once
-            and (self.my_away == 1 or self.opp_away == 1)
-        )
-        return replace(
-            self,
-            cube_owner=CubeOwner.CENTERED,
-            cube_value=1,
-            is_crawford=crawford,
-        )
-
-    def after_game(self, game_result: int, winner_is_me: bool) -> "MatchState":
-        """Update match score after a game. game_result is 1/2/3;
-        points = cube_value × game_result. Returns new MatchState
-        with updated away-scores."""
-        points = self.cube_value * game_result
-        if winner_is_me:
-            new_my = max(0, self.my_away - points)
-            new_opp = self.opp_away
-        else:
-            new_my = self.my_away
-            new_opp = max(0, self.opp_away - points)
-        return replace(
-            self,
-            my_away=new_my,
-            opp_away=new_opp,
-            cube_owner=CubeOwner.CENTERED,
-            cube_value=1,
-            is_crawford=False,
-        )
-
-    def match_over(self) -> bool:
-        return self.is_matchplay and (self.my_away <= 0 or self.opp_away <= 0)
-
-    def i_won_match(self) -> bool:
-        return self.my_away <= 0
 
 
 # ── GameMode ─────────────────────────────────────────────────────────

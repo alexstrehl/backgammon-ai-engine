@@ -199,10 +199,10 @@ def _warm_start_equity(path: str, reinit_output: bool = True) -> TDNetwork:
 
 
 def _warm_start_cubeful(path: str) -> TDNetwork:
-    """Load a 196-input model and extend to cubeful (199-input).
+    """Load a 196-input model and extend to cubeful (200-input).
 
     Copies the first 196 columns of the input layer from the pretrained
-    model. The 3 new columns (cube features) get Kaiming initialization.
+    model. The 4 new columns (cube features) get Kaiming initialization.
     Output mode is set to equity.
     """
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
@@ -211,7 +211,7 @@ def _warm_start_cubeful(path: str) -> TDNetwork:
     old_activation = checkpoint.get("activation", "relu")
 
     encoder = CubefulEncoder()
-    new_input = encoder.num_features  # 199
+    new_input = encoder.num_features  # 200 (196 + CUBE_FEATURES)
 
     net = TDNetwork(
         hidden_sizes=old_hidden,
@@ -317,7 +317,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     g_io.add_argument("--warm-start-cubeful", default=None, metavar="PATH",
                       help="Initialize a cubeful money model from any "
                            "196-input model (DMP or cubeless money). Extends "
-                           "input 196->199 (adds cube features), sets output "
+                           "input 196->200 (adds cube features), sets output "
                            "to equity.")
     g_io.add_argument("--save", default=None,
                       help="Path to save the trained network at the end of the run.")

@@ -13,7 +13,7 @@ Supports:
 
 import torch
 import torch.nn as nn
-from typing import List, Literal
+from typing import List
 from encoding import NUM_FEATURES
 
 
@@ -224,10 +224,12 @@ class TDNetwork(nn.Module):
             new_layer_size = source.hidden_sizes[-1]
 
         last_size = source.hidden_sizes[-1]
-        if new_layer_size > last_size:
+        if new_layer_size != last_size:
             raise ValueError(
-                f"new_layer_size ({new_layer_size}) must be <= the source's last "
-                f"hidden size ({last_size}) for near-identity initialization."
+                f"new_layer_size ({new_layer_size}) must EQUAL the source's last "
+                f"hidden size ({last_size}): the appended layer is a near-identity "
+                f"map, which only preserves the function when square. A smaller "
+                f"layer drops hidden components; a larger one is unsupported."
             )
 
         new_hidden_sizes = source.hidden_sizes + [new_layer_size]
@@ -443,11 +445,13 @@ class ProbNetwork(nn.Module):
                 src_w = src_sd[wkey]
                 src_b = src_sd[bkey]
                 old_out, old_in = src_w.shape
-                # New-column contributions from expanded prior layer: 0
-                # (preserves function exactly at init).
-                dst_w.zero_()
+                # Copy the old block; leave the NEW units' input rows at their
+                # fresh Kaiming init (nonzero -> they get gradient and can
+                # learn). Zero ONLY the old units' new input columns so
+                # newly-added prior-layer units don't perturb the preserved
+                # function at init. (Mirrors TDNetwork.width_expand.)
                 dst_w[:old_out, :old_in] = src_w
-                dst_b.zero_()
+                dst_w[:old_out, old_in:] = 0.0
                 dst_b[:old_out] = src_b
             # Output head: copy existing rows, zero new columns.
             dst_hw = expanded.get_parameter("head.weight")
@@ -471,10 +475,12 @@ class ProbNetwork(nn.Module):
         last_size = source.hidden_sizes[-1]
         if new_layer_size is None:
             new_layer_size = last_size
-        if new_layer_size > last_size:
+        if new_layer_size != last_size:
             raise ValueError(
-                f"new_layer_size ({new_layer_size}) must be <= last "
-                f"hidden size ({last_size}) for near-identity init."
+                f"new_layer_size ({new_layer_size}) must EQUAL last hidden size "
+                f"({last_size}): the appended layer is a near-identity map, which "
+                f"only preserves the function when square. A smaller layer drops "
+                f"hidden components; a larger one is unsupported."
             )
 
         new_hidden = source.hidden_sizes + [new_layer_size]

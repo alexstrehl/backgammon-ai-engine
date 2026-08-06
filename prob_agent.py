@@ -15,7 +15,7 @@ import torch
 
 from agents import Agent
 from backgammon_engine import (
-    BoardState, Play, switch_turn,
+    BoardState, Play, switch_turn, get_legal_plays,
     get_legal_plays_encoded as _py_get_legal_plays_encoded,
 )
 from encoding import get_encoder, OPP_OFF_INDEX, TERMINAL_OFF_THRESHOLD
@@ -66,7 +66,6 @@ class ProbAgent(Agent):
         bf16_inference: bool = False,
         plies: int = 0,
         prune_threshold: float = 0.16,
-        dmp: bool = False,
         use_fast_engine: bool = True,
     ):
         if not isinstance(network, ProbNetwork):
@@ -87,9 +86,6 @@ class ProbAgent(Agent):
         self.is_cubeful = False
         self.plies = plies
         self.prune_threshold = float(prune_threshold)
-        # DMP scoring: state value is 2*P(win)-1 (in [-1,+1]); terminal
-        # stakes collapse to ±1 (gammons/backgammons don't matter).
-        self.dmp = bool(dmp)
         # Optional bf16 inference (~1.5-2x faster matmuls, ~3-digit precision).
         self.bf16_inference = bool(bf16_inference)
         if self.bf16_inference:
@@ -148,18 +144,13 @@ class ProbAgent(Agent):
         return prob5_postprocess(p)
 
     def _score(self, probs: torch.Tensor) -> torch.Tensor:
-        """State value from on-roll player's perspective.
-
-        DMP: ``2*P(win) - 1`` (gammons/backgammons ignored).
-        Otherwise: cubeless money equity ``2*P(w) + P(wg) + P(wbg) - P(lg) - P(lbg) - 1``.
-        """
-        if self.dmp:
-            return 2.0 * probs[..., 0] - 1.0
+        """State value from on-roll player's perspective: cubeless money
+        equity ``2*P(w) + P(wg) + P(wbg) - P(lg) - P(lbg) - 1``."""
         return prob5_to_equity(probs)
 
     def _terminal_mag(self, state: BoardState) -> float:
-        """Magnitude of terminal-state result. ±1 in DMP, 1/2/3 otherwise."""
-        return 1.0 if self.dmp else float(state.game_result())
+        """Magnitude of terminal-state result (1/2/3)."""
+        return float(state.game_result())
 
     def evaluate(self, state: BoardState) -> float:
         t = self._encode_batch([state])
@@ -284,6 +275,40 @@ class ProbAgent(Agent):
                 opp_values[j] = -self._terminal_mag(ns)
         idx = int(np.argmin(opp_values))
         return actions[idx]
+
+    def choose_next_state(self, state: BoardState, dice: Tuple[int, int]):
+        """Record-free chooser: return the successor BoardState of the
+        selected move, or None when there is no legal play (caller applies
+        ``switch_turn``).
+
+        At 0-ply with the C fast path this is FUSED — move generation +
+        perspective196 encoding in ONE C call, one batched forward — skipping
+        the actions-list path's per-candidate Python materialisation and
+        re-encoding (~2x per decision). Selection is identical: same C
+        candidate order, same terminal correction, same argmin. Other
+        configs fall back to the standard ``choose_checker_action`` path.
+        """
+        if self.plies != 0 or not self._fast_engine:
+            plays = get_legal_plays(state, dice)
+            if not plays:
+                return None
+            return self.choose_checker_action(state, dice, plays)[1]
+        features, next_states = self._get_legal_plays_encoded(state, dice)
+        if len(next_states) == 0:
+            return None
+        opp_values = (
+            self._score(self._probs(torch.from_numpy(features)))
+            .detach().cpu().numpy()
+        )
+        # Terminal correction, mask read from the encoding (same convention
+        # as value_oneply_checker); next_states view is still valid here —
+        # no _bg_fast call happens between the fused call and this point.
+        for j in np.flatnonzero(
+            features[:, OPP_OFF_INDEX] >= TERMINAL_OFF_THRESHOLD
+        ):
+            opp_values[int(j)] = -self._terminal_mag(next_states[int(j)])
+        idx = int(np.argmin(opp_values))
+        return next_states[idx]  # __getitem__ materialises off the C buffer
 
     def _choose_1ply(
         self, actions: List[Tuple[Play, BoardState]],

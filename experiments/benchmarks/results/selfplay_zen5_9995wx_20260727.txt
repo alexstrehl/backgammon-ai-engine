@@ -1,0 +1,26 @@
+# Zen 5 (TR PRO 9995WX), idle, one pinned core, N=300 games/engine, 2026-07-27
+# GNUBG rows: dance turns excluded from checker-decision counts, session-start
+#   auto-played game excluded, game-level bootstrap 95% CIs.
+# NATIVE (PureTD/Sage) fast rows: game-level bootstrap 95% CIs (2026-07-31,
+#   core 16). Deep-search rows (PURETD 1-ply, SAGE-AN unpruned, CUBELESS
+#   prob5-1ply) are single-run point estimates - CI not computed.
+# cubeful money self-play
+# cube-off rows = cubeless checker cost for gnubg/PureTD
+GNUBG 0-ply cube-off: 300 games 0.46s (649.0 g/s) | checker 13611 (29445.2 dec/s) | cube-opps 14849 responses 0 | combined 29445.2 dec/s 95%CI [28689.3,30223.3]
+GNUBG 0-ply cube-on: 300 games 0.33s (906.1 g/s) | checker 10339 (31226.2 dec/s) | cube-opps 7334 responses 393 | combined 54563.5 dec/s 95%CI [53076.5,56116.2]
+GNUBG 1-ply cube-off: 300 games 12.34s (24.3 g/s) | checker 13942 (1129.9 dec/s) | cube-opps 15282 responses 0 | combined 1129.9 dec/s 95%CI [1089.4,1172.2]
+GNUBG 1-ply cube-on: 300 games 9.90s (30.3 g/s) | checker 10683 (1079.1 dec/s) | cube-opps 7588 responses 395 | combined 1885.4 dec/s 95%CI [1811.7,1964.6]
+PURETD 0-ply cube-off: 300 games 2.98s (100.6 g/s) | checker 17236 (5779.5 dec/s) | cube-offers 16936 responses 0 | combined 5779.5 dec/s 95%CI [5539.1,5979.6]
+PURETD 0-ply cube-on : 300 games 2.28s (131.8 g/s) | checker 11542 (5070.1 dec/s) | cube-offers 7961 responses 386 | combined 8736.7 dec/s 95%CI [8587.5,8887.2]
+PURETD 1-ply cube-off: 300 games 1277.36s (0.2 g/s) | checker 16303 (12.8 dec/s) | cube-offers 16003 responses 0 | combined 12.8 dec/s
+PURETD 1-ply cube-on : 300 games 1039.59s (0.3 g/s) | checker 10490 (10.1 dec/s) | cube-offers 7408 responses 369 | combined 17.6 dec/s
+SAGE-AN 1P production cube-on: 300 games 98.79s (3.04 g/s) | checker 12047 (122.0 dec/s) | cube-offers 7842 responses 409 | combined 205.5 dec/s 95%CI [203.2,207.7]
+SAGE-AN 2P production cube-on: 300 games 393.36s (0.76 g/s) | checker 12713 (32.3 dec/s) | cube-offers 8131 responses 423 | combined 54.1 dec/s 95%CI [52.4,55.8]
+SAGE-AN 2P unpruned cube-on: 300 games 505.97s (0.59 g/s) | checker 12713 (25.1 dec/s) | cube-offers 8131 responses 423 | combined 42.0 dec/s
+# cubeless money self-play
+CUBELESS prob5-0ply prod: 300 games 2.97s (100.85 g/s) | checker 14752 (4959.2 dec/s, 0.202 ms/dec) 95%CI [4864.0,5055.8]  # fused chooser (choose_next_state)
+CUBELESS sage-0ply production: 300 games 2.75s (108.95 g/s) | checker 15036 (5460.4 dec/s, 0.183 ms/dec) 95%CI [5159.2,5756.7]
+CUBELESS sage-1ply production: 300 games 15.24s (19.69 g/s) | checker 14890 (977.3 dec/s, 1.023 ms/dec) 95%CI [942.5,1013.5]
+CUBELESS sage-1ply unpruned: 300 games 128.46s (2.34 g/s) | checker 14967 (116.5 dec/s, 8.583 ms/dec) 95%CI [112.0,121.4]
+CUBELESS prob5-1ply prod: 300 games 468.87s (0.64 g/s) | checker 15142 (32.3 dec/s, 30.965 ms/dec)
+SAGE-NATIVE-0PLY: 300 games 0.68s (440.5 g/s)

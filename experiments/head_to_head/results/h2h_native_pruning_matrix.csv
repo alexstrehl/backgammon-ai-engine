@@ -1,0 +1,18 @@
+# PureTD (R11a prod, cubeful md5 77a3205c / cubeless prob5 prod) 0-ply vs each
+# baseline at 1-ply, with the baseline's move filter ON (pruned) and OFF
+# (unpruned). This matrix isolates the effect of the opponent's move filter.
+# Values are PureTD's margin (mEq/game, positive = PureTD ahead); cubeful
+# headline = capped mean (+-128), cubeless = mean equity (no cube).
+#
+# gnubg rows use the true gnubg 1.08 binary (external-player socket,
+# gnubg-ext); Open Sage rows use its analyzer/native selection. gnubg is
+# slightly better WITH its default filter; Open Sage is stronger UNPRUNED.
+mode,opponent,opp_ply,filter,games,side1_mEq_per_game,eq_ci_low_mEq,eq_ci_high_mEq,metric
+cubeless-money,gnubg,1,pruned,10000000,10.8,10.0,11.7,mean
+cubeless-money,gnubg,1,unpruned,10000000,11.9,11.0,12.7,mean
+cubeless-money,OpenSage,1,pruned,10000000,9.0,8.2,9.9,mean
+cubeless-money,OpenSage,1,unpruned,10000000,8.2,7.4,9.1,mean
+cubeful-money,gnubg,1,pruned,12500000,22.7,21.1,24.4,capped128
+cubeful-money,gnubg,1,unpruned,10000000,22.4,20.5,24.2,capped128
+cubeful-money,OpenSage,1,pruned,10000000,21.7,19.7,23.7,capped128
+cubeful-money,OpenSage,1,unpruned,10000000,19.0,17.0,21.0,capped128

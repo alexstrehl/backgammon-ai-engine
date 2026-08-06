@@ -18,7 +18,7 @@ echo "  -> test_nn built"
 
 echo "Done. Usage:"
 echo "  # Export a model first:"
-echo "  python ../export_weights.py ../best_models/td_batch_relu_512_512_256_128_1ply_vi_final.pt model.bin"
+echo "  python ../export_weights.py ../best_models/dmp_512_512_256_256.pt model.bin"
 echo ""
 echo "  # Play two models:"
 echo "  ./play_models model1.bin model2.bin 1000"

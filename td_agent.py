@@ -18,6 +18,7 @@ encoding inside `choose_checker_action`. Falls back to
 unsupported.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -45,6 +46,9 @@ _DICE_OUTCOMES = [(d1, d2) for d1 in range(1, 7) for d2 in range(d1, 7)]
 
 # Per-dice probabilities (doubles 1/36, non-doubles 2/36); aligned with
 # _DICE_OUTCOMES order. Used by the expand_21 fast path's vectorized reduction.
+# Opt-in structural asserts in the hot cubeful 1-ply selector (debug).
+_STRUCT_CHECKS = os.environ.get("TD_STRUCT_CHECKS") == "1"
+
 _ONEPLY_PROBS = np.array(
     [(1.0 / 36.0) if d1 == d2 else (2.0 / 36.0) for d1, d2 in _DICE_OUTCOMES],
     dtype=np.float64,
@@ -499,6 +503,12 @@ class TDAgent(Agent):
 
         Probability mode: terminal successors get value 0 (opp loses
         with certainty).
+
+        Deliberately NOT merged with _value_oneply_checker_batched: that
+        variant adds a transposition-table memo (assumes a FROZEN network
+        — stale during training, where weights change every round) and
+        optional bf16; this plain path is the training-target-safe one
+        (trainer.collect_episode).
         """
         assert not state.is_game_over(), \
             "value_oneply_checker called on a terminal state"
@@ -1558,24 +1568,27 @@ class TDAgent(Agent):
         assert abs(sum(probs) - 1.0) < 1e-9, \
             "dice probabilities must sum to 1"
 
-        # Structural check: every non-terminal candidate must have a
-        # full 21-bucket dice dict in scenario A (and B if opp_can_offer),
-        # with at least one resolution per bucket.
-        for _m in range(len(plays)):
-            if cand_terminal[_m] is None:
-                assert cand_dice_A[_m] is not None \
-                    and len(cand_dice_A[_m]) == 21, \
-                    f"cand {_m}: scenario A missing dice buckets"
-                for _r in cand_dice_A[_m].values():
-                    assert len(_r) >= 1, \
-                        f"cand {_m}: empty resolution list in scenario A"
-                if opp_can_offer:
-                    assert cand_dice_B[_m] is not None \
-                        and len(cand_dice_B[_m]) == 21, \
-                        f"cand {_m}: scenario B missing dice buckets"
-                    for _r in cand_dice_B[_m].values():
+        # Structural check (debug scaffolding, ~O(plays x 21) per decision):
+        # every non-terminal candidate must have a full 21-bucket dice dict
+        # in scenario A (and B if opp_can_offer), with at least one
+        # resolution per bucket. Gated off the hot path; enable with
+        # TD_STRUCT_CHECKS=1.
+        if _STRUCT_CHECKS:
+            for _m in range(len(plays)):
+                if cand_terminal[_m] is None:
+                    assert cand_dice_A[_m] is not None \
+                        and len(cand_dice_A[_m]) == 21, \
+                        f"cand {_m}: scenario A missing dice buckets"
+                    for _r in cand_dice_A[_m].values():
                         assert len(_r) >= 1, \
-                            f"cand {_m}: empty resolution list in scenario B"
+                            f"cand {_m}: empty resolution list in scenario A"
+                    if opp_can_offer:
+                        assert cand_dice_B[_m] is not None \
+                            and len(cand_dice_B[_m]) == 21, \
+                            f"cand {_m}: scenario B missing dice buckets"
+                        for _r in cand_dice_B[_m].values():
+                            assert len(_r) >= 1, \
+                                f"cand {_m}: empty resolution list in scenario B"
 
         best_idx = 0
         best_val = float("-inf")
@@ -1713,7 +1726,7 @@ class TDAgent(Agent):
                         next_states_view[int(i)] for i in non_term_idx
                     ]
                 if len(non_term_idx) > 0:
-                    # Build the (n_nonterm, 199) chunk: base feats +
+                    # Build the (n_nonterm, 200) chunk: base feats +
                     # cube one-hot column, vectorised.
                     chunk = np.zeros(
                         (len(non_term_idx), n_feat),
@@ -1918,15 +1931,9 @@ class TDAgent(Agent):
                 # Opp is on roll at next_state. The 2-ply value function
                 # returns opp's per-unit equity (now including opp's
                 # cube decision in the level-2 expansion).
-                import os as _os
-                if _os.environ.get("TWOPLY_IMMEDIATE_CUBE", "0") == "1":
-                    opp_value = self.value_twoply_with_immediate_cube(
-                        next_state, match_state, k=k,
-                    )
-                else:
-                    opp_value = self.value_twoply_checker_cubeful_filtered(
-                        next_state, match_state, k=k,
-                    )
+                opp_value = self.value_twoply_checker_cubeful_filtered(
+                    next_state, match_state, k=k,
+                )
                 mover_eq = -opp_value
 
             if mover_eq > best_value:
@@ -1935,36 +1942,6 @@ class TDAgent(Agent):
 
         chosen = plays[best_idx][1]
         return chosen, best_value
-
-    def value_twoply_with_immediate_cube(
-        self, state: BoardState, match_state, k: int = 3,
-    ) -> float:
-        """value_twoply_checker_cubeful_filtered + on-roll player's own
-        immediate cube decision at this state.
-
-        The base function enumerates the OPPONENT's cube decision at
-        level-2 (after on-roll player's move). It does NOT enumerate
-        the on-roll player's cube decision RIGHT NOW (before rolling).
-        This wrapper adds that level-1 enumeration via the standard
-        max(no_double, min(2·v_after_take, 1)) analytical formula.
-
-        Cost: two calls to the base function (vs one). Roughly 2x slower
-        when the on-roll player is cube-eligible; same cost when not.
-        """
-        v_no_double = self.value_twoply_checker_cubeful_filtered(
-            state, match_state, k=k,
-        )
-        if not match_state.can_offer(state.turn):
-            return v_no_double
-        # On-roll doubles → opp takes/passes. On take: cube=2, opp owns.
-        # Recompute 2-ply value at same state under new cube state.
-        after_take_ms = match_state.after_take(state.turn)
-        v_after_take = self.value_twoply_checker_cubeful_filtered(
-            state, after_take_ms, k=k,
-        )
-        # Opp picks min for on-roll: payoff after doubling = min(2·v, 1)
-        v_double_response = min(2.0 * v_after_take, 1.0)
-        return max(v_no_double, v_double_response)
 
     def value_twoply_checker_cubeful_filtered(
         self, state: BoardState, match_state, k: int = 3,

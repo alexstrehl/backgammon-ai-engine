@@ -1,0 +1,31 @@
+# Fixed-pool CUBELESS per-decision benchmark — consolidated results
+# gnubg rows: official 1.08.003 threads-disabled binary (fixedpool_bench_gnubg.py,
+#   findbestmove at a cubeless evalcontext, default pruning+filter).
+# PureTD/Sage rows: fixedpool_bench.py --mode cubeless (native per-call APIs).
+# Shared committed 8000-position pool (fixedpool_positions.json) for every row.
+# All rows single pinned core, idle box, WARM (see warmup note), one sweep
+#   2026-08-02, ratio-of-sums estimator. moves/s [block-bootstrap 95% CI].
+# 2-ply configs are not part of the suite (not used in the paper).
+#
+# engine          config                        Zen3_EPYC7713P(core8)      Zen5_TRPRO9995WX(core16)
+gnubg-0ply        official findbestmove default 18732 [18056,19487]        34082 [32967,35278]
+sage-1P(=0ply)    best_move_index production    10543 [10110,10998]        16566 [15933,17239]
+prob5-0ply        fused kernel                  2316 [2272,2362]           6196 [6070,6323]
+gnubg-1ply        official findbestmove default 745.5 [727.4,763.4]        1286.1 [1258.4,1316.0]
+sage-2P(=1ply)    best_move_index production    624.5 [608.5,640.4]        1060.0 [1034.1,1086.1]
+prob5-1ply        full-width play path          10.6 [10.3,11.0]           28.3 [27.4,29.4]
+#
+# ESTIMATOR: point estimate AND bootstrap statistic are the RATIO OF SUMS
+#   (total calls / total wall-time) over ~80 contiguous blocks; mean-of-block-
+#   rates is Jensen-biased upward by ~CV^2 of the block times (+40% measured
+#   on the heavy-tailed cubeful Sage analyzer row), hence ratio-of-sums
+#   everywhere.
+# WARMUP: every timed config is preceded by a fixed 3s (BENCH_WARMUP_S)
+#   core-clock ramp via a cache-NEUTRAL scalar spin loop plus ~20 real calls
+#   (weights/code only) — ramps the clock without pre-caching the pool (a
+#   full-pool warmup inflated tiny-eval configs 2-7x).
+# Run-to-run: tiny sub-0.1ms evals (gnubg 0-ply) drift ~8% between runs on
+#   boost clock; the CI is within-run only. Deeper rows reproduce within
+#   ~2-4%.
+# Raw sweep logs (2026-08-02, both hosts) are archived outside the repo;
+#   available from the authors on request.

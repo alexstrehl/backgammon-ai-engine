@@ -156,11 +156,12 @@ class TestPlayModelsDispatch:
             assert _load_agent(p, bf16=False).bf16_inference is False
 
     def test_prob5_uses_money_equity_not_dmp(self):
-        # prob5 is a cubeless-money model; the play dispatch must never
-        # switch it to DMP P(win) scoring.
+        # prob5 is a cubeless-money model; it has NO DMP switch at all
+        # (the dmp param was removed as unsupported) — selection is always
+        # by trained money equity, so the play dispatch cannot switch it.
         with tempfile.TemporaryDirectory() as d:
             p = self._save(ProbNetwork(input_size=196, hidden_sizes=[8]), d, "p.pt")
-            assert _load_agent(p).dmp is False
+            assert not hasattr(_load_agent(p), "dmp")
 
 
 class TestExpand:
@@ -169,6 +170,26 @@ class TestExpand:
         wide = ProbNetwork.width_expand(src, [32, 16])
         x = torch.randn(5, 196)
         assert torch.allclose(src(x), wide(x), atol=1e-5)
+
+    def test_width_expand_new_units_are_trainable(self):
+        # Regression: the new units' input rows must keep a nonzero init so
+        # they receive gradient. A previous version zeroed the whole first-
+        # layer block, leaving the added width permanently dead (zero
+        # activation -> zero gradient), so expansion was a silent no-op.
+        torch.manual_seed(0)
+        src = ProbNetwork(input_size=196, hidden_sizes=[8, 8])
+        wide = ProbNetwork.width_expand(src, [16, 16])
+        w0 = wide.trunk[0].weight
+        before = w0.detach().clone()
+        opt = torch.optim.Adam(wide.parameters(), lr=1e-2)
+        for _ in range(50):
+            xb = torch.randn(32, 196)
+            (wide(xb) ** 2).mean().backward()
+            opt.step()
+            opt.zero_grad()
+        # rows [8:16] are the newly added units of the first hidden layer
+        moved = (w0.detach()[8:16] - before[8:16]).abs().max().item()
+        assert moved > 1e-6, f"new units did not train (max|delta|={moved:.2e})"
 
     def test_depth_expand_identity_preserves_function(self):
         # eps=0 -> exact identity; post-ReLU non-negativity makes the

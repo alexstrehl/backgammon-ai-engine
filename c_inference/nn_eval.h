@@ -4,7 +4,7 @@
  * Sample code illustrating how the trained model can be run from pure C
  * for inclusion in other projects. No external dependencies beyond math.h.
  *
- * Loads models exported by export_weights.py (BGNN binary format).
+ * Loads models exported by tools/export_weights.py (BGNN binary format).
  * See play_models.c for a complete usage example.
  */
 
@@ -44,7 +44,7 @@ typedef struct {
 } NNModel;
 
 /*
- * Load model from binary file (.bin exported by export_weights.py).
+ * Load model from binary file (.bin exported by tools/export_weights.py).
  * Returns 0 on success, -1 on error.
  */
 int nn_load(NNModel *model, const char *path);

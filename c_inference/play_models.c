@@ -11,7 +11,7 @@
  *   bash build_play.sh
  *
  *   # Export a model
- *   python ../export_weights.py ../best_models/td_batch_relu_512_512_256_128_1ply_vi_final.pt model.bin
+ *   python ../export_weights.py ../best_models/dmp_512_512_256_256.pt model.bin
  *
  *   # Verify C matches Python
  *   ./test_nn model.bin

@@ -23,9 +23,8 @@ Examples:
 
 # Pin BLAS / PyTorch threads BEFORE importing torch. Even with batch
 # training, the network is small enough that thread contention can
-# dominate, and parallel-worker collection (when added) wants each
-# worker subprocess to be single-threaded. Matches the legacy
-# td_batch_train.py convention.
+# dominate, and parallel-worker collection wants each worker subprocess
+# to be single-threaded.
 import os
 if "OMP_NUM_THREADS" not in os.environ:
     os.environ["OMP_NUM_THREADS"] = "1"
@@ -41,7 +40,67 @@ from train_cli import (
     add_common_args, apply_cubeful_money_upgrades, build_mode, build_network,
     eval_vs_random, resolve_save_path,
 )
-from trainer import Trainer
+from trainer import DEFAULT_MAX_EPISODE_PLIES, Trainer
+
+
+def resolve_cuda_oneply_collector(args):
+    """Route `--oneply --device cuda` to the vectorized GPU collector.
+
+    Returns the list of notes to print (pure-ish: mutates only
+    args.vectorized_collect; no I/O), so the routing table is unit-
+    testable without a GPU or a parser.
+
+    Rules:
+      * explicit --vectorized-collect and --no-vectorized-collect
+        together is an error;
+      * AUTO-enable only for --oneply --device cuda, and only when the
+        user chose no other collector accelerator (--c-engine /
+        --bf16-collect are explicit CPU-collector choices and win);
+      * --oneply-acting keeps the CPU collector (the vectorized worker
+        hard-refuses it; auto-routing must not manufacture that error).
+        Callers must normalize "--oneply-acting implies --oneply" BEFORE
+        calling this;
+      * every published 1-ply recipe of record runs --device cpu, so
+        this default changes no historical command.
+    The CUDA/workers availability checks stay in Trainer.train (which
+    also runs the VRAM preflight and can fall back loudly).
+    """
+    notes = []
+    if args.vectorized_collect and args.no_vectorized_collect:
+        raise SystemExit(
+            "ERROR: --vectorized-collect and --no-vectorized-collect "
+            "are mutually exclusive")
+    if not (args.oneply and args.device == "cuda"):
+        return notes
+    if args.no_vectorized_collect:
+        notes.append(
+            "NOTE: --no-vectorized-collect: keeping the CPU collector; "
+            "the master training step runs on cuda.")
+        return notes
+    if args.vectorized_collect:
+        return notes
+    if args.c_engine or args.bf16_collect:
+        notes.append(
+            "NOTE: --oneply --device cuda would default to the "
+            "vectorized GPU collector, but an explicit CPU-collector "
+            "accelerator (--c-engine/--bf16-collect) was chosen and "
+            "wins. Drop it to use the GPU collector.")
+        return notes
+    if args.oneply_acting:
+        # The vectorized collector refuses --oneply-acting (hard error in
+        # Trainer.train); auto-routing would turn a valid command into
+        # that error, blaming a flag the user never passed.
+        notes.append(
+            "NOTE: --oneply-acting is not supported by the vectorized "
+            "GPU collector; keeping the CPU collector. The master "
+            "training step runs on cuda.")
+        return notes
+    args.vectorized_collect = True
+    notes.append(
+        "AUTO: --oneply --device cuda -> vectorized GPU collector "
+        "(pass --no-vectorized-collect for the CPU collector; the VRAM "
+        "preflight may still cap workers or fall back, and will say so).")
+    return notes
 
 
 def main():
@@ -64,7 +123,7 @@ def main():
 
     g_batch = parser.add_argument_group("batch / round")
     g_batch.add_argument("--batch-size", type=int, default=256)
-    g_batch.add_argument("--episodes-per-round", type=int, default=100,
+    g_batch.add_argument("--episodes-per-round", type=int, default=1000,
                          help="Episodes collected before each shuffle+train pass.")
     g_batch.add_argument("--epochs-per-round", type=int, default=1,
                          help="Passes over the round's pool per round.")
@@ -91,19 +150,18 @@ def main():
                          help="Ramp LR from lr*0.1 up to scheduled lr over the "
                               "first N rounds. Useful when starting from a "
                               "depth-expanded model.")
+    g_batch.add_argument("--c-engine", action="store_true",
+                         help="compute the 1-ply cubeful target's net-forward "
+                              "in C via libbg_nply (OpenBLAS sgemm) instead of "
+                              "PyTorch. Requires --oneply and "
+                              "c_engine/libbg_nply.so (build_nply.sh). Targets "
+                              "are numerically equivalent; only the forward "
+                              "moves to C. ~+17%% on top of --pipeline-collect.")
     g_batch.add_argument("--bf16-collect", action="store_true",
                          help="Run 1-ply target NN forward in bf16 inside "
                               "collection workers (~1.9x matmul speedup). "
                               "Master training step stays fp32. Introduces "
                               "~1e-3 numerical drift in 1-ply targets.")
-    g_batch.add_argument("--cube-targets-1ply", action="store_true",
-                         help="EXPERIMENTAL: in --oneply training mode, use "
-                              "value_oneply_checker_cubeful() for cube-decision "
-                              "targets (pure 1-ply, conceptually a deeper "
-                              "search). Default uses the 0-ply formula "
-                              "(evaluate_cubeful at is_cube_action=False) for "
-                              "cube targets, which empirically gives much "
-                              "better cube_mEMG. No effect without --oneply.")
     g_batch.add_argument("--pipeline-collect", action="store_true",
                          help="Overlap worker collection of round N+1 with the "
                               "master training step of round N. Workers in round "
@@ -112,6 +170,44 @@ def main():
                               "1-ply LRs but should be validated when changing "
                               "recipes. Reproducibility preserved. Requires "
                               "--workers > 1; no-op otherwise.")
+    g_batch.add_argument("--max-episode-plies", type=int,
+                         default=DEFAULT_MAX_EPISODE_PLIES, metavar="N",
+                         help="Safety bound on self-play episode length, in "
+                              "plies (turns). An episode exceeding it is "
+                              "DISCARDED (its samples are dropped, not "
+                              "truncated) and counted in the round log line. "
+                              "Guards against a degenerate policy producing "
+                              "non-terminating games, which otherwise hang the "
+                              "round barrier forever while worker RSS grows "
+                              "until the OOM killer fires. Never triggers on "
+                              "healthy play (healthy max is ~341 samples "
+                              "i.e. well under 1500 plies). 0 disables.")
+    g_batch.add_argument("--vectorized-collect", action="store_true",
+                         help="Collect on the GPU: each worker process runs "
+                              "--vectorized-batch games in lockstep as "
+                              "generators and batches every pending network "
+                              "forward across those games into ONE local CUDA "
+                              "call (no IPC, no inference server). Requires "
+                              "--oneply, --workers > 1 and CUDA; warns and "
+                              "falls back to the CPU collector otherwise. "
+                              "DISABLES --pipeline-collect, --c-engine and "
+                              "--bf16-collect (each logged explicitly). Use a "
+                              "large --episodes-per-round (>= workers * "
+                              "batch * 8) or the lockstep tail-drain eats the "
+                              "throughput gain. --max-episode-plies is "
+                              "enforced per game, as on the CPU paths.")
+    g_batch.add_argument("--no-vectorized-collect", action="store_true",
+                         help="Keep the CPU collector even when --oneply "
+                              "--device cuda would default to the vectorized "
+                              "GPU collector. The master training step still "
+                              "runs on cuda. Mutually exclusive with an "
+                              "explicit --vectorized-collect.")
+    g_batch.add_argument("--vectorized-batch", type=int, default=32,
+                         metavar="B",
+                         help="Games in flight per worker process for "
+                              "--vectorized-collect (default 32). Larger B "
+                              "means bigger GPU batches but more GPU memory "
+                              "per process and a longer lockstep tail.")
     g_batch.add_argument("--save-every", type=int, default=0, metavar="N",
                          help="Checkpoint at the first round boundary on "
                               "or after every N episodes (effective "
@@ -124,15 +220,22 @@ def main():
                         help="Print recent batch loss every N rounds (0 to disable).")
     args = parser.parse_args()
 
+    # --oneply-acting implies --oneply for targets. Normalize BEFORE the
+    # collector routing so the resolver sees the real ply config (it must
+    # not depend on flag-spelling: --oneply-acting alone and
+    # --oneply --oneply-acting have to route identically).
+    if args.oneply_acting:
+        args.oneply = True
+
+    for note in resolve_cuda_oneply_collector(args):
+        print(note, flush=True)
+
     apply_cubeful_money_upgrades(args)
 
     if args.torch_seed is not None:
         torch.manual_seed(args.torch_seed)
 
     net = build_network(args)
-    # --oneply-acting implies --oneply for targets
-    if args.oneply_acting:
-        args.oneply = True
     agent = TDAgent(net, device=args.device, oneply=args.oneply_acting,
                     boltzmann_temp=args.boltzmann_temp)
     mode = build_mode(args.game_mode, jacoby=args.jacoby)
@@ -194,10 +297,13 @@ def main():
         warmup_cycles=args.warmup_cycles,
         boltzmann_temp=args.boltzmann_temp,
         bf16_collect=args.bf16_collect,
+        c_engine=args.c_engine,
         save_path=resolved_save,
         save_every=args.save_every,
-        cube_targets_1ply=args.cube_targets_1ply,
         pipeline_collect=args.pipeline_collect,
+        max_episode_plies=args.max_episode_plies,
+        vectorized_collect=args.vectorized_collect,
+        vectorized_batch=args.vectorized_batch,
     )
     elapsed = time.perf_counter() - t0
     eps_per_s = args.num_episodes / elapsed if elapsed > 0 else 0.0

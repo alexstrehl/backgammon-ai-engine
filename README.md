@@ -2,15 +2,13 @@
 
 A backgammon AI trained entirely through self-play [Reinforcement Learning](https://en.wikipedia.org/wiki/Reinforcement_learning).  The main approach is temporal difference learning with a neural network using Tesauro's original feature encoding (see [TD-Gammon](https://en.wikipedia.org/wiki/TD-Gammon)).  In addition to sampled Bellman backups, we implemented exact Bellman backups (sometimes called 1-ply backups), moving closer to an AlphaZero-style approach.  The framework supports multiprocessing and GPU acceleration to speed up training.  Currently it covers 1-point matches (DMP) and money games, but we plan to extend to match play.
 
-**Key results:** A 561k-parameter network achieves 51.84% win rate against gnubg 0-ply¹ (10M games, 95% CI [51.8%, 51.9%]) in 1-point matches. A 562k-parameter network achieves +57.8 mEq/game (0.058 points per game advantage, 10M games, 95% CI [+56.1, +59.6]) vs 0-ply in cubeful money matches. XG++ analysis of 1500 self-play games gives this model a Performance Rating (PR) of 1.06 (95% CI [1.01, 1.11]).
+**Key results:** A 562k-parameter network achieves +22.7 mEq/game against gnubg 1-ply¹ (12.5M games, 95% CI [+21.1, +24.4]) in cubeful money games. XG++ analysis of 1000 self-play games gives this model a Performance Rating (PR) of 0.94 (95% CI [0.89, 0.99]).
 
 Two important findings:
-1) Simple RL techniques are sufficient to get a base-model that is nearly as good as or better than gnubg's base-model.
+1) For money games, simple RL techniques are sufficient to get a base-model that is nearly as good as or better than gnubg's base-model.
 2) Cube action for money games can be learned via RL in the very natural way of simply introducing new actions (offer double, take or drop) to the agent and then learning as usual from self-play.  No formulas based on take-points were used.  We suspect this approach will also work for cube action in match play but that remains future work.
 
 As far as we're aware this is the first open-source backgammon AI trained entirely through self-play reinforcement learning (with the complete training pipeline included) to achieve near-SOTA 0-ply playing strength in DMP and cubeful money games.  It is also the first open-source implementation to learn cube action directly through self-play RL, although the approach is the same as described (but not evaluated for money games) by [Andrew Lin](https://ieeexplore.ieee.org/document/9382451/).
-
-The models we've trained show a small but significant advantage over gnubg when neither is allowed any search (so 0-ply vs 0-ply).  For our DMP model, experiments with 1-ply and 2-ply search implementations have shown that the advantage holds at both depths: a 51.5% win rate (95% CI [51.2%, 51.8%]) at 1-ply and 51.4% (95% CI [50.7%, 52.1%]) at 2-ply.²  For the cubeful-money model, allowing a 1-ply search improved the PR from 1.06 to 0.50 (95% CI [0.46, 0.53]), and a 1-ply vs 1-ply head-to-head against gnubg gives +47.1 mEq/game (95% CI [+38.3, +56.0], 400k games).  Allowing a 2-ply search further lowers the XG++ PR to 0.22 (95% CI [0.19, 0.25]), and a 2-ply vs 2-ply head-to-head against gnubg gives +45.0 mEq/game (95% CI [+22.8, +67.3]).  So our cubeful model maintains an advantage at deeper search levels, though that advantage narrows somewhat.  This result may indicate that gnubg's base networks are more tuned for deep search than ours, or that gnubg uses a more sophisticated search.  Given the goals of this project, to experiment with AI techniques and to develop a SOTA or near-SOTA backgammon AI, the next major avenue is evidently methods that search more deeply and optimize the model for search (including MCTS and AlphaZero-like approaches).
 
 [BGBlitz](https://bgblitz.com/) is a notable non-open-source example of an extremely strong (competitive with or ahead of gnubg) backgammon AI trained with pure RL techniques (see their [technical presentation](https://bgblitz.com/download/blog/Aachen_BGBlitz.pdf)).
 
@@ -18,17 +16,14 @@ The models we've trained show a small but significant advantage over gnubg when 
 
 | Model | Type | Output | Architecture | Params | vs gnubg 0-ply | mEMG | XG++ PR (0-ply) | File |
 |-------|------|--------|-------------|--------|----------------|------|-----------------|------|
-| Best cubeful | cubeful-money | equity | [512,512,256,256] | 562k | **+57.8 mEq/game** [+56.1, +59.6] | **2.1** [2.0, 2.2] | **1.06** [1.01, 1.11] | `best_models/cubeful_money_512_512_256_256.pt` |
-| Best cubeful 3L | cubeful-money | equity | [512,512,256] | 497k | **+40.7 mEq/game** [+38.9, +42.5] | **2.6** [2.5, 2.7] | — | `best_models/cubeful_money_512_512_256.pt` |
-| Best cubeless | cubeless-money | equity | [512,512,256] | 495k | **+27.9 mEq/game** [+27.0, +28.7] | N/A | — | `best_models/cubeless_money_512_512_256.pt` |
-| Cubeless prob5 | cubeless-money | prob5 | [512,512,256,128] | 528k | **+35.4 mEq/game** [+33.4, +37.3] | N/A | — | `best_models/cubeless_prob5_512_512_256_128.pt` |
+| Best cubeful | cubeful-money | equity | [512,512,256,256] | 562k | **+78.7 mEq/game** [+76.9, +80.5] | **1.94** [1.87, 2.01] | **0.94** [0.89, 0.99] | `best_models/cubeful_money_512_512_256_256.pt` |
+| Best cubeful 3L | cubeful-money | equity | [512,512,256] | 497k | **+53.5 mEq/game** [+51.8, +55.3] | **2.6** [2.5, 2.7] | — | `best_models/cubeful_money_512_512_256.pt` |
+| Best cubeless | cubeless-money | equity | [512,512,256,256] | 561k | **+42.3 mEq/game** [+41.5, +43.2] | N/A | — | `best_models/cubeless_money_512_512_256_256.pt` |
+| Best cubeless 3L | cubeless-money | equity | [512,512,256] | 495k | **+27.9 mEq/game** [+27.0, +28.7] | N/A | — | `best_models/cubeless_money_512_512_256.pt` |
+| Cubeless prob5 | cubeless-money | prob5 | [512,512,256,128] | 528k | **+44.6 mEq/game** [+43.7, +45.4] | **1.34** [1.31, 1.38] | — | `best_models/cubeless_prob5_512_512_256_128.pt` |
 | Best DMP | DMP | win prob | [512,512,256,256] | 561k | **51.84%** [51.8%, 51.9%] | **1.5** [1.5, 1.6] | **1.19** [1.14, 1.24] | `best_models/dmp_512_512_256_256.pt` |
-| DMP efficient | DMP | win prob | [256,256,256] | 182k | **50.80%** [50.8%, 50.9%] | 2.3 [2.2, 2.3] | — | `best_models/dmp_256_256_256.pt` |
-| DMP (original) | DMP | win prob | [512,512,256,128] | 528k | 51.2% (p=0.0004, 20k games) | 2.1 [2.0, 2.1] | — | `best_models/td_batch_relu_512_512_256_128_1ply_vi_final.pt` |
 
-_All "vs gnubg 0-ply" results are from 10M-game evaluations with non-parametric (bootstrap) 95% confidence intervals (except DMP original, which is the earlier 20k-game figure)._ _The Best cubeful 3L checkpoint has since been trained with a further 2M episodes of 1-ply training; its figures were measured on the prior checkpoint._ _Cubeful results report the raw mean equity in mEq/game, except Best cubeful (4L), where we report the capped (±128) mean — capping individual game equities proved more stable for that model._ _mEMG is scored by gnubg's 4-ply analysis on 4000 self-play games per model, with bootstrap 95% CIs._ _XG++ PR is the eXtreme Gammon (XG++) Performance Rating — lower is better; the values shown are 0-ply, from self-play games with bootstrap 95% CIs (1500 games for the cubeful 4L, 1000 for the DMP)._
-
-**Money-mode caveat for cubeful eval.** gnubg-nn does not appear to implement money-game equity for cube decisions (calls return "Not implemented for money"). To approximate, we evaluate cube decisions inside a simulated 21-point match at 0-0 score, with cube value hardcoded to 2 for any redouble (and Jacoby rule is enforced by doubling whenever gnubg recommends "no double, too good" on a centered cube). Earlier figures had a quirk where gnubg's cube decisions were occasionally routed through a no-op 0-ply evaluator. Rather than fixing that path directly, the evaluation now lets gnubg make its cube decisions at 1-ply; the figures above reflect this.
+_All "vs gnubg 0-ply" results are from 10M-game evaluations with non-parametric (bootstrap) 95% confidence intervals._ _Both cubeful rows and the Cubeless prob5 row play the real gnubg 1.08.003 binary over its external-player socket, with gnubg's native money cube (Jacoby) for cubeful._ _The remaining rows use the gnubg-nn wrapper², which selects the same checker moves as the real binary at 0-ply (decision-gate checks: 232/250 identical picks cubeless, 294/300 DMP, with every remaining difference an exact evaluation tie)._ _The Best cubeful 3L mEMG was measured on the prior checkpoint (since trained 2M further episodes); its H-H figure is the committed checkpoint._ _Cubeful rows report the capped (±128) mean equity — native-cube games include rare runaway redouble wars that make the raw mean unstable._ _mEMG is scored by gnubg's 4-ply analysis on 4000 self-play games per model, with bootstrap 95% CIs._ _XG++ PR is the eXtreme Gammon (XG++) Performance Rating — lower is better; the values shown are 0-ply, from self-play games with bootstrap 95% CIs (1000 games each)._
 
 ## How It Works
 
@@ -57,7 +52,6 @@ The 1-ply value iteration approach was inspired by and validated against the "1-
 
 Sampled backups (0-ply) are ~30x faster and effective for building a strong base model.
 Exact backups (1-ply) are slower but when initialized with 0-ply-trained weights, they often improve results.
-GPU training is currently only supported for the 0-ply sampled backup mode.
 
 ### Cubeful and cubeless money models
 
@@ -176,7 +170,7 @@ python train_prob5.py --oneply \
   --resume models/cubeless_prob5_512_512_256_128.pt \
   --num-episodes 500000 --lr 1.5e-4 --save models/cubeless_prob5_512_512_256_128.pt
 
-# Play the prob5 model against gnubg (cubeless money; add --bf16 for ~1.5x faster play)
+# Play the prob5 model against gnubg (cubeless money)
 python play_models.py --model1 best_models/cubeless_prob5_512_512_256_128.pt \
   --gnubg --game-mode cubeless-money --games 1000
 ```
@@ -186,7 +180,7 @@ Prob5 is cubeless-money only (no cube policy).
 ### Cubeful Money Training
 
 Train a cubeful money model from a cubeless money model. The `--warm-start-cubeful` flag
-extends the 196-input model to 199 inputs (adding 3 cube one-hot features):
+extends the 196-input model to 200 inputs (adding the 3-way cube-ownership one-hot plus the `is_cube_action` flag):
 
 ```bash
 mkdir -p models
@@ -204,7 +198,7 @@ python train_batch.py --game-mode cubeful-money \
   --num-episodes 500000 --oneply \
   --optimizer adam --lr 1e-5 --end-lr 5e-6 \
   --workers 48 --episodes-per-round 1000 \
-  --device cuda --save models/cubeful_512_512_256_1ply.pt
+  --save models/cubeful_512_512_256_1ply.pt
 
 # 3. Low-LR polish to recover network strength after 1-ply
 python train_batch.py --game-mode cubeful-money \
@@ -222,25 +216,18 @@ it with a low-LR 0-ply polish reliably recovers and improves equity.
 
 ### Evaluate
 
-> **Note on the gnubg cubeful eval (`--gnubg-cubeful`).** The cubeful
-> baseline implemented in `GnubgNNCubefulAgent` picks checker plays
-> by calling `gnubg_nn.probabilities` on each candidate next-state and
-> converting the 5-tuple to cubeless money equity, then taking the
-> argmin over the opponent's equity. gnubg's desktop "Cubeful checker
-> evaluations" GUI option does take cube ownership into account, but
-> we could not find a way to enable that path through `gnubg-nn` —
-> empirically both `probabilities` and `best_move` are cube-blind at
-> every ply/score we tried. There is a `best_move` API we could call
-> instead, but in a 400k-game H-H at 0-ply, using it either at money
-> score `(0,0)` or at the 21-point 0-0 match-equity approximation was
-> statistically inferior to the equity approach above, so we leave
-> that path unused.
+> **Note on the gnubg cubeful eval.** Cubeful evaluation plays the real
+> GNU Backgammon 1.08 binary over its external-player socket
+> (`--model2 gnubg-ext`, see `gnubg_external.py`): gnubg picks its own
+> checker plays and makes its native money-cube decisions (Jacoby) — no
+> approximation. (An earlier gnubg-nn-based cubeful baseline used a
+> 21-point match-equity approximation for the cube; it has been removed.)
 
 ```bash
-# 1. Best cubeful model vs gnubg (cubeful money, mEq/game)
+# 1. Best cubeful model vs gnubg (real 1.08 binary, cubeful money, mEq/game)
 python play_models.py \
     --model1 best_models/cubeful_money_512_512_256_256.pt \
-    --gnubg-cubeful --games 50000 --workers 32 \
+    --model2 gnubg-ext --plies 0 --games 50000 --workers 32 \
     --game-mode cubeful-money --jacoby
 
 # 2. Best cubeful model self-play with .mat game files
@@ -276,7 +263,7 @@ python gnubg_eval.py --model best_models/dmp_512_512_256_256.pt \
 ### Inspect a model
 
 ```bash
-python describe_model.py best_models/dmp_512_512_256_256.pt
+python tools/describe_model.py best_models/dmp_512_512_256_256.pt
 ```
 
 Prints architecture, parameter count, encoder, and output mode for any saved `.pt` checkpoint.
@@ -298,10 +285,10 @@ Prints architecture, parameter count, encoder, and output mode for any saved `.p
 | `agents.py` | Agent interface, RandomAgent, GnubgNNAgent |
 | `play_models.py` | Head-to-head evaluation with parallel workers |
 | `gnubg_eval.py` | Export games to .mat format, analyze with GNU Backgammon |
-| `describe_model.py` | Print architecture and training info for a saved model |
+| `tools/describe_model.py` | Print architecture and training info for a saved model |
 | `c_engine/` | C implementation of move generation (~20x faster) |
 | `c_inference/` | Standalone C inference (loads exported weights; supports prob5) |
-| `benchmarks/` | Self-contained single-thread moves/s benchmark (our net vs gnubg-nn); see `benchmarks/README.md` |
+| `experiments/benchmarks/` | Single-core per-decision compute benchmarks (PureTD vs official gnubg binary vs Open Sage); see `experiments/benchmarks/README.md` |
 
 ## Key Findings
 
@@ -341,6 +328,6 @@ MIT
 
 ---
 
-¹ Evaluated using [gnubg-nn](https://github.com/StonesAndDice/gnubg-nn-pypi) 1.1.0a6, which wraps GNU Backgammon's neural network (weights version 1.01, 1,097,867 bytes). The `benchmarks/` folder pins 1.1.0a8; the bundled GNU weights, which determine all evaluation output, are byte-identical across these versions.
+¹ GNU Backgammon 1.08.003 (neural-net weights `gnubg.wd`, md5 `14184acc9c60ef67be0fad88548fd51a`), played over its external-player socket — gnubg as shipped: prune nets + Normal move filter, native money cube (Jacoby).
 
-² An earlier commit of this README reported worse DMP search results (a tie at 2-ply); those figures were erroneous.
+² Evaluated using [gnubg-nn](https://github.com/StonesAndDice/gnubg-nn-pypi) 1.1.0a6, which wraps GNU Backgammon's neural network (weights version 1.01, 1,097,867 bytes).

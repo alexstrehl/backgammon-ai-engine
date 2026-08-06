@@ -15,14 +15,9 @@ backgammon_engine convention (`.turn` = next player to act).
 The shared library is built/loaded lazily on first import; an
 ImportError on failure lets callers fall back to backgammon_engine.
 
-TODO (task #6 / #7 — cube + matchplay): the C encoder is hard-coded
-to 196 perspective features. The cubeful experiments build their
-199-feature input by appending 3 cube one-hot features in Python
-after a 196 C encode call. When we add cube / matchplay support
-here, follow that pattern: a thin `get_legal_plays_encoded_cubeful`
-(and matchplay variant) that calls the existing C function and
-appends the small features in Python. Verify the cube perspective
-flip (MINE ↔ THEIRS) against cubeful_exp1 for the exact rule.
+The C encoder is the 196-feature perspective encoding; cubeful models
+append the small cube features in Python after the C encode call (see
+td_agent's fused cubeful path).
 """
 
 import ctypes
@@ -34,7 +29,7 @@ import numpy as np
 from backgammon_engine import BoardState
 
 NUM_FEATURES = 196
-MAX_PLAYS = 1024
+MAX_PLAYS = 4096  # keep in sync with bg_engine.h MAX_PLAYS
 MAX_MOVES_PER_PLAY = 4
 NUM_POINTS = 24
 

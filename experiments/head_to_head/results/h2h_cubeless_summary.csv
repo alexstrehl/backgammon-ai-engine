@@ -1,0 +1,11 @@
+# Main-results convention (2026-07-25): gnubg = REAL gnubg 1.08.003 binary via
+# the external-player socket (side specs gnubg-ext / gnubg-ext-full); all 1-ply
+# opponents UNPRUNED (gnubg: prune nets off + keep-all filter; Sage:
+# SAGE_UNPRUNED=1). Cubeless criterion fix applied (chequer eval cubeful off).
+# Superseded wrapper-era rows (gnubg-nn in-process opponent): see git history.
+side1,side1_plies,side2,side2_plies,mode,games,edge_mEq,ci_lo,ci_hi
+PureTD_prob5,0,gnubg-ext,0,cubeless-money,10000000,44.6,43.7,45.4
+PureTD_prob5,0,gnubg-ext-full,1,cubeless-money,10000000,11.9,11.0,12.7
+PureTD_prob5,0,opensage,0,cubeless-money,10000000,40.3,39.4,41.1
+PureTD_prob5,0,opensage_unpruned,1,cubeless-money,10000000,8.2,7.4,9.1
+gnubg-ext-full,1,opensage_unpruned,1,cubeless-money,10000000,-2.7,-3.6,-1.9

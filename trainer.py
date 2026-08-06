@@ -20,7 +20,6 @@ import multiprocessing as mp
 import os
 import random
 import time
-from dataclasses import replace
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -29,7 +28,52 @@ import torch
 from agents import Agent
 from backgammon_engine import BoardState, opening_roll, switch_turn
 from encoding import CubePerspective
-from modes import CubeOwner, GameMode, cube_perspective
+from modes import GameMode, cube_perspective
+
+
+# Safety bound on self-play episode length, in PLIES (turns), not
+# samples. Neither episode loop below has any natural termination
+# guarantee: they run `while not mode.is_episode_over(state)`, and a
+# degenerate policy can produce games that never reach a terminal
+# state (mutual hitting / recirculation, or a bear-in the net refuses
+# to complete). Such an episode spins at full turn throughput forever
+# while its sample lists grow without bound -- the master blocks on the
+# round barrier (pool.map get()) and worker RSS climbs until the OOM
+# killer fires.
+#
+# Calibration: on a healthy cubeful-money net, episodes average ~129
+# samples with a max of ~341 over 2000 episodes; a cubeful turn emits
+# 1-2 samples (checker always, cube when eligible), so healthy play is
+# ~65-340 plies. 1500 plies is ~4-20x the healthy maximum -- far enough
+# above legitimate play that it never fires on a healthy run, while
+# still bounding a runaway episode to a few thousand samples instead of
+# millions.
+DEFAULT_MAX_EPISODE_PLIES = 1500
+
+# VRAM preflight for the vectorized GPU collector. Each vectorized
+# worker process owns a full CUDA context (measured 250-500 MB on the
+# boxes this repo runs on: prob5 W=16xB=16 fit an 8 GB card, W=32xB=32
+# did not; the eval-server daemon idles at ~498 MB). The estimate below
+# is deliberately conservative -- a capped-but-running collector beats
+# an OOM forty minutes into a leg.
+VEC_PER_WORKER_BYTES = 420 * 2**20
+VEC_RESERVE_BYTES = 512 * 2**20   # master context / display / allocator slack
+
+
+def vectorized_vram_cap(requested_workers: int, free_bytes: int) -> int:
+    """How many vectorized GPU worker processes fit in `free_bytes`.
+
+    Pure function so the arithmetic is unit-testable without a GPU.
+    Returns min(requested, floor((free - reserve) / per_worker)),
+    clamped at >= 0. The CALLER decides what to do with 0 or 1 (fall
+    back to the CPU collector -- one worker forfeits lockstep batching).
+    """
+    if requested_workers <= 0:
+        return 0
+    budget = free_bytes - VEC_RESERVE_BYTES
+    if budget <= 0:
+        return 0
+    return min(requested_workers, int(budget // VEC_PER_WORKER_BYTES))
 
 
 # ── Episode collection (mode-agnostic, agent-driven) ──────────────────
@@ -40,7 +84,7 @@ def collect_episode(
     mode: GameMode,
     rng: random.Random,
     oneply: bool = False,
-    cube_targets_1ply: bool = False,
+    max_episode_plies: int = DEFAULT_MAX_EPISODE_PLIES,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Play one self-play episode and return (encodings, targets).
 
@@ -61,19 +105,36 @@ def collect_episode(
     Cubeful modes: if `mode.initial_match_state()` returns a
     MatchState, dispatches to the cubeful collector which also
     generates cube-decision samples.
+
+    `max_episode_plies`: safety bound (see DEFAULT_MAX_EPISODE_PLIES).
+    An episode that exceeds it is DISCARDED -- the function returns
+    empty arrays. Discarding rather than truncating is deliberate: a
+    runaway episode's samples come from a degenerate region of state
+    space and would poison the pool, and truncate-and-bootstrap would
+    change TD semantics. Empty arrays are the discard signal; a
+    legitimate episode always emits at least one sample, so callers can
+    treat "empty" as "discarded". Pass <= 0 to disable the bound.
     """
     initial_match_state = mode.initial_match_state()
     if initial_match_state is not None:
         return _collect_episode_cubeful_money(
-            agent, mode, rng, initial_match_state,
-            oneply=oneply, cube_targets_1ply=cube_targets_1ply,
+            agent, mode, rng, initial_match_state, oneply=oneply,
+            max_episode_plies=max_episode_plies,
         )
 
     state, dice = opening_roll(rng)
     enc_list: List[np.ndarray] = []
     targets: List[float] = []
+    plies = 0
 
     while not mode.is_episode_over(state):
+        if max_episode_plies > 0 and plies >= max_episode_plies:
+            # Runaway episode -- discard (see docstring).
+            return (
+                np.empty((0, 0), dtype=np.float32),
+                np.empty((0,), dtype=np.float32),
+            )
+        plies += 1
         enc_list.append(agent.encode_state(state))
 
         if oneply:
@@ -124,7 +185,7 @@ def _collect_episode_cubeful_money(
     rng: random.Random,
     match_state,
     oneply: bool = False,
-    cube_targets_1ply: bool = False,
+    max_episode_plies: int = DEFAULT_MAX_EPISODE_PLIES,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Cubeful MONEY-game episode collector.
 
@@ -140,17 +201,27 @@ def _collect_episode_cubeful_money(
     bootstrap = -V(opp view) or terminal game_result at episode end.
 
     All targets are per-unit equity (cube_value = 1).
+
+    `max_episode_plies`: see collect_episode. Exceeding it discards the
+    episode (returns empty arrays). Pass <= 0 to disable.
     """
     state, dice = opening_roll(rng)
     enc_list: List[np.ndarray] = []
     targets: List[float] = []
     is_opening = True  # no doubling on the opening roll
+    plies = 0
 
     while not mode.is_episode_over(state):
+        if max_episode_plies > 0 and plies >= max_episode_plies:
+            # Runaway episode -- discard (see collect_episode docstring).
+            return (
+                np.empty((0, 0), dtype=np.float32),
+                np.empty((0,), dtype=np.float32),
+            )
+        plies += 1
         player = state.turn
 
         # ── Cube decision phase (if eligible) ───────────────────────
-        oneply_no_double = None  # cached for checker-phase reuse
         if not is_opening and match_state.can_offer(player):
             pre_persp = cube_perspective(match_state.cube_owner, player)
 
@@ -160,43 +231,25 @@ def _collect_episode_cubeful_money(
             ))
 
             if oneply:
-                opponent = 1 - player
-                theirs_ms = replace(
-                    match_state, cube_owner=CubeOwner(opponent + 1),
+                # Cube targets are direct network evaluations. A cube
+                # action has no chance node (the transition is
+                # deterministic — no dice roll to average over), so the
+                # network's own value IS the exact one-step backup; the
+                # 1-ply machinery only applies to the checker phase.
+                # Batched into one forward(batch=2) — saves one network
+                # dispatch per cube-eligible turn.
+                x_nd = agent._encode_cubeful(
+                    state, pre_persp, is_cube_action=False,
                 )
-                if cube_targets_1ply:
-                    # EXPERIMENTAL: pure 1-ply cube targets. Conceptually
-                    # the deeper search (1-ply lookahead at cube decisions),
-                    # but empirically inflates slack at boundary positions
-                    # via a subtle bug in value_oneply_checker_cubeful, which
-                    # degrades cube performance vs the 0-ply-target default.
-                    v_no_double = agent.value_oneply_checker_cubeful(
-                        state, match_state,
-                    )
-                    oneply_no_double = v_no_double
-                    v_double_take = 2.0 * agent.value_oneply_checker_cubeful(
-                        state, theirs_ms,
-                    )
-                else:
-                    # Default: 0-ply cube targets while keeping 1-ply for
-                    # the checker phase. Avoids the 1-ply cube-target
-                    # inflation that produced r8_tmp's cube_mEMG regression.
-                    # Batched into one forward(batch=2) — saves one network
-                    # dispatch per cube-eligible turn.
-                    x_nd = agent._encode_cubeful(
-                        state, pre_persp, is_cube_action=False,
-                    )
-                    x_dt = agent._encode_cubeful(
-                        state, CubePerspective.THEIRS, is_cube_action=False,
-                    )
-                    t = torch.from_numpy(np.stack([x_nd, x_dt]))
-                    t = agent._to_device(t)
-                    with torch.no_grad():
-                        values = agent.network(t).flatten()
-                    v_no_double = float(values[0].item())
-                    v_double_take = 2.0 * float(values[1].item())
-                    # leave oneply_no_double = None so checker_target
-                    # below recomputes via 1-ply (don't reuse 0-ply v_nd)
+                x_dt = agent._encode_cubeful(
+                    state, CubePerspective.THEIRS, is_cube_action=False,
+                )
+                t = torch.from_numpy(np.stack([x_nd, x_dt]))
+                t = agent._to_device(t)
+                with torch.no_grad():
+                    values = agent.network(t).flatten()
+                v_no_double = float(values[0].item())
+                v_double_take = 2.0 * float(values[1].item())
                 do_double = agent._money_cube_decision(
                     v_no_double, v_double_take, pre_persp, match_state.jacoby,
                 )
@@ -218,7 +271,6 @@ def _collect_episode_cubeful_money(
                     # Cube target: stake doubles, cube transfers.
                     targets.append(v_double_take)
                     match_state = match_state.after_take(player)
-                    oneply_no_double = None
                 else:
                     # Cube target: opponent drops, we win 1 per unit.
                     targets.append(1.0)
@@ -234,12 +286,9 @@ def _collect_episode_cubeful_money(
         ))
 
         if oneply:
-            if oneply_no_double is not None:
-                checker_target = oneply_no_double
-            else:
-                checker_target = agent.value_oneply_checker_cubeful(
-                    state, match_state,
-                )
+            checker_target = agent.value_oneply_checker_cubeful(
+                state, match_state,
+            )
             targets.append(checker_target)
             result = agent.choose_checker_action_cubeful(
                 state, dice, match_state,
@@ -303,41 +352,39 @@ def _split_episodes(total: int, n_workers: int) -> List[int]:
 
 def _collect_worker(args):
     """Worker subprocess: rebuild the agent from a state_dict, play
-    `num_episodes` episodes, return concatenated (encodings, targets)
-    numpy arrays. The GameMode instance is pickled directly into
+    `num_episodes` episodes, return
+    (encodings, targets, n_discarded) — the concatenated numpy arrays
+    plus the count of episodes discarded for exceeding
+    `max_episode_plies`. The GameMode instance is pickled directly into
     `args` — simpler and more general than name-based dispatch,
     because modes can carry config (e.g. CubefulMoneyMode.jacoby).
 
-    Set env LEAK_DIAG=1 to log RSS at entry/exit (for leak hunts).
+    NOTE: the args tuple arity must stay in sync with
+    `_build_worker_args` in Trainer.train — a mismatch here has bitten
+    this file before.
     """
     os.environ["OMP_NUM_THREADS"] = "1"
     torch.set_num_threads(1)
 
     (state_dict, hidden_sizes, input_size, output_mode, encoder_name,
-     mode, num_episodes, seed, oneply, oneply_acting, boltzmann_temp,
-     bf16_inference, cube_targets_1ply) = args
-
-    diag = os.environ.get("LEAK_DIAG") == "1"
-
-    def _rss_kb():
-        try:
-            with open("/proc/self/statm") as f:
-                # fields in pages: size resident shared text lib data dt
-                resident = int(f.read().split()[1])
-            return resident * (os.sysconf("SC_PAGE_SIZE") // 1024)
-        except Exception:
-            return -1
-
-    rss_in = _rss_kb() if diag else None
+     activation, mode, num_episodes, seed, oneply, oneply_acting,
+     boltzmann_temp, bf16_inference, c_engine, max_episode_plies) = args
 
     from model import TDNetwork
     from td_agent import TDAgent
 
+    # `activation` MUST be threaded through and applied here. Before
+    # 2026-08-05 the worker rebuilt with the constructor default
+    # ("relu") regardless of the checkpoint — activation is not a
+    # parameter tensor, so load_state_dict succeeds and a tanh/sigmoid
+    # net silently trains against relu-computed targets. Invisible only
+    # while every checkpoint happens to be relu.
     net = TDNetwork(
         hidden_sizes=hidden_sizes,
         input_size=input_size,
         output_mode=output_mode,
         encoder_name=encoder_name,
+        activation=activation,
     )
     net.load_state_dict(state_dict)
     agent = TDAgent(
@@ -345,40 +392,75 @@ def _collect_worker(args):
         bf16_inference=bf16_inference,
     )
 
+    # C engine: replaces the 1-ply cubeful TARGET forward with libbg_nply
+    # (OpenBLAS sgemm). Move selection stays PyTorch. No-op unless oneply.
+    # Weights are this round's, so the per-process .bin export is current.
+    #
+    # enable_c_engine returns False when libbg_nply.so is missing, and
+    # upstream IGNORES that -- so a run with --c-engine set silently degrades
+    # to PyTorch and an A/B can be PyTorch on both arms. Fail loudly.
+    if c_engine and oneply:
+        import c_engine.bg_nply as _cn
+        if not _cn.enable_c_engine(agent):
+            raise RuntimeError(
+                "--c-engine requested but libbg_nply is unavailable; "
+                "build it with `bash c_engine/build_nply.sh` "
+                "(needs a CBLAS exporting cblas_sgemm)"
+            )
+
     rng = random.Random(seed)
 
     enc_chunks: List[np.ndarray] = []
     tgt_chunks: List[np.ndarray] = []
+    n_discarded = 0
     for _ in range(num_episodes):
         encs, tgts = collect_episode(
             agent, mode, rng, oneply=oneply,
-            cube_targets_1ply=cube_targets_1ply,
+            max_episode_plies=max_episode_plies,
         )
         if len(encs) > 0:
             enc_chunks.append(encs)
             tgt_chunks.append(tgts)
+        else:
+            # Empty == discarded overlong episode (a legitimate episode
+            # always emits at least one sample).
+            n_discarded += 1
     if not enc_chunks:
         result = (
             np.empty((0, 0), dtype=np.float32),
             np.empty((0,), dtype=np.float32),
+            n_discarded,
         )
     else:
         result = (
             np.concatenate(enc_chunks, axis=0),
             np.concatenate(tgt_chunks, axis=0),
+            n_discarded,
         )
 
-    if diag:
-        rss_out = _rss_kb()
-        print(
-            f"[worker {os.getpid()}] RSS {rss_in/1024:.1f} -> {rss_out/1024:.1f} MB "
-            f"(Δ {(rss_out-rss_in)/1024:+.1f} MB), {num_episodes} eps",
-            flush=True,
-        )
     return result
 
 
 # ── Trainer class ─────────────────────────────────────────────────────
+
+
+def _unique_ckpt_path(path: str) -> str:
+    """Return `path`, or the first free `..._rN` variant if it already exists.
+
+    Periodic checkpoints are named from an episode counter local to a single
+    invocation. Resuming a partially-finished leg restarts that counter, so
+    without this a resumed run silently overwrites the earlier run's
+    checkpoints -- and the surviving file is then labelled with FEWER episodes
+    than it actually contains, which is worse than losing it: it will be banked
+    and compared under the wrong label.
+    """
+    if not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    n = 2
+    while os.path.exists(f"{root}_r{n}{ext}"):
+        n += 1
+    return f"{root}_r{n}{ext}"
 
 
 class Trainer:
@@ -475,8 +557,11 @@ class Trainer:
         save_path: Optional[str] = None,
         save_every: int = 0,
         metrics_out: Optional[dict] = None,
-        cube_targets_1ply: bool = False,
         pipeline_collect: bool = False,
+        c_engine: bool = False,
+        max_episode_plies: int = DEFAULT_MAX_EPISODE_PLIES,
+        vectorized_collect: bool = False,
+        vectorized_batch: int = 32,
     ) -> List[float]:
         """Round-based batch TD(0). A round collects
         `episodes_per_round` episodes, then trains `epochs_per_round`
@@ -506,9 +591,37 @@ class Trainer:
         (the rng.randint() sequence for worker seeds is unchanged).
         No effect with workers <= 1.
 
+        `max_episode_plies`: safety bound on self-play episode length
+        (see DEFAULT_MAX_EPISODE_PLIES). Episodes exceeding it are
+        discarded and counted; the count appears in the round log line
+        so a diverging run becomes visible rather than silently
+        stalling. Applies to every collection path (single-process,
+        parallel, pipelined, and the vectorized GPU collector).
+
+        `vectorized_collect`: opt-in GPU collector. Each of `workers`
+        processes runs `vectorized_batch` games in lockstep as Python
+        generators, batching every pending network forward across those
+        games into ONE local GPU call (no IPC). Requires oneply,
+        workers > 1 and CUDA; ignored (with a warning) otherwise. It
+        replaces the worker function only -- round structure, weight
+        shipping, LR schedule, discard accounting and the training step
+        are unchanged. It is MUTUALLY EXCLUSIVE with pipelining and
+        with the C 1-ply engine; both are disabled with an explicit log
+        line rather than silently (see below).
+
         Returns a flat list of per-batch losses.
         """
         mode.validate_agent(self.agent)
+        if vectorized_collect and oneply_acting:
+            # Checked before any pool exists. The vectorized generators
+            # implement 0-ply move SELECTION only; silently ignoring
+            # --oneply-acting would play a different policy than asked
+            # for and change the data distribution, so refuse outright.
+            raise ValueError(
+                "--vectorized-collect does not support --oneply-acting "
+                "(the vectorized collector does 1-ply TARGETS with 0-ply "
+                "move selection). Drop one of the two flags."
+            )
         if isinstance(self.optimizer, torch.optim.SGD):
             import warnings
             warnings.warn(
@@ -545,56 +658,192 @@ class Trainer:
         # TRAINER_MAXTASKSPERCHILD env var recycles workers after N
         # calls — useful if you observe residual per-worker growth over
         # a long run (glibc arena fragmentation, torch allocator cache).
-        # With spawn, recycled workers start pristine, so this is now a
-        # real knob rather than a diagnostic stub.
+        # With spawn, recycled workers start pristine, so the knob
+        # meaningfully bounds per-worker growth.
         _mt = os.environ.get("TRAINER_MAXTASKSPERCHILD")
         maxtasks = int(_mt) if _mt else None
+
+        # Vectorized-eligibility and the VRAM preflight run BEFORE pool
+        # creation: pool tasks rotate across processes, so a per-round
+        # task cap would NOT cap CUDA contexts (each process that ever
+        # ran a vectorized task keeps its context for life). The pool
+        # itself is sized to the capped worker count.
+        vec_active = bool(
+            vectorized_collect and workers > 1 and oneply
+            and torch.cuda.is_available()
+        )
+        vec_workers = workers
+        if vec_active:
+            free_b, total_b = torch.cuda.mem_get_info()
+            vec_workers = vectorized_vram_cap(workers, free_b)
+            if vec_workers < 2:
+                print(
+                    f"  WARN: --vectorized-collect IGNORED (VRAM preflight: "
+                    f"{free_b / 2**20:.0f} MB free supports "
+                    f"{vec_workers} worker context(s), need >= 2) -- "
+                    f"falling back to the CPU collector", flush=True,
+                )
+                vec_active = False
+                # vec_workers stays < 2: the generic IGNORED print below
+                # is guarded on vec_workers == workers so the VRAM WARN
+                # above is the only message for this case.
+            elif vec_workers < workers:
+                print(
+                    f"  NOTE: VRAM preflight capped vectorized workers "
+                    f"{workers} -> {vec_workers} "
+                    f"({free_b / 2**20:.0f} MB free, "
+                    f"~{VEC_PER_WORKER_BYTES / 2**20:.0f} MB/context + "
+                    f"{VEC_RESERVE_BYTES / 2**20:.0f} MB reserve). "
+                    f"Pool is sized to the cap.", flush=True,
+                )
+
         pool = (
             mp.get_context("spawn").Pool(
-                processes=workers, maxtasksperchild=maxtasks,
+                processes=(vec_workers if vec_active else workers),
+                maxtasksperchild=maxtasks,
             )
             if workers > 1 else None
         )
 
-        # Master-side leak diagnostic: RSS at pool creation + per-round
-        # delta. Uses the same /proc/self/statm trick as the worker.
-        _diag_master = os.environ.get("LEAK_DIAG") == "1"
-
-        def _master_rss_mb():
-            try:
-                with open("/proc/self/statm") as f:
-                    resident = int(f.read().split()[1])
-                return resident * (os.sysconf("SC_PAGE_SIZE") // 1024) / 1024.0
-            except Exception:
-                return -1.0
-
-        if _diag_master:
+        # ── Vectorized GPU collection (opt-in) ─────────────────────────
+        # Each worker runs `vectorized_batch` games in lockstep and does
+        # ONE batched GPU forward per step across all of them. Needs
+        # oneply (the collector is 1-ply-only by construction), a real
+        # worker pool, and CUDA.
+        #
+        # Everything this path turns off is announced. The original
+        # implementation disabled pipelining silently, which made a
+        # recipe change (one-round-stale targets -> fresh targets)
+        # invisible in the logs; and it predates --c-engine entirely, so
+        # a run passing both would have silently got neither the C
+        # engine nor a warning.
+        if vectorized_collect and not vec_active and vec_workers == workers:
+            # (VRAM-cap fallback already printed its own WARN above.)
+            reasons = []
+            if not oneply:
+                reasons.append("needs --oneply")
+            if workers <= 1:
+                reasons.append("needs --workers > 1")
+            if not torch.cuda.is_available():
+                reasons.append("CUDA not available")
             print(
-                f"[master {os.getpid()}] RSS at pool start: "
-                f"{_master_rss_mb():.1f} MB",
+                "  WARN: --vectorized-collect IGNORED ("
+                + "; ".join(reasons) + ") -- falling back to the CPU "
+                "collector",
                 flush=True,
             )
+        if vec_active:
+            print(
+                f"Vectorized GPU collection: ON ({vec_workers} procs x "
+                f"B={vectorized_batch} games/proc, fp32 on cuda, "
+                f"max_episode_plies={max_episode_plies})",
+                flush=True,
+            )
+            # Spec echo: the worker REBUILDS the net from these fields.
+            # Anything not echoed here has silently defaulted before
+            # (activation; cf. the eval server rebuilding every net as
+            # ReLU) -- print exactly what workers will construct.
+            _sn = self.agent.network
+            print(
+                f"  worker net spec: hidden={list(_sn.hidden_sizes)} "
+                f"input={getattr(_sn, 'input_size', '?')} "
+                f"activation={getattr(_sn, 'activation', 'relu')} "
+                f"output_mode={getattr(_sn, 'output_mode', '?')} "
+                f"encoder={getattr(_sn, 'encoder_name', '?')}",
+                flush=True,
+            )
+            if pipeline_collect:
+                print(
+                    "  NOTE: --pipeline-collect DISABLED by "
+                    "--vectorized-collect. The vectorized worker owns a "
+                    "CUDA context and its forwards would contend with "
+                    "the master's train step on the same GPU. RECIPE "
+                    "EFFECT: collectors now see the CURRENT round's "
+                    "weights instead of one-round-stale weights.",
+                    flush=True,
+                )
+            if c_engine:
+                print(
+                    "  NOTE: --c-engine DISABLED by "
+                    "--vectorized-collect. The vectorized collector "
+                    "computes 1-ply targets by yielding feature "
+                    "matrices to the GPU driver net; the C 1-ply engine "
+                    "is a different (CPU) implementation and the two "
+                    "cannot both own the 1-ply computation.",
+                    flush=True,
+                )
+            if bf16_collect:
+                print(
+                    "  NOTE: --bf16-collect DISABLED by "
+                    "--vectorized-collect (driver net runs fp32 on "
+                    "cuda). Targets are fp32, i.e. MORE precise than "
+                    "the bf16 CPU collector, not less.",
+                    flush=True,
+                )
+
         net = self.agent.network
         hidden_sizes = list(net.hidden_sizes)
         input_size = getattr(net, "input_size", 196)
         output_mode = getattr(net, "output_mode", "probability")
         encoder_name = getattr(net, "encoder_name", "perspective196")
+        activation = getattr(net, "activation", "relu")
 
         # Helper: build worker_args for a given round_size using current
         # net weights. Called either eagerly (pipeline pre-submit) or
         # lazily (sync path).
         def _build_worker_args(round_size: int):
             splits = _split_episodes(round_size, workers)
+            # .clone() is REQUIRED, not defensive. On a CPU net `.cpu()` is a
+            # no-op that returns a VIEW sharing storage with the live parameter,
+            # so the tensors handed to map_async are pickled by the pool's task
+            # thread WHILE optimizer.step() mutates them in place — workers can
+            # receive torn weights. Demonstrated 2026-08-04: identical CPU runs
+            # diverged (pool 31771 x4, 31943 x1). Not reachable on --device cuda
+            # (there .cpu() genuinely copies, in the master thread). Cost is one
+            # ~2MB copy per round, i.e. nothing.
             state_dict = {
-                k: v.detach().cpu()
+                k: v.detach().cpu().clone()
                 for k, v in net.state_dict().items()
             }
             return [
                 (state_dict, hidden_sizes, input_size, output_mode,
-                 encoder_name,
+                 encoder_name, activation,
                  mode, n_eps, rng.randint(0, 2**31 - 1),
                  oneply, oneply_acting, boltzmann_temp,
-                 bf16_collect, cube_targets_1ply)
+                 bf16_collect, c_engine, max_episode_plies)
+                for n_eps in splits
+            ]
+
+        # Helper: build args for the vectorized (GPU) workers. Same
+        # leading fields as _build_worker_args, then the per-process
+        # game batch B and the driver device in place of the c_engine
+        # flag (which the vectorized path cannot use, see above), and
+        # the ply bound last.
+        #
+        # NOTE: arity must stay in sync with
+        # `vectorized_collect_worker` in vectorized_collect.py.
+        def _build_vec_args(round_size: int):
+            splits = _split_episodes(round_size, vec_workers)
+            # .clone() is REQUIRED, not defensive. On a CPU net `.cpu()` is a
+            # no-op that returns a VIEW sharing storage with the live parameter,
+            # so the tensors handed to map_async are pickled by the pool's task
+            # thread WHILE optimizer.step() mutates them in place — workers can
+            # receive torn weights. Demonstrated 2026-08-04: identical CPU runs
+            # diverged (pool 31771 x4, 31943 x1). Not reachable on --device cuda
+            # (there .cpu() genuinely copies, in the master thread). Cost is one
+            # ~2MB copy per round, i.e. nothing.
+            state_dict = {
+                k: v.detach().cpu().clone()
+                for k, v in net.state_dict().items()
+            }
+            return [
+                (state_dict, hidden_sizes, input_size, output_mode,
+                 encoder_name, activation,
+                 mode, n_eps, rng.randint(0, 2**31 - 1),
+                 oneply, oneply_acting, boltzmann_temp,
+                 bf16_collect,
+                 vectorized_batch, "cuda",
+                 max_episode_plies)
                 for n_eps in splits
             ]
 
@@ -603,7 +852,7 @@ class Trainer:
         # will then wait for "pending" results at the top of each
         # iteration and submit the NEXT round's collect before training.
         # No-op when pool is None or pipeline_collect is False.
-        use_pipeline = pipeline_collect and pool is not None
+        use_pipeline = pipeline_collect and pool is not None and not vec_active
         pending = None
         pending_round_size = 0
         if use_pipeline:
@@ -619,8 +868,6 @@ class Trainer:
                 round_size = min(
                     episodes_per_round, num_episodes - episodes_played,
                 )
-                rss_round_start = _master_rss_mb() if _diag_master else 0.0
-
                 # ── LR annealing (linear, by episodes_played) ──────
                 if end_lr is not None:
                     frac = episodes_played / max(num_episodes, 1)
@@ -641,8 +888,24 @@ class Trainer:
                 _t_collect_start = time.perf_counter()
                 enc_chunks: List[np.ndarray] = []
                 tgt_chunks: List[np.ndarray] = []
+                n_discarded = 0
 
-                if pool is None:
+                if vec_active:
+                    # Vectorized GPU collection: each worker drives
+                    # `vectorized_batch` games in lockstep and batches
+                    # their forwards into one local GPU call. Returns
+                    # the same (enc, tgt, n_discarded) 3-tuple as
+                    # _collect_worker, so accounting below is shared.
+                    from vectorized_collect import vectorized_collect_worker
+                    for w_enc, w_tgt, w_disc in pool.map(
+                        vectorized_collect_worker,
+                        _build_vec_args(round_size),
+                    ):
+                        if len(w_enc) > 0:
+                            enc_chunks.append(w_enc)
+                            tgt_chunks.append(w_tgt)
+                        n_discarded += w_disc
+                elif pool is None:
                     # Single-process: master agent does the collection,
                     # so its bf16 inference copy (if enabled) must be
                     # re-synced to the current fp32 weights each round.
@@ -650,14 +913,27 @@ class Trainer:
                         if not self.agent.bf16_inference:
                             self.agent.bf16_inference = True
                         self.agent.refresh_bf16_inference()
+                    # Same for the C engine: it holds a weight COPY, so it
+                    # must be re-exported each round or targets would come
+                    # from the previous round's net.
+                    if c_engine and oneply:
+                        import c_engine.bg_nply as _cn
+                        if not _cn.enable_c_engine(self.agent):
+                            raise RuntimeError(
+                                "--c-engine requested but libbg_nply is "
+                                "unavailable; build with "
+                                "`bash c_engine/build_nply.sh`"
+                            )
                     for _ in range(round_size):
                         encs, tgts = collect_episode(
                             self.agent, mode, rng, oneply=oneply,
-                            cube_targets_1ply=cube_targets_1ply,
+                            max_episode_plies=max_episode_plies,
                         )
                         if len(encs) > 0:
                             enc_chunks.append(encs)
                             tgt_chunks.append(tgts)
+                        else:
+                            n_discarded += 1
                 elif use_pipeline:
                     # Pipelined: this round's collect was started in the
                     # previous iteration (or pre-loop for round 0). Submit
@@ -676,20 +952,22 @@ class Trainer:
                         next_pending = pool.map_async(
                             _collect_worker, _build_worker_args(next_round_size),
                         )
-                    for w_enc, w_tgt in pending.get():
+                    for w_enc, w_tgt, w_disc in pending.get():
                         if len(w_enc) > 0:
                             enc_chunks.append(w_enc)
                             tgt_chunks.append(w_tgt)
+                        n_discarded += w_disc
                     pending = next_pending
                     pending_round_size = next_round_size
                 else:
                     # Non-pipelined parallel: submit and wait synchronously.
-                    for w_enc, w_tgt in pool.map(
+                    for w_enc, w_tgt, w_disc in pool.map(
                         _collect_worker, _build_worker_args(round_size),
                     ):
                         if len(w_enc) > 0:
                             enc_chunks.append(w_enc)
                             tgt_chunks.append(w_tgt)
+                        n_discarded += w_disc
 
                 episodes_played += round_size
                 if metrics_out is not None:
@@ -697,7 +975,21 @@ class Trainer:
                         time.perf_counter() - _t_collect_start
                     )
                     metrics_out.setdefault("round_sizes", []).append(round_size)
+                    metrics_out.setdefault("discarded", []).append(n_discarded)
                 if not enc_chunks:
+                    # Nothing usable this round. If that is because every
+                    # episode ran away, say so loudly -- otherwise the run
+                    # would spin here producing no training signal at all.
+                    if n_discarded:
+                        print(
+                            f"Round {round_idx + 1:4d}/{num_rounds} "
+                            f"| episodes {episodes_played}/{num_episodes} "
+                            f"| pool     0 "
+                            f"| DISCARDED {n_discarded}/{round_size} overlong "
+                            f"episodes (>{max_episode_plies} plies) -- "
+                            f"no usable samples this round",
+                            flush=True,
+                        )
                     continue
 
                 pool_enc = np.concatenate(enc_chunks, axis=0)
@@ -737,30 +1029,28 @@ class Trainer:
                 if log_every and (round_idx + 1) % log_every == 0:
                     recent = losses[-10:] if losses else [0.0]
                     avg = sum(recent) / len(recent)
+                    discard_note = (
+                        f" | discarded {n_discarded} overlong episodes"
+                        f" (>{max_episode_plies} plies)"
+                        if n_discarded else ""
+                    )
                     print(
                         f"Round {round_idx + 1:4d}/{num_rounds} "
                         f"| episodes {episodes_played}/{num_episodes} "
                         f"| pool {n:5d} "
                         f"| recent batch loss {avg:.4f}"
+                        f"{discard_note}"
                     )
 
                 if next_save is not None and episodes_played >= next_save:
                     root, ext = os.path.splitext(save_path)
-                    ckpt_path = f"{root}_ep{episodes_played}{ext or '.pt'}"
+                    ckpt_path = _unique_ckpt_path(
+                        f"{root}_ep{episodes_played}{ext or '.pt'}")
                     self.agent.network.save(ckpt_path)
                     print(f"  -> checkpoint saved: {ckpt_path}", flush=True)
                     while next_save <= episodes_played:
                         next_save += save_every
 
-                if _diag_master:
-                    rss_round_end = _master_rss_mb()
-                    print(
-                        f"[master round={round_idx + 1}] RSS "
-                        f"{rss_round_start:.1f} -> {rss_round_end:.1f} MB "
-                        f"(Δ {rss_round_end - rss_round_start:+.1f}) "
-                        f"| losses={len(losses)}",
-                        flush=True,
-                    )
         finally:
             if pool is not None:
                 pool.close()

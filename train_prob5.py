@@ -86,6 +86,15 @@ _DICE_OUTCOMES: List[Tuple[Tuple[int, int], float]] = [
     for d2 in range(d1, 7)
 ]
 
+# Same 21 probabilities as a float32 vector, in _DICE_OUTCOMES order.
+# float32 (not float64) so that `chosen * _ONEPLY_PROBS32[:, None]` is
+# bit-identical to the scalar `prob * vec` of the per-dice reference
+# path: numpy casts a Python float scalar down to the array's float32
+# before multiplying, so the two agree exactly.
+_ONEPLY_PROBS32 = np.array(
+    [p for _, p in _DICE_OUTCOMES], dtype=np.float32,
+)
+
 
 # ── Target helpers ────────────────────────────────────────────────────
 
@@ -111,6 +120,63 @@ def _flip_vec(v: np.ndarray) -> np.ndarray:
     )
 
 
+def _flip_rows(v: np.ndarray) -> np.ndarray:
+    """Vectorised `_flip_vec` over an (N, 5) float32 block.
+
+    Bit-identical to stacking `_flip_vec` row by row: every element is
+    produced by the same float32 op (`1.0 - x` or a plain copy), and
+    numpy keeps a weak Python-float scalar at float32.
+    """
+    out = np.empty((v.shape[0], NUM_OUTPUTS), dtype=np.float32)
+    out[:, 0] = 1.0 - v[:, 0]
+    out[:, 1] = v[:, 3]
+    out[:, 2] = v[:, 4]
+    out[:, 3] = v[:, 1]
+    out[:, 4] = v[:, 2]
+    return out
+
+
+def _prob5_equity_np(m: np.ndarray) -> np.ndarray:
+    """Bit-exact numpy mirror of ``model.prob5_to_equity`` for an
+    (N, 5) **float32** array.
+
+    Why not just call ``prob5_to_equity(torch.from_numpy(m))``: on the
+    1-ply target path that costs ~5 torch dispatches per dice outcome
+    (21 per position) for what is a 5-element dot product.
+
+    Why this exact expression: ``prob5_to_equity`` is
+    ``(probs * w).sum(dim=-1) - 1.0`` with ``w = [2, 1, 1, -1, -1]``.
+    The elementwise product is unambiguous, but the fp32 reduction over
+    the length-5 last dim is NOT associative, and ATen's CPU sum kernel
+    uses a 4-accumulator cascade: lane j seeds accumulator j, the tail
+    element 4 folds back into accumulator 0, and the accumulators are
+    then combined left to right. That is exactly
+
+        (((p0 + p4) + p1) + p2) + p3        then  ``- 1.0``
+
+    which is what the statements below evaluate (``x + (-y)`` is
+    bit-identical to ``x - y`` in IEEE-754, including the signed-zero
+    cases). Every other plausible order — plain left-to-right, numpy's
+    ``sum``, ``@``, ``einsum``, pairwise trees — disagrees with torch on
+    ~25-60% of random rows by 1 ulp, and a 1-ulp change is enough to
+    flip an ``argmax`` and so change a whole target vector. The
+    ``- 1.0`` is kept (rather than dropped as an argmax-invariant
+    constant) because rounding can map two distinct pre-subtraction
+    values onto one, which would move a first-occurrence tie.
+
+    ``tests/test_prob5_oneply_fast.py`` asserts this equality directly,
+    so a torch upgrade that changes the reduction order fails loudly
+    instead of silently drifting.
+    """
+    e = m[:, 0] * np.float32(2.0)
+    e -= m[:, 4]
+    e += m[:, 1]
+    e += m[:, 2]
+    e -= m[:, 3]
+    e -= np.float32(1.0)
+    return e
+
+
 # ── 1-ply exact Bellman backup ────────────────────────────────────────
 
 
@@ -121,6 +187,182 @@ def _oneply_target_vec(
     gpe_fn: Callable,
     device: str,
 ) -> np.ndarray:
+    """Exact 1-ply Bellman target for `state`.
+
+    Dispatches to the batched `expand_21` fast path when the C engine is
+    in use (`gpe_fn.use_expand21`, set by `_resolve_engine_fns`), and
+    falls back to the per-dice reference implementation otherwise — or
+    when `expand_21` reports a buffer overflow. The two are bit-exact
+    equivalents; see `_oneply_target_vec_expand21`.
+    """
+    if getattr(gpe_fn, "use_expand21", False):
+        fast = _oneply_target_vec_expand21(state, network, encode_fn, device)
+        if fast is not None:
+            return fast
+    return _oneply_target_vec_perdice(
+        state, network, encode_fn, gpe_fn, device,
+    )
+
+
+def _oneply_target_vec_expand21(
+    state: BoardState,
+    network: ProbNetwork,
+    encode_fn: Callable[[BoardState], np.ndarray],
+    device: str,
+) -> Optional[np.ndarray]:
+    """`_oneply_target_vec_perdice` with the 21 move-gen calls and the
+    per-successor Python loops replaced by one `bg_fast.expand_21` C
+    call plus a numpy segment reduction.
+
+    Returns None if `expand_21` is unavailable or overflows its buffers,
+    in which case the caller must use the per-dice path.
+
+    `expand_21` hands back, for the 21 dice in `_DICE_OUTCOMES` order
+    (verified identical to the C loop `d1=1..6, d2=d1..6` in
+    `c_engine/bg_engine.c:1074`):
+      * `base_feats` (n_rows, 196) — the perspective196 encoding of every
+        NON-terminal reply, packed in reply order; a forced-pass dice
+        contributes exactly one row, the encoding of
+        `switch_turn(state)`, which is precisely what the reference path
+        puts in `pass_buf`.
+      * `counts` (21,) — replies per dice, always >= 1.
+      * `gr` (n_replies,) — 0 for a non-terminal reply (consumes the next
+        `base_feats` row), else the winner's game_result 1/2/3, from
+        which `_terminal_target`'s `[1, r>=2, r>=3, 0, 0]` is rebuilt.
+        `game_result_c` mirrors `BoardState.game_result` exactly.
+    All four are fresh copies (`bg_fast.expand_21`), so nothing here
+    aliases a C buffer that a later call would invalidate — and
+    `get_legal_plays_encoded_21` uses its own static play array, so it
+    does not clobber `_play_buf` behind an outstanding `_LazyNextStates`.
+
+    ROW ORDER IS LOAD-BEARING. The reference path feeds the network
+    `pass_buf + play_buf` (all forced-pass rows first); `expand_21`
+    returns replies interleaved in dice order. A CPU MLP forward is
+    *not* bit-invariant under a row permutation — measured 26 differing
+    outputs in 87k on a [80] net and 15 in 82k on [512,512,256], each
+    1 ulp — and 1 ulp is enough to move an argmax. So when any forced
+    pass is present its rows are gathered to the front before the
+    forward and the outputs are scattered back afterwards. Positions
+    with no forced pass (the overwhelming majority) skip the gather
+    entirely, because the two orders already coincide.
+    """
+    exp = _bg_fast.expand_21(state)
+    if exp is None:
+        return None
+    base_feats, counts, gr, n_rows = exp
+    n_replies = gr.shape[0]
+
+    nonterm = gr == 0
+    # Reply-space segment starts (counts >= 1, so strictly increasing —
+    # required for the reduceat calls below).
+    seg = np.empty(len(_DICE_OUTCOMES), dtype=np.int64)
+    seg[0] = 0
+    np.cumsum(counts[:-1], out=seg[1:])
+
+    # ── Forced-pass detection (see ROW ORDER above) ──────────────────
+    # A forced pass is the only way a dice bucket holds exactly one
+    # non-terminal reply whose encoding equals `switch_turn(state)`: any
+    # legal play moves at least one checker, so a real reply's board —
+    # and hence its 196-vector — always differs.
+    order = None
+    if n_rows and bool((counts == 1).any()):
+        single = np.flatnonzero(counts == 1)
+        rep = seg[single]
+        single_nonterm = nonterm[rep]
+        if single_nonterm.any():
+            # reply index -> base_feats row index, for non-terminal replies
+            row_of = np.cumsum(nonterm) - 1
+            rows = row_of[rep[single_nonterm]]
+            pass_enc = encode_fn(switch_turn(state))
+            is_pass = (base_feats[rows] == pass_enc).all(axis=1)
+            if is_pass.any():
+                pass_rows = rows[is_pass]
+                keep = np.ones(n_rows, dtype=bool)
+                keep[pass_rows] = False
+                order = np.concatenate([pass_rows, np.flatnonzero(keep)])
+
+    # ── One forward over every non-terminal reply ────────────────────
+    if n_rows:
+        x_np = base_feats if order is None else base_feats[order]
+        x = torch.from_numpy(x_np).to(device)
+        with torch.no_grad():
+            out = network(x)
+            if network.raw_logits:
+                out = torch.sigmoid(out)
+            out = prob5_postprocess(out)
+        out_np = out.detach().cpu().numpy()
+        if order is not None:
+            inv = np.empty(n_rows, dtype=np.int64)
+            inv[order] = np.arange(n_rows)
+            out_np = out_np[inv]
+    else:
+        out_np = np.empty((0, NUM_OUTPUTS), dtype=np.float32)
+
+    # ── Per-reply mover target vectors ───────────────────────────────
+    if n_rows == n_replies:
+        # No terminal reply anywhere — the common case; skip the scatter.
+        moves = _flip_rows(out_np)
+    else:
+        moves = np.empty((n_replies, NUM_OUTPUTS), dtype=np.float32)
+        moves[nonterm] = _flip_rows(out_np)
+        term_gr = gr[~nonterm]
+        # `_terminal_target`, rebuilt from the C game_result: the mover
+        # just bore off all 15, so it wins, and gr is 1/2/3.
+        term = np.empty((term_gr.shape[0], NUM_OUTPUTS), dtype=np.float32)
+        term[:, 0] = 1.0
+        term[:, 1] = term_gr >= 2
+        term[:, 2] = term_gr >= 3
+        term[:, 3] = 0.0
+        term[:, 4] = 0.0
+        moves[~nonterm] = term
+
+    # ── Per-dice argmax over derived equity, keeping the WHOLE vector ─
+    # `np.argmax` returns the FIRST maximum; reproduce that exactly with
+    # a max-then-lowest-hitting-index reduction. A plain
+    # `argmax.reduceat` does not exist, and reducing on the values alone
+    # would leave the tie-break to whatever order the reduction happened
+    # to visit — which on transpositions (two play sequences reaching
+    # the same board) is a real, frequent tie.
+    eqs = _prob5_equity_np(moves)
+    seg_max = np.maximum.reduceat(eqs, seg)
+    hit = eqs == np.repeat(seg_max, counts)
+    cand = np.where(hit, np.arange(n_replies), n_replies)
+    best = np.minimum.reduceat(cand, seg)
+    if best.max() >= n_replies:
+        # Only reachable if some bucket's equities contain NaN: NaN
+        # poisons `seg_max` and then compares unequal to everything, so
+        # the bucket has no hit. The reference path would instead return
+        # a NaN target here (np.argmax picks the first NaN), which BCE
+        # turns into a NaN loss and a dead net several rounds later.
+        # This is the one intentional behavioural difference: fail now,
+        # loudly, instead of poisoning the run silently.
+        raise ValueError(
+            "prob5 1-ply target: network produced non-finite outputs "
+            "(NaN equity in at least one dice bucket)"
+        )
+
+    # Accumulate exactly as the reference loop does: float32 throughout,
+    # dice in _DICE_OUTCOMES order. `sum(axis=0)` over a (21, 5) float32
+    # block visits rows in order and is bit-identical to the reference's
+    # `target += prob * vec` loop (asserted in the parity tests).
+    target = (moves[best] * _ONEPLY_PROBS32[:, None]).sum(axis=0)
+    return np.clip(target, 0.0, 1.0)
+
+
+def _oneply_target_vec_perdice(
+    state: BoardState,
+    network: ProbNetwork,
+    encode_fn: Callable[[BoardState], np.ndarray],
+    gpe_fn: Callable,
+    device: str,
+) -> np.ndarray:
+    """Reference 1-ply target: 21 separate move-gen calls.
+
+    Kept as the definition of correctness for
+    `_oneply_target_vec_expand21` (and as its fallback). Do not "clean
+    up" the arithmetic here without re-running
+    `tests/test_prob5_oneply_fast.py`.
+    """
     target = np.zeros(NUM_OUTPUTS, dtype=np.float32)
 
     # Two separate buffers so row lookup is unambiguous.
@@ -220,10 +462,13 @@ def _collect_one_episode(
         if oneply:
             # Move selection (0-ply): pick the move with best derived equity
             # from the mover's view. This MUST run *before* `_oneply_target_vec`
-            # below: that call re-invokes `gpe_fn` 21 times, and the C fast path
-            # (`bg_fast.get_legal_plays_encoded`) reuses an internal successor
-            # buffer -- so `features` and the `next_states` objects are only
-            # valid until the next `gpe_fn` call.
+            # below: on the per-dice fallback that call re-invokes `gpe_fn` 21
+            # times, and the C fast path (`bg_fast.get_legal_plays_encoded`)
+            # reuses an internal successor buffer -- so `features` and the
+            # `next_states` objects are only valid until the next `gpe_fn`
+            # call. (The batched `expand_21` path happens to use its own
+            # buffers, but the ordering constraint stands: the fallback is
+            # reachable and both must be safe.)
             if len(next_states):
                 with torch.no_grad():
                     x = torch.from_numpy(features).to(device)
@@ -311,6 +556,11 @@ def _resolve_engine_fns(encoder_name: str = "perspective196"):
     use). Uses the C engine (``bg_fast``) for the perspective196 encoder,
     else the pure-Python engine. Both impls share the
     ``(state, dice, encoder)`` signature and produce identical features.
+
+    ``gpe_fn.use_expand21`` tells ``_oneply_target_vec`` whether the
+    batched all-21-dice C expansion is available for this configuration.
+    It rides on the function rather than being recomputed there because
+    the 1-ply target only ever sees ``gpe_fn``, not ``encoder_name``.
     """
     enc = get_encoder(encoder_name)
     fast = _BG_FAST_AVAILABLE and encoder_name == "perspective196"
@@ -320,6 +570,9 @@ def _resolve_engine_fns(encoder_name: str = "perspective196"):
     def gpe_fn(state, dice, _impl=impl, _enc=enc):
         return _impl(state, dice, _enc)
 
+    gpe_fn.use_expand21 = bool(
+        fast and getattr(_bg_fast, "_HAS_EXPAND21", False)
+    )
     return encode_fn, gpe_fn
 
 
@@ -376,6 +629,25 @@ def _collect_worker(args):
     return np.concatenate(enc_chunks, axis=0), np.concatenate(tgt_chunks, axis=0)
 
 
+def _unique_ckpt_path(path: str) -> str:
+    """Return `path`, or the first free `..._rN` variant if it already exists.
+
+    Periodic checkpoints are named from an episode counter that is local to a
+    single invocation. Resuming a partially-finished leg restarts that counter,
+    so without this a resumed run silently overwrites the earlier run's
+    checkpoints -- and the file that survives is labelled with FEWER episodes
+    than it actually contains, which is a correctness trap as much as a data
+    loss (it will be banked and compared under the wrong label).
+    """
+    if not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    n = 2
+    while os.path.exists(f"{root}_r{n}{ext}"):
+        n += 1
+    return f"{root}_r{n}{ext}"
+
+
 # ── Training loop ─────────────────────────────────────────────────────
 
 
@@ -396,6 +668,7 @@ def train(
     save_path: Optional[str],
     save_every: int,
     warmup_cycles: int,
+    pipeline_collect: bool = False,
 ) -> None:
     """Round-based batch TD(0) on the 5-output prob network.
 
@@ -433,6 +706,50 @@ def train(
     episodes_played = 0
     t0_all = time.time()
 
+    def _build_worker_args(size: int):
+        """Worker args carrying the CURRENT weights. Called eagerly when
+        pipelining, which is what makes those targets one round stale."""
+        # .clone() is REQUIRED, not defensive — the same race dd3cdc9 fixed on
+        # the trainer.py side. train_prob5 does not import trainer.py, so that
+        # fix did not reach here. On a CPU net `.cpu()` is a no-op returning a
+        # VIEW sharing storage with the live parameter, so the tensors handed
+        # to map_async are pickled by the pool's task thread WHILE
+        # optimizer.step() mutates them in place — workers can receive torn
+        # weights. Reachable in exactly the prob5 1-ply recipe (--device cpu +
+        # --pipeline-collect + map_async); NOT on --device cuda, where .cpu()
+        # genuinely copies in the master thread. Harm is bounded (a worker sees
+        # an element-wise blend of net(t) and net(t+1), inside the one-round
+        # staleness pipelining already accepts) and no bad value reaches the
+        # master — workers return only (encodings, targets). But it is a real
+        # nondeterminism source: identical CPU runs diverge. Cost: ~2MB/round.
+        sd = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+        dev = device if oneply else "cpu"
+        return [
+            (
+                sd, net.hidden_sizes, net.input_size, net.activation,
+                net.encoder_name, net.raw_logits, n,
+                rng.randint(0, 2**31 - 1), oneply, dev,
+            )
+            for n in _split_episodes(size, workers) if n > 0
+        ]
+
+    # ── Pipeline pre-roll ─────────────────────────────────────────────
+    # Overlap round N+1's collection with round N's training step, so the
+    # train step hides behind collection instead of serialising after it.
+    use_pipeline = pipeline_collect and pool is not None
+    if pipeline_collect and pool is None:
+        print("  NOTE: --pipeline-collect ignored (needs --workers > 1)")
+    elif use_pipeline:
+        print("  pipelined collection: ON (round N+1 collects during "
+              "round N's training step)")
+
+    pending = None
+    if use_pipeline:
+        pending = pool.map_async(
+            _collect_worker,
+            _build_worker_args(min(episodes_per_round, num_episodes)),
+        )
+
     try:
         for round_idx in range(num_rounds):
             round_size = min(
@@ -453,9 +770,6 @@ def train(
 
             # ── Collect ───────────────────────────────────────────
             t_c0 = time.perf_counter()
-            net_cpu_sd = {
-                k: v.detach().cpu() for k, v in net.state_dict().items()
-            }
             if pool is None:
                 encode_fn, get_legal_plays_fn = _resolve_engine_fns()
                 oneply_dev = device if oneply else "cpu"
@@ -474,18 +788,29 @@ def train(
                         tgt_chunks.append(tgt)
                 if oneply and oneply_dev != "cpu":
                     net.to("cpu")
-            else:
-                splits = _split_episodes(round_size, workers)
-                oneply_dev = device if oneply else "cpu"
-                worker_args = [
-                    (
-                        net_cpu_sd, net.hidden_sizes, net.input_size,
-                        net.activation, net.encoder_name, net.raw_logits,
-                        n, rng.randint(0, 2**31 - 1), oneply, oneply_dev,
+            elif use_pipeline:
+                # This round's collect was submitted last iteration (or
+                # pre-loop). Submit the NEXT round's collect BEFORE
+                # training, so those workers run during the master's train
+                # step. They see the CURRENT weights, which makes their
+                # targets one round stale.
+                next_pending = None
+                if round_idx + 1 < num_rounds:
+                    next_size = min(
+                        episodes_per_round,
+                        num_episodes - (episodes_played + round_size),
                     )
-                    for n in splits if n > 0
-                ]
-                results = pool.map(_collect_worker, worker_args)
+                    if next_size > 0:
+                        next_pending = pool.map_async(
+                            _collect_worker, _build_worker_args(next_size),
+                        )
+                results = pending.get()
+                pending = next_pending
+                enc_chunks = [r[0] for r in results if len(r[0]) > 0]
+                tgt_chunks = [r[1] for r in results if len(r[1]) > 0]
+            else:
+                results = pool.map(_collect_worker,
+                                   _build_worker_args(round_size))
                 enc_chunks = [r[0] for r in results if len(r[0]) > 0]
                 tgt_chunks = [r[1] for r in results if len(r[1]) > 0]
             t_collect = time.perf_counter() - t_c0
@@ -574,7 +899,12 @@ def train(
                 )
 
             if save_path and save_every > 0 and episodes_played % save_every < round_size:
-                ck_path = f"{save_path}_ep{episodes_played}.pt"
+                # NEVER overwrite. `episodes_played` counts within THIS run, so
+                # a leg resumed from a partial restarts it at 0 and would
+                # silently clobber the earlier run's checkpoints -- and the
+                # surviving file then carries a name that understates how much
+                # training it contains, which is worse than losing it.
+                ck_path = _unique_ckpt_path(f"{save_path}_ep{episodes_played}.pt")
                 net.save(ck_path)
                 print(f"    -> checkpoint saved to {ck_path}")
 
@@ -584,8 +914,16 @@ def train(
             pool.join()
 
     if save_path:
-        net.save(save_path)
-        print(f"Saved final network to {save_path}")
+        # Same never-overwrite rule as the periodic checkpoints: a resumed
+        # leg re-run with the same --save must not clobber the previous
+        # leg's final model.
+        final_path = _unique_ckpt_path(save_path)
+        net.save(final_path)
+        if final_path != save_path:
+            print(f"NOTE: {save_path} already exists -- final network "
+                  f"saved to {final_path} instead (never overwrite).")
+        else:
+            print(f"Saved final network to {final_path}")
 
     elapsed = time.time() - t0_all
     gps = num_episodes / elapsed if elapsed > 0 else 0.0
@@ -595,12 +933,138 @@ def train(
 # ── CLI ───────────────────────────────────────────────────────────────
 
 
+def _warm_start_equity_trunk(
+    path: str,
+    target_hidden: List[int],
+    activation: str,
+    raw_logits: bool,
+) -> ProbNetwork:
+    """Initialise a fresh prob5 net's leading trunk layers from a cubeless
+    EQUITY checkpoint (``TDNetwork``).
+
+    The two architectures share **no** parameter keys: ``TDNetwork`` stores
+    ``hidden_layers.{i}`` + ``fc_output``, while ``ProbNetwork`` uses an
+    ``nn.Sequential`` trunk (``trunk.{2*i}``, with the activation at the odd
+    indices) + ``head``. Hidden layer ``i`` therefore maps
+    ``hidden_layers.{i}`` -> ``trunk.{2*i}``, copied for the LEADING
+    PREFIX of layers whose shapes match exactly (copying stops at the
+    first mismatch). ``head`` is never written: it is a different task
+    head (5 probabilities vs 1 equity).
+
+    Note ``TDNetwork.save`` does not record ``model_type``, so
+    ``ProbNetwork.load``'s guard does not catch an equity checkpoint — which
+    is why ``--resume`` on one dies with a raw torch key error instead of a
+    useful message. Hence the explicit validation here.
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+
+    model_type = ckpt.get("model_type")
+    if model_type is not None and model_type != "td":
+        raise ValueError(
+            f"--warm-start-equity-trunk: {path} has model_type="
+            f"{model_type!r}; expected a cubeless-money EQUITY (TDNetwork) "
+            "checkpoint."
+        )
+    output_mode = ckpt.get("output_mode")
+    if output_mode is not None and output_mode != "equity":
+        raise ValueError(
+            f"--warm-start-equity-trunk: {path} has output_mode="
+            f"{output_mode!r}, not 'equity'."
+        )
+    src_act = ckpt.get("activation")
+    if src_act is not None and src_act != activation:
+        raise ValueError(
+            f"--warm-start-equity-trunk: {path} was trained with "
+            f"activation={src_act!r} but the target net uses "
+            f"activation={activation!r}. Trunk weights are not "
+            f"transferable across activations; pass --activation "
+            f"{src_act} or pick a matching source checkpoint."
+        )
+    if src_act is None:
+        print(f"  WARNING: {path} records no activation; assuming it "
+              f"matches the target's ({activation}).")
+    src_sd = ckpt.get("state_dict")
+    if not src_sd or not any(k.startswith("hidden_layers.") for k in src_sd):
+        raise ValueError(
+            f"--warm-start-equity-trunk: {path} has no 'hidden_layers.*' "
+            "parameters — it is not a TDNetwork checkpoint."
+        )
+
+    src_hidden = ckpt.get("hidden_sizes")
+    net = ProbNetwork(
+        hidden_sizes=target_hidden,
+        input_size=ckpt.get("input_size", 196),
+        activation=activation,
+        encoder_name=ckpt.get("encoder_name", "perspective196"),
+        raw_logits=raw_logits,
+    )
+    dst_sd = net.state_dict()
+    new_sd = {k: v.clone() for k, v in dst_sd.items()}
+
+    copied: List[int] = []
+    n_copied = 0
+    for i in range(len(target_hidden)):
+        pairs = [
+            (f"hidden_layers.{i}.{suf}", f"trunk.{2 * i}.{suf}")
+            for suf in ("weight", "bias")
+        ]
+        if not all(
+            sk in src_sd and dk in dst_sd
+            and src_sd[sk].shape == dst_sd[dk].shape
+            for sk, dk in pairs
+        ):
+            # Copy only a LEADING prefix. A later layer that happens to
+            # re-match after a mismatch would sit on top of random-init
+            # earlier layers and receive garbage activations -- worse
+            # than a fresh init, and invisible in the summary.
+            break
+        for sk, dk in pairs:
+            new_sd[dk] = src_sd[sk].clone()
+            n_copied += new_sd[dk].numel()
+        copied.append(i)
+    net.load_state_dict(new_sd)
+
+    # Loud summary: this whole flag previously did nothing at all, silently,
+    # so it must be impossible to not notice what it did.
+    total = sum(v.numel() for v in new_sd.values())
+    print(f"Warm-started trunk from EQUITY checkpoint {path}")
+    print(f"  source hidden={src_hidden} -> target hidden={target_hidden}")
+    for i in range(len(target_hidden)):
+        dst_shape = tuple(dst_sd[f"trunk.{2 * i}.weight"].shape)
+        sk = f"hidden_layers.{i}.weight"
+        src_shape = tuple(src_sd[sk].shape) if sk in src_sd else None
+        if i in copied:
+            print(f"  layer {i} -> trunk.{2 * i}: COPIED {dst_shape}")
+        elif src_shape == dst_shape:
+            print(f"  layer {i} -> trunk.{2 * i}: FRESH (shapes match, "
+                  "but an earlier layer mismatched -- only a leading "
+                  "prefix is copied)")
+        else:
+            print(f"  layer {i} -> trunk.{2 * i}: FRESH "
+                  f"(source {src_shape} vs target {dst_shape})")
+    print("  head (5-output): FRESH — never copied from a 1-output "
+          "equity head")
+    print(f"  => {n_copied}/{total} params warm-started "
+          f"({100.0 * n_copied / total:.1f}%)")
+
+    if not copied:
+        raise ValueError(
+            "--warm-start-equity-trunk copied ZERO layers — refusing to "
+            "train from what would be a random init. Check that --hidden "
+            f"is compatible with the source architecture {src_hidden}."
+        )
+    return net
+
+
 def _build_network(args) -> ProbNetwork:
-    """Resolve --resume / --expand / --expand-depth / fresh."""
-    sources = [args.resume, args.expand, args.expand_depth]
+    """Resolve --resume / --expand / --expand-depth / --warm-start-equity-trunk
+    / fresh."""
+    sources = [args.resume, args.expand, args.expand_depth,
+               args.warm_start_equity_trunk]
     if sum(1 for s in sources if s) > 1:
         raise ValueError(
-            "--resume, --expand, --expand-depth are mutually exclusive"
+            "--resume, --expand, --expand-depth, --warm-start-equity-trunk "
+            "are mutually exclusive"
         )
 
     target_hidden = (
@@ -642,6 +1106,17 @@ def _build_network(args) -> ProbNetwork:
         )
         return net
 
+    if args.warm_start_equity_trunk:
+        if target_hidden is None:
+            raise ValueError(
+                "--warm-start-equity-trunk requires --hidden <target sizes> "
+                "(otherwise the default [80] would silently be used)"
+            )
+        return _warm_start_equity_trunk(
+            args.warm_start_equity_trunk, target_hidden,
+            args.activation, args.raw_logits,
+        )
+
     if target_hidden is None:
         target_hidden = [80]
     return ProbNetwork(
@@ -649,6 +1124,40 @@ def _build_network(args) -> ProbNetwork:
         activation=args.activation,
         raw_logits=args.raw_logits,
     )
+
+
+
+def reject_cuda_oneply(args):
+    """Refuse ``--oneply`` with a non-CPU device, loudly.
+
+    prob5 1-ply GPU collection is UNSUPPORTED in this release, by
+    measurement, not omission: a bit-exact vectorized GPU collector was
+    built and A/B'd on this codebase and lost to the CPU pipeline
+    (130.6 ep/s best GPU sweep vs 251 ep/s CPU at the production
+    W=64 --pipeline-collect config; see
+    experiments/benchmarks/prob5_collect_levers_ab.md). Worse, the previous
+    behavior of this flag combination put the net on the GPU in EVERY
+    worker (~64 CUDA contexts ~= 16 GB) -- an OOM bomb on consumer
+    cards. Refusing is strictly better than either: nothing is lost,
+    because under --pipeline-collect the master train step hides behind
+    collection, so cuda buys ~0%% at 1-ply even where it fits.
+
+    0-ply training (no --oneply) keeps full --device cuda support
+    (+82%% on the train step); every published 1-ply recipe of record
+    already passes --device cpu.
+    """
+    if args.oneply and args.device != "cpu":
+        raise SystemExit(
+            "ERROR: prob5 1-ply training does not support --device "
+            f"{args.device!r} in this release. The GPU collector was "
+            "built, validated bit-exact, and measured SLOWER than the "
+            "CPU pipeline on this codebase "
+            "(experiments/benchmarks/prob5_collect_levers_ab.md); the old behavior "
+            "also opened one CUDA context per worker and OOM'd consumer "
+            "GPUs. Use --device cpu for 1-ply legs (the recipes of "
+            "record all do); --device cuda remains supported (and "
+            "recommended, +82%) for 0-ply training."
+        )
 
 
 def main():
@@ -670,6 +1179,10 @@ def main():
     g_io = p.add_argument_group("i/o")
     g_io.add_argument("--resume", default=None,
                       help="Resume training from a saved prob5 checkpoint.")
+    g_io.add_argument("--warm-start-equity-trunk", default=None,
+                      help="Init leading trunk layers from a cubeless-money "
+                           "EQUITY checkpoint (TDNetwork); mismatched deeper "
+                           "layers and the 5-head output start fresh")
     g_io.add_argument("--expand", default=None,
                       help="Width-expand from a smaller prob5 checkpoint "
                            "to --hidden.")
@@ -709,8 +1222,14 @@ def main():
     g_train.add_argument("--seed", type=int, default=None)
     g_train.add_argument("--log-every", type=int, default=1)
     g_train.add_argument("--torch-seed", type=int, default=None)
+    g_train.add_argument("--pipeline-collect", action="store_true",
+                         help="overlap round N+1's collection with round N's "
+                              "training step (needs --workers>1). Targets "
+                              "become one round stale.")
 
     args = p.parse_args()
+
+    reject_cuda_oneply(args)
 
     if args.torch_seed is not None:
         torch.manual_seed(args.torch_seed)
@@ -740,6 +1259,7 @@ def main():
         save_path=save_path,
         save_every=args.save_every,
         warmup_cycles=args.warmup_cycles,
+        pipeline_collect=args.pipeline_collect,
     )
 
 

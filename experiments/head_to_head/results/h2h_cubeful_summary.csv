@@ -1,0 +1,12 @@
+# Main-results convention (2026-07-26): capped(+/-128) mean mEq/game, Jacoby on,
+# gnubg = REAL 1.08.003 binary (native money cube) via gnubg-ext / gnubg-ext-full;
+# 1-ply opponents UNPRUNED (SAGE_UNPRUNED=1 for Sage). --log-runaway 256 archives
+# redouble-war games; they are INCLUDED (capped estimator). Wrapper-era rows
+# (21-pt cube approximation) superseded — see git history; head-to-head the two
+# gnubg implementations are equal (+2.7 [-0.2,+5.5], 4M).
+side1,side1_plies,side2,side2_plies,mode,games,capped_edge_mEq,ci_lo,ci_hi
+PureTD_4L,0,gnubg-ext,0,cubeful-money,10000000,78.7,76.9,80.5
+PureTD_4L,0,gnubg-ext-full,1,cubeful-money,10000000,22.4,20.5,24.2
+PureTD_4L,0,opensage-analyzer,0,cubeful-money,10000000,85.9,84.0,87.8
+PureTD_4L,0,opensage-analyzer_unpruned,1,cubeful-money,10000000,19.0,17.0,21.0
+gnubg-ext-full,1,opensage-analyzer_unpruned,1,cubeful-money,10000000,0.1,-1.9,2.1

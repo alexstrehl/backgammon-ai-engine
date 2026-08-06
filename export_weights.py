@@ -127,6 +127,39 @@ def verify_export(model_path: str, bin_path: str):
     print("  (Run C inference on same input to compare)")
 
 
+def export_live(model, output_path: str):
+    """Export an in-memory TDNetwork (not a .pt path) to BGNN binary.
+
+    Used to refresh the C engine's weights between training rounds without
+    a disk round-trip through .pt. Mirrors export_model's TDNetwork branch.
+    """
+    act_id = ACTIVATION_MAP.get(model.activation)
+    if act_id is None:
+        raise ValueError(f"Unsupported activation '{model.activation}'")
+    if isinstance(model, ProbNetwork):
+        # prob5: hidden linears live in `trunk`, the 5-output layer is `head`
+        # (mirrors export_model's ProbNetwork branch). C applies sigmoid.
+        hidden_layers = [m for m in model.trunk if isinstance(m, nn.Linear)]
+        output_layer = model.head
+        output_mode_id = OUTPUT_MODE_PROB5
+    else:
+        hidden_layers = list(model.hidden_layers)
+        output_layer = model.fc_output
+        output_mode_id = OUTPUT_MODE_MAP.get(model.output_mode, 0)
+    with open(output_path, "wb") as f:
+        f.write(b"BGNN")
+        f.write(struct.pack("<i", len(model.hidden_sizes)))
+        f.write(struct.pack("<i", model.input_size))
+        f.write(struct.pack("<i", act_id))
+        f.write(struct.pack("<i", output_mode_id))
+        for hs in model.hidden_sizes:
+            f.write(struct.pack("<i", hs))
+        for layer in hidden_layers + [output_layer]:
+            w = layer.weight.detach().cpu().numpy().astype(np.float32)
+            b = layer.bias.detach().cpu().numpy().astype(np.float32)
+            f.write(w.tobytes()); f.write(b.tobytes())
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <model.pt> [output.bin]")
