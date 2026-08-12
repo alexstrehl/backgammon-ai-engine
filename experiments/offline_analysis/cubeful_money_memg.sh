@@ -50,8 +50,8 @@ python3 experiments/offline_analysis/run_cubeful_memg.py \
     --save-pergame "$OUT"
 
 # --- Open Sage 1-ply (cube-aware analyzer self-play; needs bgsage) ----------
-# SAGE_UNPRUNED=1 reproduces the PUBLISHED paper-convention row (2.258);
-# without it you get the production-filter robustness row (2.238).
+# SAGE_UNPRUNED=1 reproduces the PUBLISHED paper-convention row (2.258); drop
+# the env var and you are measuring Sage's production filter instead.
 SAGE_UNPRUNED=1 python3 experiments/offline_analysis/run_cubeful_memg.py \
     --players sage-analyzer-1ply \
     --games "$GAMES" --plies "$PLIES" --chunk "$CHUNK" \

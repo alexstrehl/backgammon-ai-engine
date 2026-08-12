@@ -275,6 +275,7 @@ typedef struct {
     unsigned int hashes[HASH_TABLE_SIZE];
     BoardState   states[HASH_TABLE_SIZE];
     int occupied[HASH_TABLE_SIZE];
+    int play_idx[HASH_TABLE_SIZE];  /* index into GenContext.plays, or -1 */
     int count;
 } BoardHashSet;
 
@@ -283,11 +284,13 @@ static void hashset_init(BoardHashSet *hs) {
     hs->count = 0;
 }
 
-/* Returns 1 if the state was already in the set, 0 if newly inserted. */
-static int hashset_insert(BoardHashSet *hs, const BoardState *s) {
+/* Insert (or find) a state. Sets *existed to 1 if it was already present.
+ * Returns the slot index, or -1 if the table is full (treat as new). */
+static int hashset_insert(BoardHashSet *hs, const BoardState *s, int *existed) {
     unsigned int h = board_hash(s);
     unsigned int idx = h & HASH_MASK;
 
+    *existed = 0;
     /* Linear probing with full state comparison */
     for (int i = 0; i < HASH_TABLE_SIZE; i++) {
         unsigned int probe = (idx + i) & HASH_MASK;
@@ -296,14 +299,16 @@ static int hashset_insert(BoardHashSet *hs, const BoardState *s) {
             hs->hashes[probe] = h;
             memcpy(&hs->states[probe], s, sizeof(BoardState));
             hs->occupied[probe] = 1;
+            hs->play_idx[probe] = -1;
             hs->count++;
-            return 0;  /* newly inserted */
+            return (int)probe;  /* newly inserted */
         }
         if (hs->hashes[probe] == h && board_equal(&hs->states[probe], s)) {
-            return 1;  /* exact duplicate */
+            *existed = 1;
+            return (int)probe;  /* exact duplicate */
         }
     }
-    return 0;  /* table full, insert anyway */
+    return -1;  /* table full: no slot; caller records the play anyway */
 }
 
 /* ── Internal: recursive play generation ───────────────────────── */
@@ -376,8 +381,11 @@ static void generate_plays(
         }
 
         /* Deduplicate by board state during recursion (like Python).
-         * Only record if this resulting state hasn't been seen yet. */
-        if (!hashset_insert(ctx->seen, state)) {
+         * On a collision keep the play using MORE dice — see
+         * backgammon_engine._generate_plays for why (false forced pass). */
+        int existed = 0;
+        int slot = hashset_insert(ctx->seen, state, &existed);
+        if (!existed) {
             /* New unique state: record this play */
             if (ctx->count < ctx->max_plays) {
                 Play *p = &ctx->plays[ctx->count];
@@ -386,7 +394,22 @@ static void generate_plays(
                     p->moves[i] = current_moves[i];
                 }
                 memcpy(&p->resulting_state, state, sizeof(BoardState));
+                if (slot >= 0) {
+                    ctx->seen->play_idx[slot] = ctx->count;
+                }
                 ctx->count++;
+            }
+        } else if (slot >= 0) {
+            int pi = ctx->seen->play_idx[slot];
+            /* pi may be stale if max_plays was hit: state seen, play not stored */
+            if (pi >= 0 && pi < ctx->count
+                && num_current_moves > ctx->plays[pi].num_moves) {
+                Play *p = &ctx->plays[pi];
+                p->num_moves = num_current_moves;
+                for (int i = 0; i < num_current_moves; i++) {
+                    p->moves[i] = current_moves[i];
+                }
+                /* resulting_state is identical by definition */
             }
         }
     }

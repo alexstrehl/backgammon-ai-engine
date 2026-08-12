@@ -46,8 +46,8 @@ run() {  # run "<comma-separated players>"
 run prob5-0ply,prob5-1ply        # PureTD-prob5 (ours)
 run gnubg-ext-0ply,gnubg-ext-1ply  # real gnubg 1.08 (external socket; 1-ply unpruned)
 run sage-0ply                    # Open Sage 0-ply (production filter = published row)
-# Published sage-1ply row (1.669, paper convention) is UNPRUNED; without the
-# env var this reproduces the production-filter robustness row (1.768).
+# The published sage-1ply row (1.669) is UNPRUNED, the paper convention; drop
+# the env var and you are measuring Sage's production filter instead.
 SAGE_UNPRUNED=1 run sage-1ply    # Open Sage 1-ply unpruned
 
 # --- process output: pooled equal-n table (chequer + overall mEMG, bootstrap 95% CIs) ---

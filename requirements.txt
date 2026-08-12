@@ -4,6 +4,6 @@ torch
 numpy==1.26.3
 scipy
 gnubg-nn==1.1.0a8
-bgsage==0.8.20260611
+bgsage==1.3.20260723
 # Plus, for the paper's gnubg-ext opponents and the mEMG judge:
 #   GNU Backgammon 1.08.003 binary (weights md5 14184acc...) on PATH or GNUBG_CMD

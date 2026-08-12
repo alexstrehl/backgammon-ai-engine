@@ -1,0 +1,115 @@
+# VALUES SUPERSEDED 2026-08-11: the same rows now carry five-sweep means and
+# t-intervals in selfplay_zen3_epyc7713p_20260811.txt / selfplay_zen5_9995wx_20260811.txt
+# (one bench.sh sweep times both methodologies). This file is retained for its
+# analysis notes -- cube-state sensitivity, the Sage cube overhead finding, the
+# Zen3->Zen5 asymmetry -- which are not duplicated there. Prefer the 20260811 files
+# for any quoted number.
+#
+# Fixed-pool CUBEFUL per-decision benchmark — consolidated results
+# Supersedes fixedpool_cubeful_20260805.txt (every row — native AND gnubg —
+#   re-swept 2026-08-09; all rows agree with the prior sweeps within ~5.3%,
+#   see REPRODUCIBILITY below).
+# SHARED COMMITTED POOL (fixedpool_cubeful_positions.json): the first 10,000
+#   checker points (board + dice + cube state) and first 6,000 cube points
+#   (board + cube state) of one seeded prod-cubeful money self-play pass
+#   (253 games, jacoby on, seed 1). ALL engines replay IDENTICAL positions
+#   with IDENTICAL per-position cube states; 48.8% of cube points are recube
+#   situations (cube >= 2, owned) — the realistic in-play mix.
+# EVERY row covers the FULL pool: all 10,000 checker and all 6,000 cube
+#   points for every engine (no caps).
+# Two per-decision costs, isolated (unlike self-play, which blends them):
+#   checker = pick the move with the cube live; cube = the cubeful evaluation
+#   a money cube action consists of.
+# PureTD/Sage rows: fixedpool_bench.py --mode cubeful --cap 10000 (production
+#   choose_checker_action_cubeful / offer_double; fakeintel preloaded on AMD).
+#   Open Sage is bgsage 1.3; analyzer = default production move filter (same
+#   configuration as the self-play SAGE-AN production rows); 0-ply =
+#   sage_plies=1 ("1P"), 1-ply = sage_plies=2 ("2P"). Each Sage row measured
+#   with only light prior single-core load (see ORDER NOTE).
+# gnubg rows: official 1.08.003 threads-disabled build, fixedpool_bench_gnubg.py
+#   (GNUBG_FP_MODE=cubeful) — findbestmove at a CUBEFUL evalcontext (checker,
+#   all 10000 pts) and cfevaluate -> FindCubeDecision (cube, all 6000 pts;
+#   the same function gnubg's native money player calls), each call under the
+#   point's own cubeinfo (cube value + owner; jacoby on).
+# All rows single pinned core (Zen3 core 100, Zen5 core 120), idle box, warm,
+#   ratio-of-sums estimator with item resampling (see cubeless file).
+#   ms/decision (dec/s [95% CI]).
+# 2-ply configs are not part of the suite (not used in the paper).
+#
+# engine             decision   Zen3_EPYC7713P(core100)        Zen5_TRPRO9995WX(core120)
+gnubg-0ply           checker    0.052  (19176 [18665,19777])   0.031  (32319 [31419,33328])
+gnubg-0ply           cube       0.0055 (181838 [180487,183284]) 0.0028 (351948 [349818,354278])
+PureTD-0ply(4L-cf)   checker    0.420  (2379 [2332,2425])      0.160  (6250 [6115,6378])
+PureTD-0ply(4L-cf)   cube       0.204  (4893 [4877,4907])      0.051  (19479 [19470,19488])
+OpenSage-0ply(anlz)  checker    1.847  (541 [525,556])         0.727  (1375 [1312,1430])
+OpenSage-0ply(anlz)  cube       28.18  (35.5 [35.5,35.5])      11.24  (89.0 [89.0,89.0])
+OpenSage-1ply(anlz)  checker    38.57  (25.9 [25.1,26.8])      23.34  (42.8 [41.4,44.4])
+OpenSage-1ply(anlz)  cube       29.17  (34.3 [34.2,34.4])      14.80  (67.6 [67.4,67.7])
+gnubg-1ply           checker    1.235  (810 [792,831])         0.740  (1352 [1321,1387])
+gnubg-1ply           cube       0.4196 (2383 [2340,2428])      0.2588 (3865 [3794,3942])
+#
+# REPRODUCIBILITY vs the prior sweeps (native rows 2026-08-05, gnubg rows
+#   2026-08-02; same pool, different pinned cores):
+#   PureTD    0.412->0.420 / 0.201->0.204 (Zen3), 0.155->0.160 / 0.052->0.051 (Zen5)
+#   Sage-0ply 1.896->1.847 / 26.95->28.18 (Zen3), 0.713->0.727 / 10.88->11.24 (Zen5)
+#   Sage-1ply 38.68->38.57 / 29.24->29.17 (Zen3), 22.78->23.34 / 14.40->14.80 (Zen5)
+#   gnubg ck  0.053->0.052 / 1.295->1.235 (Zen3), 0.031->0.031 / 0.728->0.740 (Zen5)
+#   gnubg cu  0.0053->0.0055 / 0.4432->0.4196 (Zen3), 0.0027->0.0028 / 0.2524->0.2588 (Zen5)
+#   Largest move is 5.3% (gnubg-1ply CUBE, Zen3: 0.4432->0.4196); next is 4.6%
+#   (gnubg-1ply checker, Zen3). So the spread is ~5%, not 'under 5%'.
+#   ESTIMATOR NOTE: gnubg-0ply CUBE is the one row where the block->item
+#   resampling switch itself moves the number. That call is ~2.8 us, so the
+#   ~57 ns/call extra timing overhead of per-call timing is ~4% of it: an A/B
+#   on the identical pool measured -4.2%, and the row moved -4.0%
+#   (366601 -> 351948, Zen5). Read that row as a slight over-estimate of cost;
+#   at >=100 us/call every other row is unaffected (<0.1%).
+#   NOTE: these sweeps used DIFFERENT pinned cores (16/8 then 120/100), so
+#   this is NOT a pure run-to-run drift measurement. AMD bins cores and an
+#   idle Zen 5 shows a 10.5% spread across them, tracking the kernel's CPPC
+#   ranking at Spearman r=0.94 -- so an unknown part of every move above is
+#   core binning, not drift. Same-core repeats give a between-run sd of ~1%.
+# ORDER NOTE (Sage cube row): Sage-1ply cube measured 16.63 ms (Zen5) when
+#   run immediately after the Sage-0ply rows' ~2 min of sustained single-core
+#   load, vs 14.80 ms standalone (matching the 2026-08-02 and 2026-08-05
+#   standalone values, 14.42 / 14.40) — a ~12% sensitivity to preceding load
+#   with tight within-run CIs. Committed values are from the
+#   light-prior-load condition, the same condition as every other row.
+# SAGE CUBE IS FIXED-OVERHEAD-BOUND: its 0-ply cube call costs nearly as much
+#   as its 1-ply one (28.18 vs 29.17 ms Zen3; 11.24 vs 14.80 Zen5) — the cube
+#   machinery, not net evaluation depth, dominates (matches the self-play
+#   finding that Sage's cubeful cost is cube-bound). Its 1-ply cube primitive
+#   is ~70x gnubg's (29.17 vs 0.4196 ms, Zen3).
+# CUBE-STATE NOTE: per-position cube states matter — measured directly
+#   (3000 boards, Zen3, 1-ply cfevaluate, 2026-08-05 microbenchmark, not
+#   re-run): centered 0.409 ms vs owned-at-2 0.385 vs owned-at-4 0.337
+#   (0-ply: 0.0045 vs 0.0025). Recube evaluations are CHEAPER, so a
+#   constant-centered convention would overstate gnubg's cube cost; the
+#   shared pool avoids the approximation.
+# These are ISOLATED primitive costs: for cache-reusing engines (gnubg, Sage)
+#   they overstate the amortized in-play cube cost — in real play the pre-roll
+#   cube evaluation shares its lookahead leaves with the same turn's move
+#   search and prior turns' analysis (gnubg self-play marginal cube cost at
+#   1-ply is 0.150 ms vs 0.4196 ms here). The self-play table is the amortized
+#   comparison; the two methodologies bracket real cost.
+# Zen3->Zen5 ASYMMETRY (PureTD cube 4.0x vs checker 2.6x) is real, not an
+#   artifact — verified by direct microbenchmark on idle boxes (2026-08-05,
+#   not re-run): the cube op is a BATCH-2 forward (offer_double evaluates the
+#   no-double + double-take perspectives in one 2-row batch,
+#   td_agent.offer_double), and the bare batch-2 net forward measures 149us
+#   Zen3 vs 37us Zen5 = 4.0x (small-batch GEMV is vector-width/overhead-bound:
+#   Zen5 has AVX-512 + higher IPC + DDR5 bandwidth; Zen3 is AVX2 — Zen5
+#   batch-1 and batch-2 cost the SAME 37-38us, i.e. fully overhead-bound),
+#   while batch~20 checker forwards ratio only 2.25x (GEMM-efficient on both)
+#   plus ~1.7x-scaling C move-gen. Self-play attribution corroborates
+#   independently: cube 0.237 (Zen3) vs 0.070 (Zen5) = 3.4x against checker
+#   0.406 vs 0.155 = 2.6x — the attributed cube cost is a small difference of
+#   large wall-clocks and so noisier than the fixed-pool figure, but it puts
+#   the cube ratio well above the checker ratio by both methods.
+# Cross-check vs the self-play cubeful table: recombining PureTD's two clean
+#   latencies at the self-play decision mix reproduces the self-play
+#   wall-clock within noise (Zen3: 67076 checker x 0.420ms + 49132 cube x
+#   0.204ms = 38.19s vs the run's 38.88s, 1.8%).
+# Run-to-run: sub-0.25ms rows drift ~8-12% between sweeps on boost clock;
+#   CIs are within-run only.
+# Raw sweep logs (2026-08-09, both hosts) are archived outside the repo;
+#   available from the authors on request.

@@ -43,10 +43,36 @@ class _LCG:
 # Sage's analyzer floors at ~2 threads) this makes wall-time equal true
 # single-core cost. Override core with BENCH_CORE, disable with BENCH_NO_PIN.
 if not os.environ.get("BENCH_NO_PIN"):
-    os.sched_setaffinity(0, {int(os.environ.get("BENCH_CORE", "0"))})
+    _env = os.environ.get("BENCH_CORE", "").strip()
+    if _env:
+        # An explicitly requested core must be honored — fail loudly.
+        _core = int(_env)
+        if _core == 0:
+            raise SystemExit("BENCH_CORE=0 is the IRQ core; pick another core")
+        try:
+            os.sched_setaffinity(0, {_core})
+        except AttributeError:
+            raise SystemExit("sched_setaffinity unavailable on this platform; "
+                             "set BENCH_NO_PIN=1 to run unpinned")
+        except OSError as e:
+            raise SystemExit("cannot pin to core %d (%s); pick a core this host has"
+                             % (_core, e))
+    else:
+        # No core requested: prefer 8 (core 0 handles IRQs), else the highest
+        # core this process may use.
+        try:
+            _avail = os.sched_getaffinity(0)
+            _core = 8 if 8 in _avail else max(_avail)
+            os.sched_setaffinity(0, {_core})
+            if _core != 8:
+                print("[bench] BENCH_CORE unset; pinned to core %d" % _core)
+        except (AttributeError, OSError):
+            print("[bench] cannot pin on this platform; running unpinned")
 
 
 PLIES = [int(x) for x in os.environ.get("GNUBG_BENCH_PLIES", "0,1").split(",")]
+RESET_EVERY = int(os.environ.get("GNUBG_RESET_EVERY", "250"))
+WARMUP_S = float(os.environ.get("BENCH_WARMUP_S", "3.0"))
 NGAMES = {0: int(os.environ.get("GNUBG_BENCH_G0", "150")),
           1: int(os.environ.get("GNUBG_BENCH_G1", "40")),
           2: int(os.environ.get("GNUBG_BENCH_G2", "20"))}
@@ -121,13 +147,32 @@ for plies in PLIES:
         # roll) — untimed, so exclude it from the counts as well. The old
         # aggregate counter included it: a ~1/N dec/s inflation.
         n0 = len(count_record())
+        # Ramp the pinned core before timing (cannot import bench_common:
+        # gnubg's embedded Python has no torch). These are the shortest timed
+        # regions in the suite (0.34-0.80 s), so the most cold-exposed.
+        _t_end = time.time() + WARMUP_S
+        _x = 0.0
+        while time.time() < _t_end:
+            for _ in range(10000):
+                _x = _x * 1.000001 + 1.0
+        del _x  # accumulator exists only to keep the spin loop live
         gdts = []
-        for _ in range(ngames):
+        per_game = []
+        # gnubg's per-game bookkeeping scales with the session record's
+        # length (3.5 -> 6.1 ms/game over 2000 games); reset periodically to
+        # remove the artifact. Counts are harvested BEFORE each reset, so the
+        # per-game (time, decisions) pairs match an unreset run. 'new session'
+        # does not clear the evaluation cache.
+        for i in range(ngames):
+            if RESET_EVERY and i and i % RESET_EVERY == 0:
+                per_game.extend(count_record()[n0:])
+                gnubg.command("new session")
+                n0 = len(count_record())
             t0 = time.perf_counter()
             gnubg.command("new game")
             gdts.append(time.perf_counter() - t0)
         dt = sum(gdts)
-        per_game = count_record()[n0:]
+        per_game.extend(count_record()[n0:])
         assert len(per_game) == ngames, (n0, len(per_game), ngames)
         nch = sum(g[0] for g in per_game)
         nopp = sum(g[1] for g in per_game)
@@ -143,9 +188,10 @@ for plies in PLIES:
             c_ch_time = dt / nch
         else:
             c_cu_time = (dt - nch * c_ch_time) / max(nopp + nresp, 1)
+            # negative residual = below run-to-run noise, not a real cost
             print("GNUBG %d-ply ATTRIBUTION: checker %.3f ms/dec (%.1f dec/s) | cube %.3f ms/dec (%.1f dec/s)"
                   % (plies, 1000 * c_ch_time, 1 / c_ch_time,
                      1000 * c_cu_time,
-                     1 / c_cu_time if c_cu_time > 0 else float("inf")),
+                     (1 / c_cu_time) if c_cu_time > 0 else float("nan")),
                   flush=True)
 print("ALLDONE", flush=True)

@@ -1,7 +1,7 @@
 """Open Sage (``bgsage``) opponents for head-to-head evaluation.
 
 OPTIONAL module: everything here needs ``pip install bgsage``
-(pinned: v0.8.20260611, commit e09bf9c) — but bgsage is imported LAZILY inside
+(pinned: v1.3.20260723) — but bgsage is imported LAZILY inside
 the classes, and nothing in the training codebase imports this module. Open
 Sage is a baseline opponent for reproducing the H-H tables, not a dependency
 of training.

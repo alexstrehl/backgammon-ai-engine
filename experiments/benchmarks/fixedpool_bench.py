@@ -9,7 +9,7 @@ compute is isolated from game length / dice. Block-bootstrap 95% CIs
 
   cubeless : prob5 + Open Sage checker throughput on the committed 8000-pos
              pool (fixedpool_positions.json). Configs via --configs:
-             prob5-0ply, prob5-1ply, sage-1P (=0-ply), sage-2P (=1-ply).
+             prob5-0ply, prob5-1ply, sage-0ply (XG 1P), sage-1ply (XG 2P).
   cubeful  : PureTD + Open Sage (0-ply + 1-ply analyzer) cubeful checker AND
              cube cost on the COMMITTED
              cubeful pool (fixedpool_cubeful_positions.json): the first 10,000
@@ -52,16 +52,14 @@ from play_models import _load_agent
 PROB5 = os.path.join(_REPO, "best_models", "cubeless_prob5_512_512_256_128.pt")
 CUBEFUL = "best_models/cubeful_money_512_512_256_256.pt"
 CUBEFUL_POOL = os.path.join(_HERE, "fixedpool_cubeful_positions.json")
-BLOCKS = int(os.environ.get("FP_BLOCKS", "80"))
 
 
 # ------------------------------------------------------------------ cubeless
-def run_cubeless(cap, blocks, configs, out):
+def run_cubeless(cap, configs, out):
     import numpy as np
-    import bgbot_cpp
     from backgammon_engine import get_legal_plays
-    from bgsage.weights import WeightConfig
-    from bgsage.board import possible_moves
+
+    wanted = [c.strip() for c in configs.split(",") if c.strip()]
 
     chk = load_fixedpool()
     print(f"[fixedpool] loaded {len(chk)} checker decisions from the committed pool",
@@ -69,12 +67,6 @@ def run_cubeless(cap, blocks, configs, out):
 
     p0 = _load_agent(PROB5)               # ProbAgent, 0-ply
     p1 = _load_agent(PROB5, oneply=True)  # ProbAgent, 1-ply full-width
-    w = WeightConfig.default()
-    s1 = bgbot_cpp.create_multipy_stage9(w.weight_paths_list, w.hidden_sizes_list,
-                                         n_plies=1, parallel_evaluate=False)
-    s2 = bgbot_cpp.create_multipy_stage9(w.weight_paths_list, w.hidden_sizes_list,
-                                         n_plies=2, parallel_evaluate=False)
-    sb = [(sage_conv(s.points, s.bar, s.turn), d[0], d[1]) for s, d in chk]
 
     def pchk(agent, sd):
         s, d = sd
@@ -89,26 +81,40 @@ def run_cubeless(cap, blocks, configs, out):
             int(np.argmin(agent._score(agent._probs(
                 torch.from_numpy(feats))).numpy()))
 
-    def schk(strat, bd):
-        b, d1, d2 = bd
-        cand = possible_moves(b, d1, d2)
-        if cand:
-            strat.best_move_index(cand, b)
-
     CHK = {
         "prob5-0ply": (lambda sd: pchk_fused(p0, sd), chk),
         "prob5-1ply": (lambda sd: pchk(p1, sd), chk),
-        "sage-1P":    (lambda bd: schk(s1, bd), sb),
-        "sage-2P":    (lambda bd: schk(s2, bd), sb),
     }
-    wanted = [c.strip() for c in configs.split(",") if c.strip()]
+
+    if any(c.startswith("sage") for c in wanted):
+        # bgsage only when a Sage config is requested — prob5-only runs
+        # need no bgsage install.
+        import bgbot_cpp
+        from bgsage.weights import WeightConfig
+        from bgsage.board import possible_moves
+
+        w = WeightConfig.default()
+        s1 = bgbot_cpp.create_multipy_stage9(w.weight_paths_list, w.hidden_sizes_list,
+                                             n_plies=1, parallel_evaluate=False)
+        s2 = bgbot_cpp.create_multipy_stage9(w.weight_paths_list, w.hidden_sizes_list,
+                                             n_plies=2, parallel_evaluate=False)
+        sb = [(sage_conv(s.points, s.bar, s.turn), d[0], d[1]) for s, d in chk]
+
+        def schk(strat, bd):
+            b, d1, d2 = bd
+            cand = possible_moves(b, d1, d2)
+            if cand:
+                strat.best_move_index(cand, b)
+
+        CHK["sage-0ply"] = (lambda bd: schk(s1, bd), sb)
+        CHK["sage-1ply"] = (lambda bd: schk(s2, bd), sb)
 
     header = (f"=== Fixed-pool cubeless per-decision (native, single pinned core, "
               f"committed pool of {len(chk)}, cap={cap}) ===")
     lines = [header]
     for name in wanted:
         fn, items = CHK[name]
-        m, lo, hi = rate(fn, items, cap, blocks)
+        m, lo, hi = rate(fn, items, cap)
         lines.append(f"{name:<16} checker {m:9.1f} moves/s  95%CI [{lo:.1f},{hi:.1f}]")
     msg = "\n".join(lines)
     print("\n" + msg, flush=True)
@@ -233,9 +239,9 @@ def load_cubeful_pool(path=CUBEFUL_POOL):
 
 def _time_cubeful_engine(name, agent, checker_pts, cube_pts, cap):
     rck, lck, hck = rate(
-        lambda it: agent.choose_checker_action_cubeful(*it), checker_pts, cap, BLOCKS)
+        lambda it: agent.choose_checker_action_cubeful(*it), checker_pts, cap)
     rcu, lcu, hcu = rate(
-        lambda it: agent.offer_double(*it), cube_pts, cap, BLOCKS)
+        lambda it: agent.offer_double(*it), cube_pts, cap)
     print(f"{name:<26} checker {rck:9.1f} dec/s 95%CI [{lck:.1f},{hck:.1f}] ({1000/rck:.3f} ms)"
           f"  |  cube {rcu:9.1f} dec/s 95%CI [{lcu:.1f},{hcu:.1f}] ({1000/rcu:.3f} ms)", flush=True)
 
@@ -272,8 +278,7 @@ def main():
     ap.add_argument("--cap", type=int, default=0,
                     help="decisions timed per config (default 8000 cubeless / 5000 cubeful)")
     # cubeless only
-    ap.add_argument("--blocks", type=int, default=80)
-    ap.add_argument("--configs", default="prob5-0ply,prob5-1ply,sage-1P,sage-2P")
+    ap.add_argument("--configs", default="prob5-0ply,prob5-1ply,sage-0ply,sage-1ply")
     ap.add_argument("--out", default="", help="cubeless: optional result file")
     # cubeful only
     ap.add_argument("--engines", default="puretd,sage0,sage")
@@ -284,7 +289,7 @@ def main():
     a = ap.parse_args()
 
     if a.mode == "cubeless":
-        run_cubeless(a.cap or 8000, a.blocks, a.configs, a.out)
+        run_cubeless(a.cap or 8000, a.configs, a.out)
     elif a.regen_pool:
         export_cubeful_pool()
     else:

@@ -19,9 +19,6 @@ legal openings by construction.
       python experiments/offline_analysis/run_cubeless_memg.py \
         --combine experiments/offline_analysis/cubeless_memg/pergame --players sage-1ply
 
-- `robustness/` — same format, non-paper configs kept for the filter-contrast
-  discussion (currently: `sage-1ply.jsonl` = Sage production filter 5/0.08).
-
 ## Rows (chequer mEMG, lower is better)
 
 | player | config | mEMG |
@@ -32,7 +29,6 @@ legal openings by construction.
 | sage-1ply | SAGE_UNPRUNED (paper convention) | 1.669 [1.613, 1.731] |
 | sage-0ply | native, production filter | 3.043 [2.981, 3.106] |
 | gnubg-ext-0ply | true gnubg 1.08 binary | 2.932 [2.875, 2.989] |
-| sage-1ply (robustness) | production filter 5/0.08 | 1.768 [1.697, 1.850] |
 
 Notes:
 
@@ -40,8 +36,10 @@ Notes:
   external-player socket) — the same opponent as the H-H tables.
 - **sage rows** use the native `OpenSageAgent` adapter (`best_move_index`),
   identical to the H-H runs. The paper row disables the root move filter
-  (`SAGE_UNPRUNED=1` → 1000/10.0), Sage's stronger config; the production
-  filter row is kept under `robustness/`.
+  (`SAGE_UNPRUNED=1` → 1000/10.0). The pruned-vs-unpruned contrast is carried
+  by the 10M-game head-to-head matrix
+  (`../../head_to_head/results/h2h_native_pruning_matrix.csv`), not by this
+  4,000-game table.
 - Cubeless rows have no cube/overall split: with cube analysis off,
   overall == chequer (the per-game `overall` field includes gnubg's
   never-double artifact and is ignored).

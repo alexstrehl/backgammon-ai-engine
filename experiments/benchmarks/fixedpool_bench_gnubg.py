@@ -32,15 +32,16 @@ default both):
 
 The cubeful sections replay the committed cubeful pool so ALL engines time
 identical positions AND identical cube states (per-position cube states
-matter: centered cfevaluate measures ~6-18% dearer than owned-cube at 1-ply,
+matter: centered cfevaluate measures ~6-21% costlier than owned-cube at 1-ply,
 so a constant-centered convention would overstate gnubg's cube cost).
 
 Env knobs: GNUBG_FP_MODE (default "both"), GNUBG_POOL / GNUBG_CUBEFUL_POOL
 (override pool paths; default = committed artifacts next to this script),
 GNUBG_FP_PLIES (default "0,1" — 2-ply is not part of the suite, not used
 in the paper), GNUBG_FP_CAP2 (position cap for plies >= 2,
-default 4000), GNUBG_FP_BLOCKS (bootstrap blocks, default 80), BENCH_CORE /
-BENCH_NO_PIN (pin, default core 0), BENCH_WARMUP_S (clock-ramp secs, default 3).
+default 4000), BENCH_CORE /
+BENCH_NO_PIN (pin; default: core 8 if present, else the highest available),
+BENCH_WARMUP_S (clock-ramp secs, default 3).
 """
 import json
 import os
@@ -66,7 +67,31 @@ class _LCG:
         return self._n() % n
 
 if not os.environ.get("BENCH_NO_PIN"):
-    os.sched_setaffinity(0, {int(os.environ.get("BENCH_CORE", "0"))})
+    _env = os.environ.get("BENCH_CORE", "").strip()
+    if _env:
+        # An explicitly requested core must be honored — fail loudly.
+        _core = int(_env)
+        if _core == 0:
+            raise SystemExit("BENCH_CORE=0 is the IRQ core; pick another core")
+        try:
+            os.sched_setaffinity(0, {_core})
+        except AttributeError:
+            raise SystemExit("sched_setaffinity unavailable on this platform; "
+                             "set BENCH_NO_PIN=1 to run unpinned")
+        except OSError as e:
+            raise SystemExit("cannot pin to core %d (%s); pick a core this host has"
+                             % (_core, e))
+    else:
+        # No core requested: prefer 8 (core 0 handles IRQs), else the highest
+        # core this process may use.
+        try:
+            _avail = os.sched_getaffinity(0)
+            _core = 8 if 8 in _avail else max(_avail)
+            os.sched_setaffinity(0, {_core})
+            if _core != 8:
+                print("[bench] BENCH_CORE unset; pinned to core %d" % _core)
+        except (AttributeError, OSError):
+            print("[bench] cannot pin on this platform; running unpinned")
 
 # NOTE: run inside gnubg's embedded Python (`gnubg -t -q -p`), where
 # `__file__` is undefined and compiled-extension imports (gzip/zlib) can
@@ -80,46 +105,38 @@ CUBEFUL_POOL = os.environ.get("GNUBG_CUBEFUL_POOL") or os.path.join(
 MODE = os.environ.get("GNUBG_FP_MODE", "both")   # cubeless | cubeful | both
 PLIES = [int(x) for x in os.environ.get("GNUBG_FP_PLIES", "0,1").split(",")]
 CAP2 = int(os.environ.get("GNUBG_FP_CAP2", "4000"))
+# GNUBG_FP_CAP caps EVERY ply (0 = whole pool). Exists so the suite can be
+# smoke-tested cheaply before a multi-hour run; leave unset for real runs.
+CAP = int(os.environ.get("GNUBG_FP_CAP", "0"))
 # Warm the core to boost clock before timing (see bench_common); default 3s.
 WARMUP_S = float(os.environ.get("BENCH_WARMUP_S", "3.0"))
-BLOCKS = int(os.environ.get("GNUBG_FP_BLOCKS", "80"))
 
 
 def timed_rate(call, m):
-    """Time call(i) over range(m) in BLOCKS equal blocks; return
-    (total_dt, rate, lo, hi) with a block-bootstrap 95% CI — the same
-    estimator as bench_common.rate() on the engines side. Point estimate
-    AND bootstrap statistic are the RATIO OF SUMS (total calls / total
-    wall-time), not the mean of per-block rates, which is Jensen-biased
-    upward by ~CV^2 of the block times on variable-cost workloads."""
-    bs = max(1, m // BLOCKS)
-    cnts, dts = [], []
-    for start in range(0, m - bs + 1, bs):
+    """Time each call(i) individually; return (total_dt, rate, lo, hi) with a
+    percentile-bootstrap 95% CI resampling CALLS — the same estimator as
+    bench_common.rate() on the engines side. Point estimate AND bootstrap
+    statistic are the RATIO OF SUMS (total calls / total wall-time), not the
+    mean of per-call rates, which is Jensen-biased upward by ~CV^2 of the
+    times on variable-cost workloads.
+
+    Per-call timing costs ~113 ns. That is <0.1% on most rows but ~4% on the
+    0-ply cube primitive (~2.8 us/call), whose cost is a slight over-estimate."""
+    dts = []
+    for i in range(m):
         t0 = time.perf_counter()
-        for i in range(start, start + bs):
-            call(i)
+        call(i)
         dts.append(time.perf_counter() - t0)
-        cnts.append(bs)
-    done = (m // bs) * bs
-    ntail = m - done                   # leftover tail: timed, not a block
-    tail_dt = 0.0
-    if ntail:
-        t0 = time.perf_counter()
-        for i in range(done, m):
-            call(i)
-        tail_dt = time.perf_counter() - t0
-    dt_total = sum(dts) + tail_dt
-    point = (sum(cnts) + ntail) / dt_total
-    nb = len(dts)
+    dt_total = sum(dts)
+    n = len(dts)
+    point = n / dt_total
     rng = _LCG(1)
     bm = []
     for _ in range(1000):
-        sc = sd = 0.0
-        for _ in range(nb):
-            j = rng.randrange(nb)
-            sc += cnts[j]
-            sd += dts[j]
-        bm.append(sc / sd)
+        sd = 0.0
+        for _ in range(n):
+            sd += dts[rng.randrange(n)]
+        bm.append(n / sd)
     bm.sort()
     return dt_total, point, bm[25], bm[975]
 
@@ -150,6 +167,7 @@ if MODE in ("cubeless", "both"):
     for plies in PLIES:
         ec = gnubg.evalcontext(0, plies, 0, 1, 0.0)   # cubeless, default prune ON
         m = min(n, CAP2) if plies >= 2 else n
+        if CAP: m = min(m, CAP)
         _spin_ramp(WARMUP_S)
         for i in range(min(m, 20)):
             gnubg.findbestmove(boards[i], ci, ec, dice[i])
@@ -189,6 +207,7 @@ if MODE in ("cubeful", "both"):
     for plies in PLIES:
         ec = gnubg.evalcontext(1, plies, 0, 1, 0.0)   # cubeful, default prune ON
         m = min(len(ck), CAP2) if plies >= 2 else len(ck)
+        if CAP: m = min(m, CAP)
         _spin_ramp(WARMUP_S)
         for i in range(min(m, 20)):
             gnubg.findbestmove(ck[i][0], ck_ci[i], ec, ck[i][1])
@@ -202,6 +221,7 @@ if MODE in ("cubeful", "both"):
     for plies in PLIES:
         ec = gnubg.evalcontext(1, plies, 0, 1, 0.0)   # cubeful eval
         m = min(len(cu), CAP2) if plies >= 2 else len(cu)
+        if CAP: m = min(m, CAP)
         _spin_ramp(WARMUP_S)
         for i in range(min(m, 20)):
             gnubg.cfevaluate(cu[i], cu_ci[i], ec)

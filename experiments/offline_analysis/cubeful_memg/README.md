@@ -8,7 +8,7 @@ sage-analyzer-0ply row, which pools its three raw shards (n=6,664 per-side
 samples; see Layout).
 
 **PureTD (`ours-*`) model**: `best_models/cubeful_money_512_512_256_256.pt`
-md5 `77a3205cc7582dbe7da4ae4e6c89fef1` (R11a_polish, prod).
+md5 `77a3205cc7582dbe7da4ae4e6c89fef1` (prod).
 
 ## Layout
 
@@ -20,8 +20,6 @@ md5 `77a3205cc7582dbe7da4ae4e6c89fef1` (R11a_polish, prod).
   `run_cubeful_memg.py --players` keys. The sage 0-ply row is instead stored
   as its three original raw shards (`sage_1P_raw_{local,epyc,topup}.json`,
   per-side sample arrays pooled for the published value).
-- `robustness/` — non-paper configs kept for the filter-contrast discussion
-  (currently: `sage-analyzer-1ply.jsonl` = production-filter run).
 
 Provenance of the `ours-*` rows: generated 2026-07-10/11 on a rented
 Threadripper PRO 9975WX box; judge weights bit-identical to the reference
@@ -31,13 +29,12 @@ Threadripper PRO 9975WX box; judge weights bit-identical to the reference
 
 | player | config | chequer | cube | overall |
 |---|---|---|---|---|
-| ours-1ply | 4L cubeful R11a | 0.987 | 1.411 | 1.027 [0.971, 1.093] |
-| ours-0ply | 4L cubeful R11a | 1.968 | 1.873 | 1.936 [1.871, 2.007] |
+| ours-1ply | 4L cubeful | 0.987 | 1.411 | 1.027 [0.971, 1.093] |
+| ours-0ply | 4L cubeful | 1.968 | 1.873 | 1.936 [1.871, 2.007] |
 | gnubg-ext-1ply | true gnubg 1.08 binary, full/unpruned | 2.022 | 2.145 | 1.997 [1.936, 2.067] |
 | sage-analyzer-1ply | SAGE_UNPRUNED (paper convention) | 1.974 | 5.758 | 2.258 [2.189, 2.330] |
 | gnubg-ext-0ply | true gnubg 1.08 binary | 4.011 | 3.819 | 3.898 [3.779, 4.027] |
 | sage-analyzer-0ply | analyzer, pooled raw shards | 3.795 | 7.048 | 4.020 [3.926, 4.114] |
-| sage-analyzer-1ply (robustness) | production filter 5/0.08 | 1.938 | 5.630 | 2.238 [2.167, 2.317] |
 
 Notes:
 
@@ -46,10 +43,10 @@ Notes:
 - **sage-analyzer rows** use `OpenSageAnalyzerAgent` (Sage's own
   `BgBotAnalyzer`: cube-aware checker play + native `cube_action`), identical
   to the H-H runs. The paper row is a config-verified `SAGE_UNPRUNED=1` run
-  (2026-07-27). An earlier run whose filter setting could not be verified
-  matches the production-filter value and is kept under `robustness/` as the
-  production row; the two configs are statistically indistinguishable on this
-  metric (2.258 vs 2.238).
+  (2026-07-27). The pruned-vs-unpruned contrast is carried by the 10M-game
+  head-to-head matrix
+  (`../../head_to_head/results/h2h_native_pruning_matrix.csv`), not by this
+  4,000-game table.
 - Sage's cube component (~5.8) dominates its overall gap to PureTD — the same
   cube-skill signature as the XG++ analysis.
 - Reproduction wrapper: `../cubeful_money_memg.sh`.

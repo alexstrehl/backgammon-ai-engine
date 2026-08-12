@@ -5,7 +5,7 @@ head-to-head tables.
 
 ## Install (pinned for reproduction)
 
-    pip install bgsage            # pinned: v0.8.20260611 (commit e09bf9c, 2026-06-11)
+    pip install bgsage==1.3.20260723
 
 ## Which agent / spec keyword
 

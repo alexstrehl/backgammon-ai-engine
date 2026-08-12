@@ -40,7 +40,7 @@ import torch
 
 from play_models import _load_agent
 from gnubg_eval import play_and_record, play_and_record_cubeful
-from bench_common import ratio_ci
+from bench_common import ratio_ci, _spin_ramp, WARMUP_S
 
 PURETD_CUBEFUL = "best_models/cubeful_money_512_512_256_256.pt"
 PROB5 = "best_models/cubeless_prob5_512_512_256_128.pt"
@@ -88,7 +88,11 @@ def _timed_games(play_one, games, running_count):
     """Play `games` games, timing each; running_count() reads the running
     decision total. Returns (gdts, gdecs) — per-game wall times and decision
     counts, so sum(gdts)/sum(gdecs) reproduce the whole-loop point estimate
-    and bench_common.ratio_ci gives the game-level bootstrap CI."""
+    and bench_common.ratio_ci gives the game-level bootstrap CI.
+
+    Ramps the pinned core first (see bench_common._spin_ramp): timing from
+    cold reads ~16% slow on short rows, distorting cross-engine ratios."""
+    _spin_ramp(WARMUP_S)
     gdts, gdecs = [], []
     for _ in range(games):
         d0 = running_count()
@@ -148,8 +152,10 @@ def run_cubeful_puretd(model, plies, games, seed):
     c_ch = dt0 / c0["checker"]
     ncube1 = c1["cube_offer"] + c1["cube_resp"]
     c_cu = (dt1 - c1["checker"] * c_ch) / max(ncube1, 1)
+    # negative residual = below run-to-run noise, not a real cost
     print("PURETD %d-ply ATTRIBUTION: checker %.3f ms/dec (%.1f dec/s) | cube %.3f ms/dec (%.1f dec/s)"
-          % (plies, 1000 * c_ch, 1 / c_ch, 1000 * c_cu, 1 / c_cu if c_cu > 0 else float("inf")),
+          % (plies, 1000 * c_ch, 1 / c_ch, 1000 * c_cu,
+             (1 / c_cu) if c_cu > 0 else float("nan")),
           flush=True)
 
 
@@ -180,9 +186,9 @@ def run_cubeful_sage(sage_plies, unpruned, games, seed):
     tot = counts["checker"] + counts["cube_offer"] + counts["cube_resp"]
     lo, hi = ratio_ci(gdts, gdecs)
     tag = "unpruned" if unpruned else "production"
-    print("SAGE-AN %dP %s cube-on: %d games %.2fs (%.2f g/s) | checker %d (%.1f dec/s)"
+    print("SAGE-AN %d-ply %s cube-on: %d games %.2fs (%.2f g/s) | checker %d (%.1f dec/s)"
           " | cube-offers %d responses %d | combined %.1f dec/s 95%%CI [%.1f,%.1f]"
-          % (sage_plies, tag, games, dt, games / dt,
+          % (sage_plies - 1, tag, games, dt, games / dt,
              counts["checker"], counts["checker"] / dt,
              counts["cube_offer"], counts["cube_resp"], tot / dt, lo, hi),
           flush=True)

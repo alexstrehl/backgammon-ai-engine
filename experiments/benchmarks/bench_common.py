@@ -1,20 +1,46 @@
 """Shared helpers for the single-thread compute benchmarks.
 
-Fixed-pool loading, Open Sage board conversion, and the block-bootstrap
+Fixed-pool loading, Open Sage board conversion, and the bootstrap
 moves/s timer used by the fixed-pool benchmarks. Import side effects: sets OMP/MKL/torch to 1 thread and
 pins the process to one core (BENCH_NO_PIN=1 / BENCH_CORE=N to override).
 """
 import os
+import sys
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
-# Pin to a single core (equivalent to `taskset -c 0`) so timing is not perturbed
-# by other load. Override: BENCH_NO_PIN=1.
+# Pin to a single core (equivalent to `taskset -c 8`) so timing is not perturbed
+# by other load. Override: BENCH_CORE=N / BENCH_NO_PIN=1.
 if not os.environ.get("BENCH_NO_PIN"):
-    try:
-        os.sched_setaffinity(0, {int(os.environ.get("BENCH_CORE", "0"))})
-    except (AttributeError, OSError):
-        pass
-import sys
+    _env = os.environ.get("BENCH_CORE", "").strip()
+    if _env:
+        # An explicitly requested core must be honored — silently running on a
+        # different core makes cross-engine/cross-sweep numbers incomparable.
+        _core = int(_env)
+        if _core == 0:
+            raise SystemExit("BENCH_CORE=0 is the IRQ core; pick another or set BENCH_NO_PIN=1")
+        try:
+            os.sched_setaffinity(0, {_core})
+        except AttributeError:
+            raise SystemExit("sched_setaffinity unavailable on this platform; "
+                             "set BENCH_NO_PIN=1 to run unpinned (results are NOT comparable)")
+        except OSError as e:
+            raise SystemExit("cannot pin to core %d (%s). Pick a core this host/cgroup "
+                             "actually has, or set BENCH_NO_PIN=1 (results are NOT "
+                             "comparable)." % (_core, e))
+    else:
+        # No core requested: prefer 8 (core 0 handles IRQs), else the highest
+        # core this process may use (small hosts, cgroup-limited containers).
+        try:
+            _avail = os.sched_getaffinity(0)
+            _core = 8 if 8 in _avail else max(_avail)
+            os.sched_setaffinity(0, {_core})
+            if _core != 8:
+                print("[bench] BENCH_CORE unset; pinned to core %d" % _core,
+                      file=sys.stderr)
+        except (AttributeError, OSError):
+            print("[bench] cannot pin on this platform; running unpinned "
+                  "(results are NOT comparable across engines/hosts)",
+                  file=sys.stderr)
 import time
 import random
 import statistics as st
@@ -93,47 +119,34 @@ def _warmup(fn, items, seconds=WARMUP_S):
         fn(it)
 
 
-def rate(fn, items, cap, blocks):
-    """moves/s and block-bootstrap 95% CI over `blocks` equal blocks.
+def rate(fn, items, cap):
+    """calls/s and percentile-bootstrap 95% CI, resampling ITEMS.
 
     Point estimate AND bootstrap statistic are the RATIO OF SUMS
-    (total calls / total wall-time), not the mean of per-block rates:
+    (total calls / total wall-time), not the mean of per-item rates:
     with variable per-call cost (e.g. Sage's analyzer position cache)
-    the arithmetic mean of block rates is Jensen-biased upward by
-    ~CV^2 of the block times — measured +40% on the cubeful Sage
-    checker row. Ratio-of-sums is the faithful throughput and matches
-    a plain total/dt timing exactly."""
+    the arithmetic mean is Jensen-biased upward by ~CV^2 of the times —
+    measured +40% on the cubeful Sage checker row. Ratio-of-sums is the
+    faithful throughput and matches a plain total/dt timing exactly.
+
+    Items are resampled individually. Per-call perf_counter costs ~113 ns,
+    under 0.1% except on sub-10us rows."""
     items = items[:cap]
     _warmup(fn, items)  # ramp core clock to steady state before timing
-    n = len(items)
-    bs = max(1, n // blocks)
-    cnts, dts = [], []
-    for i in range(0, n - bs + 1, bs):
-        blk = items[i:i + bs]
+    dts = []
+    for it in items:
         t = time.perf_counter()
-        for it in blk:
-            fn(it)
+        fn(it)
         dts.append(time.perf_counter() - t)
-        cnts.append(len(blk))
-    done = (n // bs) * bs
-    ntail = n - done          # leftover tail: timed + counted, not a block
-    if ntail:
-        blk = items[done:]
-        t = time.perf_counter()
-        for it in blk:
-            fn(it)
-        tail_dt = time.perf_counter() - t
-    point = (sum(cnts) + ntail) / (sum(dts) + (tail_dt if ntail else 0.0))
-    nb = len(dts)
+    n = len(dts)
+    point = n / sum(dts)
     rng = random.Random(1)
     bm = []
     for _ in range(1000):
-        sc = sd = 0.0
-        for _ in range(nb):
-            j = rng.randrange(nb)
-            sc += cnts[j]
-            sd += dts[j]
-        bm.append(sc / sd)
+        sd = 0.0
+        for _ in range(n):
+            sd += dts[rng.randrange(n)]
+        bm.append(n / sd)
     bm.sort()
     return point, bm[25], bm[975]
 

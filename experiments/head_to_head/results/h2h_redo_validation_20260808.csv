@@ -1,0 +1,46 @@
+# Move-generator fix: 10M-per-cell re-measurement, 2026-08-08/09. The pre-fix values
+# below are superseded by h2h_cubeless_summary.csv / h2h_cubeful_summary.csv.
+#
+# DEFECT: get_legal_plays could report a false forced pass. _generate_plays dedupes
+# terminal nodes by board key, so with one checker left the direct bear-off with the
+# larger die collides with the full two-die play (step down, then bear off); the dedup
+# kept the shorter play and the maximal-dice filter then rejected it, leaving no legal
+# play. Fixed in both engines; regression test tests/test_movegen_maximal_dedup.py;
+# validated on 503,677 positions against gnubg's move generator, 0 mismatches.
+#
+# ENGINE DEPENDENCE: the defect fires in bear-off, in ~99% of cases with one checker
+# left on points 2-6 (the 1-point is immune, since any die bears it off, as is any
+# point outside the home board; the other ~0.4% have 2-4 checkers behind an opponent
+# block and fall outside the model below). Colliding non-doublet rolls per point, and
+# each engine's last-checker distribution over 8,000 games:
+#     point:            1(imm)   2      3      4      5      6    7+(imm)
+#     rolls/15:            0     5      8      9      8      5      0
+#     PureTD:           75.6%  12.0%   2.7%   0.9%   0.8%   0.4%   7.6%
+#     Open Sage:        73.3%  17.3%   4.2%   1.9%   0.7%   0.4%   2.2%
+# Weighting rolls by each full distribution gives mean vulnerability per visit 0.983
+# (PureTD) vs 1.441 (Sage) = 1.466x; times the visit rate (1.032x) that predicts Sage
+# is struck 1.51x as often, and 22M turns of play measure 1.52x. Against gnubg the
+# imbalance is smaller and reversed (PureTD struck 1.11x). One occurrence costs
+# 0.415 pts [0.380, 0.449] of forfeited tempo (n=1,576 priced positions).
+#
+# Pre- and post-fix are independent 10M samples: the 95% null band is ~+-1.2 mEq
+# cubeless and ~+-2.6 cubeful, and only the two Sage cubeful deltas clear it.
+#
+# NOT REDONE: mEMG and XG per-decision error rates are unaffected, since a false pass
+# removes a decision rather than corrupting one and at ~1 turn in 3,700 (the worst engine) bounds any
+# shift at ~0.002 mEMG against CIs of ~0.12. The shipped checkpoints, benchmarks and
+# evaluation corpora were produced with the defective generator and were not
+# regenerated; the models are evaluated as shipped under corrected rules. The four
+# pruned rows in h2h_native_pruning_matrix.csv were re-measured 2026-08-09 (10M
+# games each) and that file is now fully post-fix.
+side1,side1_plies,side2,side2_plies,mode,games,prefix_mEq,current_mEq,ci_lo,ci_hi,delta
+PureTD_prob5,0,gnubg-ext,0,cubeless-money,10000000,44.6,44.7,43.9,45.6,+0.1
+PureTD_prob5,0,gnubg-ext-full,1,cubeless-money,10000000,11.9,12.8,11.9,13.7,+0.9
+PureTD_prob5,0,opensage,0,cubeless-money,10000000,40.3,39.4,38.6,40.3,-0.9
+PureTD_prob5,0,opensage_unpruned,1,cubeless-money,10000000,8.2,8.1,7.2,9.0,-0.1
+gnubg-ext-full,1,opensage_unpruned,1,cubeless-money,10000000,-2.7,-3.4,-4.2,-2.5,-0.7
+PureTD_4L,0,gnubg-ext,0,cubeful-money,10000000,78.7,79.9,78.2,81.7,+1.2
+PureTD_4L,0,gnubg-ext-full,1,cubeful-money,10000000,22.4,20.7,18.9,22.6,-1.7
+PureTD_4L,0,opensage-analyzer,0,cubeful-money,10000000,85.9,81.9,80.0,83.8,-4.0
+PureTD_4L,0,opensage-analyzer_unpruned,1,cubeful-money,10000000,19.0,17.4,15.5,19.4,-1.6
+gnubg-ext-full,1,opensage-analyzer_unpruned,1,cubeful-money,10000000,0.1,-3.8,-5.8,-1.8,-3.9

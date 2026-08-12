@@ -327,11 +327,15 @@ def _generate_plays(
 
     if not found:
         # No legal move with any remaining_dice die -- this path is complete.
-        # Record the resulting position (deduplicated by board state).
         if dice_used > max_used[0]:
             max_used[0] = dice_used
         key = state._key()
-        if key not in results:
+        # On a key collision keep the play using MORE dice: a shorter
+        # game-ending play (2/off with the 2 of a 21) can reach the same board
+        # as the full play, and the maximal-dice filter would then drop the
+        # position entirely — a false forced pass.
+        prev = results.get(key)
+        if prev is None or len(current_play) > len(prev[0]):
             results[key] = (current_play, state)
 
 

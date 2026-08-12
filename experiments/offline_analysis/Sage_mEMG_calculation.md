@@ -12,7 +12,7 @@ the per-decision errors into chequer / cube / overall mEMG with bootstrap CIs.
 
 | Component | Version |
 |-----------|---------|
-| Open Sage (`bgsage`) | `v0.8.20260611`, commit `e09bf9c87a5644272765da53cff511f895c0270a` |
+| Open Sage (`bgsage`) | `v0.8.20260611`, commit `e09bf9c87a5644272765da53cff511f895c0270a` (see the version note below) |
 | bgsage repo | https://github.com/markbgsage/bgsage |
 | gnubg (reference analyzer) | GNU Backgammon **1.08.003** (`gnubg.wd` md5 `14184acc9c60ef67be0fad88548fd51a`; gnubg ≥1.08 ships retrained nets — 1.06/1.07 judges are NOT comparable) |
 
@@ -65,3 +65,22 @@ Output (and raw per-game means) are saved under `--work`
   scorer collects every pair.
 - 4-ply scoring of ~1000 games is the slow stage (~1 h on 30 cores);
   generation at 0-ply is minutes.
+
+### Open Sage version note
+
+These numbers were produced with `bgsage` **v0.8.20260611**; the repo now pins
+**v1.3.20260723** (commit `a9576e8ab300e36969329e842962232883f7d90d`). The two are interchangeable here:
+
+* both ship the same production model — `PRODUCTION_MODEL = "stage9"`, the
+  19-network backgame-aware model that determines play;
+* they were verified to make **identical decisions** over ~26,000 compared
+  values on 4,000 positions sampled across all game phases (3,327 opening /
+  midgame, 469 bearing off, 204 deep bear-off, 1,557 with a checker on the
+  bar), at 0-ply and 1-ply, under both the production and unpruned filters,
+  covering the cubeless `best_move_index` path and the analyzer's
+  `checker_play` and `cube_action` — zero differences, including equity
+  values to six decimals;
+* four configurations of **seeded self-play produced bit-identical game
+  streams** (matching SHA-256 over full game outcomes).
+
+So re-running these rows under the pinned release reproduces them unchanged.

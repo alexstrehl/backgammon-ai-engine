@@ -1,0 +1,52 @@
+# Zen 5 (TR PRO 9995WX), core 120, idle, one pinned core, 2026-08-11.
+# FIVE independent sweeps of bench.sh (SWEEPS=5), each a fresh process with
+# a 90 s idle gap so sweeps sample independent thermal states. Every engine in
+# a sweep is timed on the SAME core: that is what makes the per-engine costs
+# comparable. The absolute values characterise this core, not the processor --
+# per-core frequency binning spreads throughput ~10% on Zen 5.
+#
+# Game counts are tiered by MEASURED per-game cost, not by search depth
+# (ply is a poor proxy: Sage's 0-ply analyzer costs 0.70 s/game, 10x gnubg at
+# 1-ply). G_FAST=600 for everything under ~100 ms/game; G_SLOW=200 for the two
+# Sage analyzer rows.
+#
+# Each row: mean of the 5 sweeps, 95% t-interval OVER SWEEPS (t(4)=2.776), and
+# the 5 raw values so the interval is recreatable. The per-sweep bootstrap CIs
+# are NOT used here -- they describe how precisely one run was measured and
+# cannot see run-to-run variation, which is the larger term. Do not pool raw
+# per-game points across sweeps: games in a sweep share its thermal state.
+#
+# Regenerate: SWEEPS=5 BENCH_CORE=<n> VENV=<py> bash experiments/benchmarks/bench.sh
+#             python experiments/benchmarks/aggregate_sweeps.py $OUTDIR/bench_<host>_sweep*.txt
+# Raw sweep logs (~330 KB each, mostly gnubg per-game score lines) are archived
+# outside the repo and available from the authors on request.
+#
+# row, mean_rate, ci_lo, ci_hi, sd_pct, unit, per_sweep_values
+
+FIXEDPOOL findbestmove 0-ply (default filters),33224.4,33055.9,33392.8,0.41,moves_or_evals_per_s,33057.2 33408.8 33190.5 33160.6 33304.8
+FIXEDPOOL findbestmove 1-ply (default filters),1253.6,1247.1,1260.1,0.42,moves_or_evals_per_s,1253.7 1258.8 1256.6 1253.9 1245.0
+FIXEDPOOL cubeful findbestmove 0-ply (default filters),31692.8,31472.7,31912.9,0.56,moves_or_evals_per_s,31719.1 31382.3 31821.3 31767.7 31773.6
+FIXEDPOOL cubeful findbestmove 1-ply (default filters),1343.5,1339.6,1347.4,0.23,moves_or_evals_per_s,1348.9 1343.8 1341.3 1342.1 1341.6
+FIXEDPOOL cube cfevaluate 0-ply,350294.1,346286.5,354301.8,0.92,moves_or_evals_per_s,353645.3 345132.8 351037.9 349666.9 351987.7
+FIXEDPOOL cube cfevaluate 1-ply,3861.1,3848.6,3873.5,0.26,moves_or_evals_per_s,3863.3 3860.9 3876.2 3855.8 3849.2
+FP prob5-0ply checker,5991.7,5906.7,6076.7,1.14,moves_or_evals_per_s,5873.6 6046.2 6017.3 5995.7 6025.7
+FP prob5-1ply checker,27.6,27.6,27.6,0.00,moves_or_evals_per_s,27.6 27.6 27.6 27.6 27.6
+FP sage-0ply checker,16100.8,15855.0,16346.6,1.23,moves_or_evals_per_s,16051.2 15892.2 16286.6 16328.9 15945.1
+FP sage-1ply checker,1042.4,1024.5,1060.3,1.38,moves_or_evals_per_s,1034.5 1033.0 1055.3 1060.5 1028.8
+FP PureTD 0-ply (4L cubeful) checker,6244.9,6217.8,6272.0,0.35,dec_per_s,6252.4 6236.5 6216.3 6275.9 6243.5
+FP PureTD 0-ply (4L cubeful) cube,18729.9,18401.8,19058.1,1.41,dec_per_s,18652.5 18445.2 19159.9 18746.9 18645.2
+FP Open Sage 0-ply (analyzer) checker,1368.0,1360.4,1375.6,0.45,dec_per_s,1363.4 1365.6 1378.4 1364.0 1368.6
+FP Open Sage 0-ply (analyzer) cube,89.0,88.9,89.2,0.10,dec_per_s,89.1 89.1 88.9 89.1 89.0
+FP Open Sage 1-ply (analyzer) checker,42.7,42.5,42.9,0.39,dec_per_s,42.9 42.7 42.5 42.5 42.7
+FP Open Sage 1-ply (analyzer) cube,67.7,67.6,67.7,0.07,dec_per_s,67.7 67.7 67.6 67.7 67.7
+GNUBG 0-ply cube-off,30371.1,29827.2,30915.0,1.44,dec_per_s,30973.7 30333.1 30185.1 29796.5 30567.0
+GNUBG 0-ply cube-on,54533.6,53902.3,55164.9,0.93,dec_per_s,55113.8 54372.9 55030.7 54027.2 54123.3
+GNUBG 1-ply cube-off,1123.5,1101.4,1145.5,1.58,dec_per_s,1111.2 1132.7 1102.4 1147.6 1123.5
+GNUBG 1-ply cube-on,1838.9,1802.0,1875.8,1.62,dec_per_s,1866.0 1819.2 1802.6 1871.7 1834.9
+CUBELESS prob5-0ply prod,5910.6,5891.9,5929.4,0.26,dec_per_s,5918.4 5909.2 5889.1 5929.9 5906.6
+CUBELESS sage-0ply production,6060.9,6007.9,6114.0,0.71,dec_per_s,6013.5 6062.2 6086.2 6117.2 6025.6
+CUBELESS sage-1ply production,976.4,961.6,991.1,1.22,dec_per_s,986.5 962.7 964.8 980.0 987.8
+PURETD 0-ply cube-off,6450.7,6429.4,6472.0,0.27,dec_per_s,6460.3 6430.4 6472.0 6436.3 6454.4
+PURETD 0-ply cube-on,8391.2,8301.3,8481.2,0.86,dec_per_s,8271.7 8390.0 8457.7 8398.2 8438.6
+SAGE-AN 0-ply production cube-on,199.9,199.4,200.5,0.22,dec_per_s,200.3 199.3 199.7 199.9 200.4
+SAGE-AN 1-ply production cube-on,51.7,51.4,52.1,0.52,dec_per_s,51.5 51.7 52.2 51.7 51.6
