@@ -45,8 +45,11 @@ def load_rows(path):
 def row_err_dec(r):
     """(-PR error, -all error, decisions, checker/cube split) for one row.
 
-    PR error excludes the wrong-double/wrong-take bucket (XG's PR
-    convention); all error keeps it (XG's "Eq per Decision" convention).
+    The two error values are intentionally IDENTICAL: XG's Wrong
+    Double/Wrong Take columns are subsets of Eq Double/Eq Take, so the
+    PR numerator already counts them in full and "Eq per Decision" is
+    exactly PR/500. The tuple carries the value twice only so the two
+    printed lines share one code path.
     """
     eq_move = float(r["Eq Move"])
     eq_cube = float(r["Eq Double"]) + float(r["Eq Take"])
@@ -118,7 +121,10 @@ def main():
         resample indices for every metric, so CIs are comparable)."""
         ge = row_e.reshape(-1, g).sum(axis=1)
         gd = row_d.reshape(-1, g).sum(axis=1)
-        boot = 500.0 * ge[idx].sum(axis=1) / gd[idx].sum(axis=1)
+        # Guard the denominator like the point estimate does: a cubeless
+        # export has 0 cube decisions in every resample, which would
+        # otherwise print a [nan, nan] CI.
+        boot = 500.0 * ge[idx].sum(axis=1) / np.maximum(gd[idx].sum(axis=1), 1)
         boot.sort()
         return boot[int(0.025 * args.n_boot)], boot[int(0.975 * args.n_boot)]
 

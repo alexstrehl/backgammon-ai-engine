@@ -62,9 +62,10 @@ double/take/drop decisions), and gnubg scores **both chequer and cube** decision
   cube-aware `OpenSageAnalyzerAgent` self-play). `SAGE_UNPRUNED=1` reproduces the
   published paper-convention row; without it you are measuring Sage's production
   filter instead. The wrapper runs it after the main quartet.
-- **Open Sage 0-ply** via `experiments/offline_analysis/sage_money_memg.py` — the
-  transcript path (same gnubg N-ply judge over Sage analyzer game shards); see
-  `cubeful_memg/README.md` for the pooled-shard provenance of that row.
+- **Open Sage 0-ply** via the same `run_cubeful_memg.py`
+  (`--players sage-analyzer-0ply`), at Sage's production filter — do not set
+  `SAGE_UNPRUNED`. `sage_money_memg.py` is the separate transcript path, which
+  scores Sage's own generated transcripts rather than self-play here.
 
 **Prereqs:** gnubg 1.08.003 CLI, `pip install bgsage`, torch + this repo, and the cubeful model.
 

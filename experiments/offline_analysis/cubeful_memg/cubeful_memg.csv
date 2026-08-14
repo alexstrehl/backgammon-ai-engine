@@ -1,7 +1,7 @@
 player,config,chequer_mEMG,chequer_lo,chequer_hi,cube_mEMG,cube_lo,cube_hi,overall_mEMG,overall_lo,overall_hi,n_games
-ours-0ply,4L cubeful,1.968,1.903,2.036,1.873,1.655,2.128,1.936,1.871,2.007,4000
-ours-1ply,4L cubeful,0.987,0.952,1.022,1.411,0.978,2.062,1.027,0.971,1.093,4000
-gnubg-ext-0ply,gnubg 1.08 ext,4.011,3.913,4.109,3.819,3.129,4.675,3.898,3.779,4.027,4000
-gnubg-ext-1ply,gnubg 1.08 ext full/unpruned,2.022,1.970,2.075,2.145,1.781,2.739,1.997,1.936,2.067,4000
-sage-analyzer-1ply,SAGE_UNPRUNED (paper row),1.974,1.903,2.050,5.758,5.458,6.075,2.258,2.189,2.330,4000
-sage-analyzer-0ply,analyzer pooled raw shards,3.795,3.699,3.894,7.048,6.695,7.412,4.020,3.926,4.114,6664
+ours-0ply,4L cubeful,1.902,1.846,1.959,1.613,1.446,1.787,1.848,1.795,1.903,4000
+ours-1ply,4L cubeful,0.975,0.942,1.008,1.030,0.899,1.169,0.967,0.934,1.001,4000
+gnubg-ext-0ply,gnubg 1.08 ext,3.983,3.883,4.085,3.307,3.034,3.591,3.806,3.716,3.899,4000
+gnubg-ext-1ply,gnubg 1.08 ext full/unpruned,2.093,2.037,2.148,1.845,1.707,1.988,2.027,1.976,2.077,4000
+sage-analyzer-1ply,SAGE_UNPRUNED (paper row),1.902,1.845,1.961,5.656,5.382,5.933,2.204,2.147,2.263,4000
+sage-analyzer-0ply,analyzer 0-ply,3.795,3.700,3.892,6.179,5.864,6.501,3.929,3.838,4.021,4000

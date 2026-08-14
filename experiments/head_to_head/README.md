@@ -200,8 +200,7 @@ For money modes `run.py` reports, from **side1's** perspective:
 
 ## Results
 
-Current results (re-measured 2026-08-09 on the fixed move
-generator): **10M games for every row**, in the
+**10M games for every row**, in the
 machine-readable summaries `results/h2h_cubeless_summary.csv` and
 `results/h2h_cubeful_summary.csv` (main-results convention: gnubg 1-ply =
 full-width (no pruning, `gnubg-ext-full`), Open Sage 1-ply = native unpruned; config variants in
@@ -211,8 +210,8 @@ perspective (+ = PureTD ahead); cubeful is the capped (±128) mean, Jacoby on.
 ### Cubeless money (all 10M games; gnubg = real 1.08 binary via `gnubg-ext` / `gnubg-ext-full`)
 | Matchup | PureTD edge | 95% CI |
 |---|---|---|
-| PureTD 0-ply vs gnubg 0-ply | +44.7 | [+43.9, +45.6] |
-| PureTD 0-ply vs gnubg 1-ply unpruned | +12.8 | [+11.9, +13.7] |
+| PureTD 0-ply vs gnubg 0-ply | +46.3 | [+45.5, +47.2] |
+| PureTD 0-ply vs gnubg 1-ply unpruned | +12.8 | [+11.9, +13.6] |
 | PureTD 0-ply vs Open Sage 0-ply | +39.4 | [+38.6, +40.3] |
 | PureTD 0-ply vs Open Sage 1-ply unpruned | +8.1 | [+7.2, +9.0] |
 | gnubg 1-ply vs Open Sage 1-ply (both unpruned) | −3.4 (Open Sage has the edge) | [−4.2, −2.5] |
@@ -223,9 +222,9 @@ here. **No filter effect is significant** in any of the four matchups:
 
 | Matchup | pruned | unpruned | difference |
 |---|---|---|---|
-| vs gnubg 1-ply, cubeless | +12.0 | +12.8 | −0.8 [−2.0, +0.4] |
+| vs gnubg 1-ply, cubeless | +13.3 | +12.8 | +0.5 [−0.7, +1.7] |
 | vs Open Sage 1-ply, cubeless | +7.9 | +8.1 | −0.2 [−1.5, +1.1] |
-| vs gnubg 1-ply, cubeful | +20.8 | +20.7 | +0.1 [−2.5, +2.7] |
+| vs gnubg 1-ply, cubeful | +18.6 | +19.8 | −1.2 [−3.9, +1.5] |
 | vs Open Sage 1-ply, cubeful | +16.2 | +17.4 | −1.2 [−4.0, +1.6] |
 
 Neither contrast reaches significance, so no claim about the opponent's filter
@@ -234,74 +233,11 @@ is made.
 ### Cubeful money (capped ±128, Jacoby on; all 10M games; real gnubg cube)
 | Matchup | PureTD edge | 95% CI |
 |---|---|---|
-| PureTD 0-ply vs gnubg 0-ply | +79.9 | [+78.2, +81.7] |
-| PureTD 0-ply vs gnubg 1-ply unpruned | +20.7 | [+18.9, +22.6] |
+| PureTD 0-ply vs gnubg 0-ply | +78.8 | [+77.0, +80.6] |
+| PureTD 0-ply vs gnubg 1-ply unpruned | +19.8 | [+18.0, +21.7] |
 | PureTD 0-ply vs Open Sage 0-ply | +81.9 | [+80.0, +83.8] |
 | PureTD 0-ply vs Open Sage 1-ply unpruned | +17.4 | [+15.5, +19.4] |
 | gnubg 1-ply vs Open Sage 1-ply (both unpruned) | −3.8 (Open Sage has the edge) | [−5.8, −1.8] |
 
 Headline: **PureTD at 0-ply (no search) beats both gnubg and Open Sage at 1-ply
 on money equity, in both cubeless and cubeful play.**
-
----
-
-## Move-generator fix and re-measurement (2026-08-09)
-
-Differential testing against gnubg's move generator found that
-`get_legal_plays` could report a **false forced pass** where a legal maximal
-play existed. Measured incidence per turn of play, over 22M turns of
-instrumented head-to-head: **Open Sage 2.7 per 10,000 turns** (1 in 3,700),
-**PureTD 1.8** (1 in 5,500), **gnubg 1.7** (1 in 6,000) — the rates differ
-because the trigger depends on bear-off style, as set out below.
-
-`_generate_plays` deduplicates terminal nodes by resulting board
-key, so with one checker left the direct bear-off with the larger die collides
-with the full two-die play (step down, then bear off); the dedup kept the
-shorter play and the maximal-dice filter then rejected it, leaving no legal
-play. Fixed in both the Python and C engines (bit-exact parity preserved),
-covered by `tests/test_movegen_maximal_dedup.py`, and validated on 503,677
-positions against gnubg's move generator with zero mismatches.
-
-The defect fires in bear-off, so its incidence depends on bear-off style and is
-not equal across engines. In ~99% of occurrences the mover has one checker left
-on points 2–6: the **1-point is immune** (any die bears it off, so it cannot be
-stepped down), as is any point outside the home board, and vulnerability peaks
-at the 4-point. The other ~0.4% have 2–4 checkers behind an opponent block in
-the mover's home board and fall outside the model below.
-
-Engines differ in where they park that last checker (8,000 games):
-
-| point | 1 (immune) | 2 | 3 | 4 | 5 | 6 | 7+ (immune) |
-|---|---|---|---|---|---|---|---|
-| colliding rolls /15 | 0 | 5 | 8 | 9 | 8 | 5 | 0 |
-| PureTD | 75.6% | 12.0% | 2.7% | 0.9% | 0.8% | 0.4% | 7.6% |
-| Open Sage | 73.3% | 17.3% | 4.2% | 1.9% | 0.7% | 0.4% | 2.2% |
-
-Weighting the rolls row by each engine's full distribution gives mean
-vulnerability per visit of 0.983 (PureTD) versus 1.441 (Sage) = 1.466×; times
-the visit rate (1.032×) that predicts Sage is struck **1.51×** as often, and
-22M turns of head-to-head play measure **1.52×**. One occurrence costs
-0.415 pts [0.380, 0.449] of forfeited tempo (n=1,576 priced positions).
-
-Every head-to-head cell was re-measured on the fixed engine and **those values
-replace the pre-fix ones** in the tables above; the Sage cells moved most
-(−0.9 mEq cubeless, up to −4.0 cubeful). Pre- and post-fix are independent 10M
-samples, so only those two Sage cubeful deltas exceed the ~±2.6 mEq null band.
-Pre-fix values, per-cell deltas and the full diagnosis are in
-`results/h2h_redo_validation_20260808.csv`.
-
-The move-filter matrix (`results/h2h_native_pruning_matrix.csv`) was re-measured
-too and is now fully post-fix. Its pre-fix version concluded gnubg was slightly
-better with its default filter while Open Sage was stronger unpruned; the Open
-Sage direction reverses after the fix, and neither contrast reaches
-significance.
-
-**Scope.** mEMG and XG error rates are unaffected: they average error over
-*decisions*, and a false pass removes a decision rather than corrupting one
-(the judge replays the recorded no-move and stays in sync), which at ~1 turn in
-3,700 (the worst engine) bounds any shift at ~0.002 mEMG against CIs of ~0.12.
-The shipped
-checkpoints, compute benchmarks, evaluation corpora and fixed-pool positions
-were produced with the defective generator and were not regenerated; the models
-are evaluated **as shipped** under the corrected rules.
-

@@ -18,16 +18,9 @@ Method:
   by row (200–600).
 - **A single pinned core, the same one for every engine** (`sched_setaffinity`;
   `BENCH_CORE` selects it, `BENCH_NO_PIN` disables pinning). Wall-time is then
-  a true single-core cost even where an engine spawns helper threads, and the
-  cross-engine ratio does not depend on which core was chosen. This matters
-  because AMD parts bin their cores (`amd_pstate/prefcore`): on an idle Zen 5
-  (9950X) the same PureTD cubeful row measured **8,411 dec/s on the fastest
-  core against 7,608 on the slowest, a 10.5% spread**, tracking
-  `/sys/devices/system/cpu/cpuN/acpi_cppc/highest_perf` at Spearman r=0.94.
-  Rows or sweeps timed on different cores are not comparable; a 3.9%
-  discrepancy between two sweeps of one row was attributable entirely to core
-  16 versus core 120. `bench.sh` exports one `BENCH_CORE` to all four
-  scripts.
+  a true single-core cost even where an engine spawns helper threads. Rows or
+  sweeps timed on different cores are not comparable. `bench.sh` exports one
+  `BENCH_CORE` to all four scripts.
 - **Counting convention.** One checker decision per board-and-dice turn; one
   cube decision per pre-roll turn in which the player on roll may double, plus
   each take/drop response.
@@ -107,9 +100,8 @@ fixed-pool + self-play), and skips the multi-hour deep-search rows unless
 scripts, if you want one at a time:
 
     # gnubg self-play — MUST use a threads-disabled build (recipe below).
-    # BENCH_CORE must match the native runs below: per-core silicon binning
-    # spreads throughput ~10% on Zen 5, so engines timed on different cores
-    # are not comparable (see the pinned-core bullet under Method).
+    # BENCH_CORE must match the native runs below; rows timed on different
+    # cores are not comparable.
     BENCH_CORE=8 GNUBG_BENCH_PLIES=0,1 GNUBG_BENCH_G0=600 GNUBG_BENCH_G1=600 \
       $HOME/gnubg-st/bin/gnubg -t -q -p experiments/benchmarks/selfplay_bench_gnubg.py
 
@@ -199,10 +191,9 @@ values are in `results/selfplay_zen3_epyc7713p_20260811.txt` and
 
 Every engine's 0-ply row is its in-play per-call cost (gnubg `findbestmove`
 cube-off, Sage `best_move_index`, PureTD fused `choose_next_state`), so Sage and
-PureTD are near-parity at 0-ply and both ~5-8x behind gnubg's tiny nets. That is
-a model-size gap (Sage/gnubg run tiny hand-tuned nets; prob5 is ~16x more
-MACs/eval through general MKL), not a harness gap: PureTD's loop-free kernel is
-only ~1.1x its in-play number (`results/fixedpool_*`).
+PureTD are near-parity at 0-ply and both ~5-8x behind gnubg. The gap is not
+harness overhead: PureTD's loop-free fixed-pool kernel is only ~1.1x its in-play
+number (`results/fixedpool_*`).
 
 Not benchmarked: Sage's fully native C++ self-play loop
 (`bgbot_cpp.play_games_pair_vs_self`). It cannot run the production net —
@@ -222,9 +213,8 @@ The tabulated `best_move_index` rows are the production config throughout.
   cubeless fixed-position measurement is truly representative of its
   evaluation cost.
 - **Open Sage's analyzer spawns ~2 internal threads** even at
-  `parallel_threads=1`; pinning showed the second thread is mostly
-  unproductive spin (pinned 1-ply cost within 10% of unpinned; 0-ply *faster*
-  pinned). Pinned numbers are quoted — rigorously single-core.
+  `parallel_threads=1`. Pinned 1-ply cost is within 10% of unpinned, and 0-ply
+  is faster pinned. Pinned numbers are quoted — rigorously single-core.
 - **Quoted CIs are t-intervals over five independent sweeps** (t(4)=2.776), not
   within-sweep bootstrap CIs. Each sweep contributes one number per row — itself
   a ratio-of-sums over that sweep — and the five are the sample. The self-play
@@ -294,14 +284,13 @@ Fixed-pool and self-play checker costs agree within ~15% for gnubg (+4.7 to
 +15.5%), prob5 0-ply (+2.6 to +5.2%) and Sage 1-ply (+5.0 to +15.2%), with
 self-play the costlier: its wall-clock carries game bookkeeping and dance-turn
 handling that the denominator (decisions) excludes. One row sits outside the
-band, for a known reason:
+band:
 
-- **Sage 0-ply**: self-play is 1.7× (Zen 5) to 3.0× (Zen 3) costlier
-  (0.165/0.365 ms vs 0.062/0.091 fixed-pool). The overhead is a roughly fixed
-  ~0.1–0.27 ms of Python game-loop work per decision, and Sage's 0-ply eval is
-  so cheap that the overhead, not the eval, sets the self-play number. prob5
-  0-ply shows the same absolute overhead (+0.022 ms) as a negligible *relative*
-  one because its eval is ~5× costlier.
+- **Sage 0-ply**: self-play costs 2.6× (Zen 5) to 4.0× (Zen 3) the fixed-pool
+  figure — 0.165/0.365 ms against 0.063/0.091 ms fixed-pool, an absolute gap of
+  0.102 ms (Zen 5) and 0.274 ms (Zen 3). prob5 0-ply, measured the same way, is
+  within 5% of its fixed-pool cost on both hosts (0.169/0.447 ms self-play
+  against 0.167/0.427 ms fixed-pool, a gap of 0.002 and 0.020 ms).
 
 Full tables with CIs (five-sweep t-intervals):
 `results/selfplay_zen3_epyc7713p_20260811.txt`,

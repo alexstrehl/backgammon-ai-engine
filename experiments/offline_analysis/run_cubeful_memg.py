@@ -3,9 +3,12 @@
   ours-0ply / ours-1ply          (best 4L cubeful model, 0/1-ply)
   gnubg-ext-0ply / gnubg-ext-1ply (real gnubg 1.08 binary, external-player
                                    socket; 1-ply = full/unpruned PAPER config)
+  sage-analyzer-0ply             (Open Sage cube-aware analyzer, XG 1P;
+                                   published row = production filter,
+                                   SAGE_UNPRUNED deliberately ignored here)
   sage-analyzer-1ply             (Open Sage cube-aware analyzer, XG 2P;
-                                   SAGE_UNPRUNED=1 = paper config; not in
-                                   --players all - request explicitly)
+                                   SAGE_UNPRUNED=1 = paper config)
+  The sage rows are not in --players all - request them explicitly.
 Requires the gnubg binary (GNUBG_CMD, default /usr/games/gnubg).
 
 Each player self-plays cubeful-money games (Jacoby), exported as a money game
@@ -42,14 +45,20 @@ def _build_agent(player):
         return _load_eval_agent(CUBEFUL_MODEL, oneply=False, cubeful=True)
     if player == "ours-1ply":
         return _load_eval_agent(CUBEFUL_MODEL, oneply=True, cubeful=True)
-    if player == "sage-analyzer-1ply":
-        # Open Sage cube-aware analyzer at 1-ply (XG 2P). SAGE_UNPRUNED=1
-        # disables its move filter (nothing in opensage_agents reads the
-        # env var — the kwargs must be passed here, as in play_models).
+    if player in ("sage-analyzer-0ply", "sage-analyzer-1ply"):
+        # Open Sage cube-aware analyzer. Sage is XG-numbered, so sage_plies is
+        # our ply + 1: 0-ply = 1 (XG 1P), 1-ply = 2 (XG 2P).
+        # SAGE_UNPRUNED (via play_models._sage_filter_kw, the same helper the
+        # H-H runs and run_cubeless_memg use) applies ONLY to the 1-ply
+        # player: the published 1-ply row is the SAGE_UNPRUNED paper row,
+        # while the published 0-ply row is the production filter — letting
+        # the env var reach 0-ply would silently regenerate that row under
+        # the wrong config when both players run in one invocation.
+        from play_models import _sage_filter_kw
         from experiments.opensage_agents import OpenSageAnalyzerAgent
-        kw = ({"filter_max_moves": 1000, "filter_threshold": 10.0}
-              if os.environ.get("SAGE_UNPRUNED") == "1" else {})
-        return OpenSageAnalyzerAgent(sage_plies=2, **kw)
+        kw = _sage_filter_kw() if player == "sage-analyzer-1ply" else {}
+        return OpenSageAnalyzerAgent(
+            sage_plies=1 if player == "sage-analyzer-0ply" else 2, **kw)
     if player == "gnubg-ext-0ply":
         from gnubg_external import GnubgExternalAgent
         return GnubgExternalAgent(plies=0)
@@ -158,6 +167,11 @@ def main():
     if args.combine:
         combine_dir(args.combine, players)
         return
+
+    # Judging with a one-sided-only gnubg silently changes cube statistics,
+    # and nothing in the run's provenance would record it. Fail here instead.
+    from gnubg_eval import assert_gnubg_bearoff
+    assert_gnubg_bearoff(GNUBG_CMD)
 
     print(f"### CUBEFUL {args.plies}-ply mEMG | {args.games} self-play games/player "
           f"| model={CUBEFUL_MODEL} | jacoby={JACOBY} ###", flush=True)

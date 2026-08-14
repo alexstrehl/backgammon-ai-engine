@@ -39,13 +39,16 @@ Capped ±128 mEq/game vs gnubg-ext, `--plies 0`:
 | step 10 | +66.5 [63.6, 69.3] | 4M |
 | step 13 | +73.2 [70.9, 75.6] | 6M |
 | step 14 | +75.3 [73.0, 77.7] | 6M |
-| production (reference) | +79.9 [78.2, 81.7] | 10M |
+| production (reference) | +78.8 [77.0, 80.6] | 10M |
 
-_Provenance: the `production (reference)` row is a post-move-generator-fix
-measurement (+78.7 → +79.9, see `head_to_head/results/h2h_redo_validation_20260808.csv`);
-the numbered step rows are pre-fix and were not re-run. Compare steps to each
-other freely, but the step→production gaps below carry that +1.2 mEq offset
-(the like-for-like pre-fix step-14 gap was +3.4, not +4.6)._
+_Provenance: the `production (reference)` row carries TWO corrections the
+numbered step rows do not. It is post-move-generator-fix (+78.7 → +79.9, see
+`experiments/head_to_head/results/h2h_redo_validation_20260808.csv`) and then re-measured
+2026-08-13 on a gnubg with the two-sided bearoff database (+79.9 → +78.8, see
+`experiments/head_to_head/results/h2h_cubeful_summary.csv`). The numbered step rows predate
+both and were not re-run. Compare steps to each other freely, but the
+step→production gaps below carry a net +0.1 mEq offset (the like-for-like
+pre-fix step-14 gap was +3.4, not +3.5)._
 
 **Step 15 vs production, direct: −1.1 mEq [−2.9, +0.7], p=0.235 at 10M games** —
 the interval contains zero. Chained arithmetic (−0.9) and direct measurement

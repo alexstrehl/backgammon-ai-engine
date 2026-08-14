@@ -50,7 +50,7 @@ python3 experiments/offline_analysis/run_cubeful_memg.py \
     --save-pergame "$OUT"
 
 # --- Open Sage 1-ply (cube-aware analyzer self-play; needs bgsage) ----------
-# SAGE_UNPRUNED=1 reproduces the PUBLISHED paper-convention row (2.258); drop
+# SAGE_UNPRUNED=1 reproduces the PUBLISHED paper-convention row (2.204); drop
 # the env var and you are measuring Sage's production filter instead.
 SAGE_UNPRUNED=1 python3 experiments/offline_analysis/run_cubeful_memg.py \
     --players sage-analyzer-1ply \
@@ -61,5 +61,7 @@ SAGE_UNPRUNED=1 python3 experiments/offline_analysis/run_cubeful_memg.py \
 # --- process output: pooled equal-n table (chequer/cube/overall, bootstrap CIs) ---
 python3 experiments/offline_analysis/run_cubeful_memg.py --combine "$OUT"
 
-# The sage-analyzer-0ply row is scored from pooled raw shards via
-# sage_money_memg.py (transcript path) — see cubeful_memg/README.md.
+# The sage-analyzer-0ply row is produced by the same driver, at Sage's
+# production filter (no SAGE_UNPRUNED):
+#   python3 experiments/offline_analysis/run_cubeful_memg.py \
+#     --players sage-analyzer-0ply --games "$GAMES" --save-pergame "$OUT"

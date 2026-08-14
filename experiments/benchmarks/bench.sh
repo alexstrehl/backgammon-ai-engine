@@ -146,7 +146,7 @@ if [ "$RUN_DEEP" = "1" ]; then
 else
     echo "" | tee -a "$OUT"
     echo "# deep-search self-play rows SKIPPED (RUN_DEEP=1 to include): cubeless prob5-1ply," | tee -a "$OUT"
-    echo "# cubeful PureTD-1ply, Sage-2P-unpruned, Sage-3P-unpruned (hours each)." | tee -a "$OUT"
+    echo "# cubeful PureTD-1ply, Sage 1-ply unpruned, Sage 2-ply unpruned (hours each)." | tee -a "$OUT"
 fi
 
 banner "DONE -> $OUT"

@@ -149,6 +149,12 @@ def main():
     # worker pool spawns so workers inherit it; read in gnubg_eval._write_gnubg_script.
     os.environ["GNUBG_CUBELESS_EVAL"] = "0" if args.cubeful_eval else "1"
 
+    # See run_cubeful_memg: a one-sided-only gnubg is an unrecorded config
+    # change. Cheap to check, impossible to notice afterwards.
+    if not args.combine:
+        from gnubg_eval import assert_gnubg_bearoff
+        assert_gnubg_bearoff(GNUBG_CMD)
+
     if args.combine:
         combine_dir(args.combine, players)
         return

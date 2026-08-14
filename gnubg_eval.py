@@ -64,6 +64,66 @@ else:
 GNUBG_CMD = os.environ.get("GNUBG_CMD", GNUBG_CMD)
 
 
+# ── Bearoff-database preflight ───────────────────────────────────────────────
+
+_BEAROFF_OK: dict = {}
+
+
+def assert_gnubg_bearoff(gnubg_cmd: str = None) -> None:
+    """Refuse to run unless gnubg has its TWO-SIDED bearoff database.
+
+    gnubg ships two bearoff databases and a normal build installs both
+    (`Makefile.am`: `gnubg_os0.bd` and `gnubg_ts0.bd` are both build targets
+    and both listed in `pkgdata_DATA`). The two-sided one supplies EXACT
+    CUBEFUL equities in bearoff. Without it gnubg silently falls back to a
+    net estimate, which shifts its cube decisions in bearoff races when it
+    plays, and fabricates cube errors when it judges.
+
+    There is no gnubg setting for this and nothing in a run's provenance
+    records it -- it is ambient host state. The only signal is a startup
+    warning, and every launch site used to discard it (gnubg_external.py
+    piped both stdout and stderr to DEVNULL). A fleet once ran a whole
+    experiment one-sided without anything noticing, so read the warning here.
+
+    Debian installs the file to /var/lib/gnubg/ while a source build puts it
+    in the package data dir, so we ask gnubg itself rather than looking on
+    disk. Result is cached per binary (one ~0.2 s probe per process).
+
+    Override with GNUBG_ALLOW_ONESIDED_BEAROFF=1 only to deliberately
+    reproduce a one-sided run; results are NOT comparable with two-sided ones.
+    """
+    cmd = gnubg_cmd or GNUBG_CMD
+    if cmd in _BEAROFF_OK:
+        return
+    if os.environ.get("GNUBG_ALLOW_ONESIDED_BEAROFF") == "1":
+        _BEAROFF_OK[cmd] = True
+        return
+    try:
+        out = subprocess.run(
+            [cmd, "-t", "-q", "-c", os.devnull],
+            capture_output=True, text=True, timeout=120,
+            env=dict(os.environ, LC_ALL="C"),
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"cannot probe gnubg at '{cmd}': {e}")
+    blob = (out.stdout or "") + (out.stderr or "")
+    if "will not use the two-sided bearoff" in blob:
+        raise RuntimeError(
+            "gnubg at '%s' is MISSING its two-sided bearoff database "
+            "(gnubg_ts0.bd).\n"
+            "Cubeful bearoff equities would fall back to a net estimate, so "
+            "this host's results are NOT comparable with a correctly "
+            "configured one.\n"
+            "Fix: reinstall gnubg, or copy gnubg_ts0.bd (md5 "
+            "44b6040b49b46cb9dd2ce8caa947044d) into the directory holding "
+            "gnubg.wd, or regenerate it with "
+            "`makebearoff -t 6x6 -f gnubg_ts0.bd`.\n"
+            "To run one-sided ON PURPOSE set GNUBG_ALLOW_ONESIDED_BEAROFF=1."
+            % cmd
+        )
+    _BEAROFF_OK[cmd] = True
+
+
 # ── Game recording ───────────────────────────────────────────────────────────
 
 @dataclass
@@ -424,17 +484,20 @@ def export_mat(
     point_word = "point" if points == 1 else "points"
     wins_str = f"Wins {points} {point_word}"
 
-    # For drops, place the "Wins" text alongside the drop marker in
-    # the same row so gnubg reads it correctly.
+    # For drops, place the "Wins" text alongside the drop marker in the same
+    # row so gnubg reads it correctly -- but ONLY in the WINNER's column. The
+    # winner of a dropped double is the DOUBLER, not the dropper, so appending
+    # it to whichever column happens to hold " Drops" silently credits the game
+    # to the loser. XG reads the winner off the column the token sits in, so
+    # that inverted ~25% of games (every white-doubles/black-drops game) in
+    # every export. When the winner's column on the last row is already taken
+    # (white doubled there), fall back to a separate winner-column line.
+    winner_col = 0 if winner == WHITE else 1
     drop_wins_separate = False
     if record.ended_by_drop and rows:
         last = rows[-1]
-        if last[0] and not last[1]:
-            last[1] = f" {wins_str}"
-        elif not last[0] and last[1]:
-            last[0] = f" {wins_str}"
-        elif last[0] and last[1]:
-            last[1] = last[1] + f"  {wins_str}"
+        if not last[winner_col]:
+            last[winner_col] = f" {wins_str}"
         else:
             drop_wins_separate = True
 
@@ -516,6 +579,12 @@ def run_gnubg_analysis(
     """
     if gnubg_cmd is None:
         gnubg_cmd = GNUBG_CMD
+
+    # Every analysis path funnels through here, so this is the choke point
+    # that guarantees no result is ever produced by a gnubg missing its
+    # two-sided bearoff database. Cached per binary, so the probe costs one
+    # ~0.2 s gnubg start per worker process, not per chunk.
+    assert_gnubg_bearoff(gnubg_cmd)
 
     # Use absolute paths so gnubg can find everything regardless of cwd.
     abs_work_dir = os.path.abspath(work_dir)

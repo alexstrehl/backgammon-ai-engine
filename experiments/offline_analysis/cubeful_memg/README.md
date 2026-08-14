@@ -3,9 +3,7 @@
 Judge: **gnubg 1.08.003** CLI at **4-ply** (`gnubg.wd` md5
 `14184acc9c60ef67be0fad88548fd51a`). All scoring with `LC_ALL=C` (en_US
 locale silently breaks the stats parser), `OMP_NUM_THREADS=1`. n=4000
-legal-opening self-play games per row (Jacoby on) — except the
-sage-analyzer-0ply row, which pools its three raw shards (n=6,664 per-side
-samples; see Layout).
+legal-opening self-play games per row (Jacoby on).
 
 **PureTD (`ours-*`) model**: `best_models/cubeful_money_512_512_256_256.pt`
 md5 `77a3205cc7582dbe7da4ae4e6c89fef1` (prod).
@@ -17,24 +15,36 @@ md5 `77a3205cc7582dbe7da4ae4e6c89fef1` (prod).
   per-game data below.
 - `pergame/<player>.jsonl` — one line per game (`chequer`, `cube`, `overall`
   mEMG), one file per main-table row; names match
-  `run_cubeful_memg.py --players` keys. The sage 0-ply row is instead stored
-  as its three original raw shards (`sage_1P_raw_{local,epyc,topup}.json`,
-  per-side sample arrays pooled for the published value).
+  `run_cubeful_memg.py --players` keys. Every row, including sage 0-ply, is a
+  plain 4,000-game jsonl (the old pooled-shard format was retired in the
+  2026-08-13 re-measurement).
 
-Provenance of the `ours-*` rows: generated 2026-07-10/11 on a rented
-Threadripper PRO 9975WX box; judge weights bit-identical to the reference
-(md5 gate `14184acc...`), so the samples pool with all other rows here.
+Provenance: ALL rows re-measured 2026-08-13. The previous values were
+generated with the defective move generator (false forced pass, fixed in
+2149c48) and judged by hosts whose bearoff configuration was not recorded --
+a provisioning script had been deleting `gnubg_ts0.bd`, so gnubg fell back to
+a net estimate for cubeful bearoff equities and fabricated cube errors. Every
+row here was regenerated on the fixed engine and judged by a gnubg asserted to
+carry BOTH bearoff databases (`gnubg_ts0.bd` md5 `44b6040b49b46cb9dd2ce8caa947044d`,
+`gnubg.wd` md5 `14184acc9c60ef67be0fad88548fd51a`) with zero
+"will not use the two-sided bearoff" warnings; `gnubg_eval.assert_gnubg_bearoff`
+now enforces this before any judging runs.
+
+The correction is cube-side, as expected: every cubeful row's cube component
+fell (e.g. ours-0ply 1.873 -> 1.613, sage-analyzer-0ply 7.048 -> 6.179) while
+chequer play barely moved. Engine orderings are unchanged. The cubeless table
+moved by at most 0.05. Pre-correction values are in git history.
 
 ## Rows (overall mEMG, lower is better)
 
 | player | config | chequer | cube | overall |
 |---|---|---|---|---|
-| ours-1ply | 4L cubeful | 0.987 | 1.411 | 1.027 [0.971, 1.093] |
-| ours-0ply | 4L cubeful | 1.968 | 1.873 | 1.936 [1.871, 2.007] |
-| gnubg-ext-1ply | true gnubg 1.08 binary, full/unpruned | 2.022 | 2.145 | 1.997 [1.936, 2.067] |
-| sage-analyzer-1ply | SAGE_UNPRUNED (paper convention) | 1.974 | 5.758 | 2.258 [2.189, 2.330] |
-| gnubg-ext-0ply | true gnubg 1.08 binary | 4.011 | 3.819 | 3.898 [3.779, 4.027] |
-| sage-analyzer-0ply | analyzer, pooled raw shards | 3.795 | 7.048 | 4.020 [3.926, 4.114] |
+| ours-1ply | 4L cubeful | 0.975 | 1.030 | 0.967 [0.934, 1.001] |
+| ours-0ply | 4L cubeful | 1.902 | 1.613 | 1.848 [1.795, 1.903] |
+| gnubg-ext-1ply | true gnubg 1.08 binary, full/unpruned | 2.093 | 1.845 | 2.027 [1.976, 2.077] |
+| sage-analyzer-1ply | SAGE_UNPRUNED (paper convention) | 1.902 | 5.656 | 2.204 [2.147, 2.263] |
+| gnubg-ext-0ply | true gnubg 1.08 binary | 3.983 | 3.307 | 3.806 [3.716, 3.899] |
+| sage-analyzer-0ply | analyzer 0-ply | 3.795 | 6.179 | 3.929 [3.838, 4.021] |
 
 Notes:
 

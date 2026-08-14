@@ -6,7 +6,6 @@ __pycache__/
 # Checkpoints: ignore all .pt except the curated/whitelisted locations.
 *.pt
 !best_models/**/*.pt
-!benchmarks/models/*.pt
 
 # models/ and working_models/ are local training scratch — never committed.
 # Curated checkpoints live in best_models/ (whitelisted above).
@@ -15,12 +14,13 @@ working_models/
 
 # model_logs/ holds ONLY the curated human-readable model histories below;
 # raw run logs (bench_*, hh_*, train_*, ...) are local-only and cannot be
-# added even by a bulk `git add`.
-model_logs/*
-!model_logs/cubeful_money_model_log.txt
-!model_logs/cubeless_money_training_log.md
-!model_logs/cubeless_money_4L_model_log.md
-!model_logs/dmp_model_log.txt
+# added even by a bulk `git add`. Patterns are unanchored (**/) so they apply
+# wherever the directory sits, including under experiments/.
+**/model_logs/*
+!**/model_logs/cubeful_money_4L_model_log.md
+!**/model_logs/cubeless_money_4L_model_log.md
+!**/model_logs/cubeless_prob5_model_log.md
+!**/model_logs/dmp_4L_model_log.md
 
 # build artifacts
 c_engine/*.so
@@ -32,17 +32,18 @@ datasets/
 gnubg_games/
 gnubg_test/
 logs/
-offline_analysis/*.log
+**/offline_analysis/*.log
 
 # generated benchmark position pool
-benchmarks/pool.pkl
-benchmarks/results.txt
+**/benchmarks/pool.pkl
+**/benchmarks/results.txt
+**/benchmarks/bench_*.txt
 
 # Head-to-head raw per-game data (large: each 10M run's .npz is ~72 MB and git
 # stores binaries with no delta compression). Keep only the summary CSVs under
 # version control; treat raw .npz as out-of-band artifacts. (Already-tracked
 # .npz stay tracked; this prevents new ones from being added.)
-head_to_head/results/**/*.npz
+**/head_to_head/results/**/*.npz
 
 # c-engine build artifact
 c_engine/libbg_nply.so

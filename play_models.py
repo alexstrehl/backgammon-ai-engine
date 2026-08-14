@@ -180,6 +180,13 @@ def _build_side(spec, spec_type, *, plies, sage_plies, cubeless_money,
         from gnubg_external import GnubgExternalAgent
         return GnubgExternalAgent(plies=plies, cubeless=cubeless_money,
                                   full=True)
+    if spec_type == "gnubg-ext-rootfull":
+        # Every legal move deep-evaluated at the root, gnubg's default
+        # pruning for the opponent's replies (pruning nets stay ON) --
+        # the paper's stated protocol for matched 2-ply comparisons.
+        from gnubg_external import GnubgExternalAgent
+        return GnubgExternalAgent(plies=plies, cubeless=cubeless_money,
+                                  root_full=True)
     if spec_type == "opensage":
         if cubeful:
             raise ValueError(
@@ -590,6 +597,7 @@ def _detect_side_type(spec):
     return {
         "random": "random", "gnubg": "gnubg", "opensage": "opensage",
         "gnubg-ext": "gnubg-ext", "gnubg-ext-full": "gnubg-ext-full",
+        "gnubg-ext-rootfull": "gnubg-ext-rootfull",
         "opensage-analyzer": "opensage-analyzer",
     }.get(spec, "model")
 
@@ -928,6 +936,8 @@ def main():
         "gnubg": f"GnubgNN ({args.plies}-ply{mode_tag})",
         "gnubg-ext": f"gnubg-ext ({args.plies}-ply, real gnubg 1.08)",
         "gnubg-ext-full": f"gnubg-ext-full ({args.plies}-ply, unpruned)",
+        "gnubg-ext-rootfull": (f"gnubg-ext-rootfull ({args.plies}-ply, "
+                               "keep-all root, default reply pruning)"),
         "opensage": f"OpenSage (sage_plies={args.sage_plies})",
         "opensage-analyzer": f"OpenSage-analyzer (sage_plies={args.sage_plies})",
     }.get(model2_type, args.model2)

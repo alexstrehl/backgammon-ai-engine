@@ -23,12 +23,12 @@ legal openings by construction.
 
 | player | config | mEMG |
 |---|---|---|
-| prob5-1ply | full-width 1-ply | 0.694 [0.675, 0.713] |
-| prob5-0ply | prod prob5 | 1.343 [1.312, 1.375] |
-| gnubg-ext-1ply | true gnubg 1.08 binary, full/unpruned | 1.648 [1.611, 1.686] |
-| sage-1ply | SAGE_UNPRUNED (paper convention) | 1.669 [1.613, 1.731] |
-| sage-0ply | native, production filter | 3.043 [2.981, 3.106] |
-| gnubg-ext-0ply | true gnubg 1.08 binary | 2.932 [2.875, 2.989] |
+| prob5-1ply | full-width 1-ply | 0.698 [0.679, 0.717] |
+| prob5-0ply | prod prob5 | 1.351 [1.320, 1.383] |
+| gnubg-ext-1ply | true gnubg 1.08 binary, full/unpruned | 1.626 [1.591, 1.660] |
+| sage-1ply | SAGE_UNPRUNED (paper convention) | 1.670 [1.626, 1.717] |
+| gnubg-ext-0ply | true gnubg 1.08 binary | 2.878 [2.825, 2.933] |
+| sage-0ply | native, production filter | 3.007 [2.949, 3.066] |
 
 Notes:
 

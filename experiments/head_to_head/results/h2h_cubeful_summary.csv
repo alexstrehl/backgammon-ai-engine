@@ -9,8 +9,8 @@
 # Cap sensitivity is negligible: margins at caps 32/64/128 agree within
 # 0.2 mEq in every cell (4-54 games of 10M exceed 128).
 side1,side1_plies,side2,side2_plies,mode,games,capped_edge_mEq,ci_lo,ci_hi
-PureTD_4L,0,gnubg-ext,0,cubeful-money,10000000,79.9,78.2,81.7
-PureTD_4L,0,gnubg-ext-full,1,cubeful-money,10000000,20.7,18.9,22.6
+PureTD_4L,0,gnubg-ext,0,cubeful-money,10000000,78.8,77.0,80.6
+PureTD_4L,0,gnubg-ext-full,1,cubeful-money,10000000,19.8,18.0,21.7
 PureTD_4L,0,opensage-analyzer,0,cubeful-money,10000000,81.9,80.0,83.8
 PureTD_4L,0,opensage-analyzer_unpruned,1,cubeful-money,10000000,17.4,15.5,19.4
 gnubg-ext-full,1,opensage-analyzer_unpruned,1,cubeful-money,10000000,-3.8,-5.8,-1.8

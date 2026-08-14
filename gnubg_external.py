@@ -86,10 +86,12 @@ class _ExtServer:
     """One gnubg subprocess serving `external localhost:<port>`."""
 
     def __init__(self, plies: int, gnubg_cmd: str = GNUBG_CMD,
-                 cubeless: bool = False, full: bool = False):
+                 cubeless: bool = False, full: bool = False,
+                 root_full: bool = False):
         self.plies = plies
         self.cubeless = cubeless
         self.full = full
+        self.root_full = root_full
         self.proc = None
         self.sock = None
         self.fh = None
@@ -102,6 +104,23 @@ class _ExtServer:
                       "set evaluation cubedecision evaluation prune off\n")
             for ply in (1, 2, 3, 4):
                 extra += f"set evaluation movefilter {ply} 0 1000 0 10.0\n"
+        elif root_full:
+            # Full-width ROOT only: every legal move gets the deep
+            # evaluation, but the opponent's replies keep gnubg's shipped
+            # pruning (pruning nets stay ON and the deeper filter levels
+            # keep their defaults). This is the 2-ply protocol the paper
+            # states -- "evaluate every legal move per position but use the
+            # default settings for pruning the opponent's responses" --
+            # and is NOT the same as full=True, which also drops the
+            # pruning nets. Only the level-0 row is overridden.
+            for ply in (1, 2, 3, 4):
+                extra += f"set evaluation movefilter {ply} 0 1000 0 10.0\n"
+        # This Popen discards gnubg's output, so its startup warnings can
+        # never be seen -- check the bearoff databases BEFORE spawning.
+        # Independent of the port, so it belongs outside the retry loop
+        # (inside, a failing probe also leaked the mkstemp script below).
+        from gnubg_eval import assert_gnubg_bearoff
+        assert_gnubg_bearoff(gnubg_cmd)
         last_err = None
         for _attempt in range(5):
             port = self._free_port()
@@ -194,21 +213,27 @@ class GnubgExternalAgent(Agent):
     full: False = production config (pruning nets + Normal move filter,
         gnubg as shipped); True = totally unpruned (no pruning nets,
         keep-all filter — full-width search, ~4x slower at 1-ply).
+    root_full: every legal move evaluated at the root, but gnubg's default
+        pruning for the opponent's replies (pruning nets stay ON). This is
+        the paper's stated 2-ply protocol; distinct from full=True.
     """
 
     def __init__(self, plies: int = 0, gnubg_cmd: str = GNUBG_CMD,
-                 cubeless: bool = False, full: bool = False):
+                 cubeless: bool = False, full: bool = False,
+                 root_full: bool = False):
         self.plies = plies
         self.gnubg_cmd = gnubg_cmd
         self.cubeless = cubeless
         self.full = full
+        self.root_full = root_full
         self._server = None  # lazy: one subprocess per worker process
 
     # ── plumbing ─────────────────────────────────────────────────────
     def _srv(self) -> _ExtServer:
         if self._server is None:
             self._server = _ExtServer(self.plies, self.gnubg_cmd,
-                                      self.cubeless, self.full)
+                                      self.cubeless, self.full,
+                                      self.root_full)
         return self._server
 
     @staticmethod
