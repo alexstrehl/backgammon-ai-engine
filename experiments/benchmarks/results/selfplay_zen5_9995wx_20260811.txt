@@ -1,9 +1,10 @@
 # Zen 5 (TR PRO 9995WX), core 120, idle, one pinned core, 2026-08-11.
+# SELF-PLAY rows only; the fixed-position rows from the same run are in
+# fixedpool_zen5_9995wx_20260811.txt.
 # FIVE independent sweeps of bench.sh (SWEEPS=5), each a fresh process with
 # a 90 s idle gap so sweeps sample independent thermal states. Every engine in
 # a sweep is timed on the SAME core: that is what makes the per-engine costs
-# comparable. The absolute values characterise this core, not the processor --
-# per-core frequency binning spreads throughput ~10% on Zen 5.
+# comparable. The absolute values characterise this core, not the processor.
 #
 # Game counts are tiered by MEASURED per-game cost, not by search depth
 # (ply is a poor proxy: Sage's 0-ply analyzer costs 0.70 s/game, 10x gnubg at
@@ -23,22 +24,6 @@
 #
 # row, mean_rate, ci_lo, ci_hi, sd_pct, unit, per_sweep_values
 
-FIXEDPOOL findbestmove 0-ply (default filters),33224.4,33055.9,33392.8,0.41,moves_or_evals_per_s,33057.2 33408.8 33190.5 33160.6 33304.8
-FIXEDPOOL findbestmove 1-ply (default filters),1253.6,1247.1,1260.1,0.42,moves_or_evals_per_s,1253.7 1258.8 1256.6 1253.9 1245.0
-FIXEDPOOL cubeful findbestmove 0-ply (default filters),31692.8,31472.7,31912.9,0.56,moves_or_evals_per_s,31719.1 31382.3 31821.3 31767.7 31773.6
-FIXEDPOOL cubeful findbestmove 1-ply (default filters),1343.5,1339.6,1347.4,0.23,moves_or_evals_per_s,1348.9 1343.8 1341.3 1342.1 1341.6
-FIXEDPOOL cube cfevaluate 0-ply,350294.1,346286.5,354301.8,0.92,moves_or_evals_per_s,353645.3 345132.8 351037.9 349666.9 351987.7
-FIXEDPOOL cube cfevaluate 1-ply,3861.1,3848.6,3873.5,0.26,moves_or_evals_per_s,3863.3 3860.9 3876.2 3855.8 3849.2
-FP prob5-0ply checker,5991.7,5906.7,6076.7,1.14,moves_or_evals_per_s,5873.6 6046.2 6017.3 5995.7 6025.7
-FP prob5-1ply checker,27.6,27.6,27.6,0.00,moves_or_evals_per_s,27.6 27.6 27.6 27.6 27.6
-FP sage-0ply checker,16100.8,15855.0,16346.6,1.23,moves_or_evals_per_s,16051.2 15892.2 16286.6 16328.9 15945.1
-FP sage-1ply checker,1042.4,1024.5,1060.3,1.38,moves_or_evals_per_s,1034.5 1033.0 1055.3 1060.5 1028.8
-FP PureTD 0-ply (4L cubeful) checker,6244.9,6217.8,6272.0,0.35,dec_per_s,6252.4 6236.5 6216.3 6275.9 6243.5
-FP PureTD 0-ply (4L cubeful) cube,18729.9,18401.8,19058.1,1.41,dec_per_s,18652.5 18445.2 19159.9 18746.9 18645.2
-FP Open Sage 0-ply (analyzer) checker,1368.0,1360.4,1375.6,0.45,dec_per_s,1363.4 1365.6 1378.4 1364.0 1368.6
-FP Open Sage 0-ply (analyzer) cube,89.0,88.9,89.2,0.10,dec_per_s,89.1 89.1 88.9 89.1 89.0
-FP Open Sage 1-ply (analyzer) checker,42.7,42.5,42.9,0.39,dec_per_s,42.9 42.7 42.5 42.5 42.7
-FP Open Sage 1-ply (analyzer) cube,67.7,67.6,67.7,0.07,dec_per_s,67.7 67.7 67.6 67.7 67.7
 GNUBG 0-ply cube-off,30371.1,29827.2,30915.0,1.44,dec_per_s,30973.7 30333.1 30185.1 29796.5 30567.0
 GNUBG 0-ply cube-on,54533.6,53902.3,55164.9,0.93,dec_per_s,55113.8 54372.9 55030.7 54027.2 54123.3
 GNUBG 1-ply cube-off,1123.5,1101.4,1145.5,1.58,dec_per_s,1111.2 1132.7 1102.4 1147.6 1123.5

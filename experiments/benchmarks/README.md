@@ -286,14 +286,16 @@ self-play the costlier: its wall-clock carries game bookkeeping and dance-turn
 handling that the denominator (decisions) excludes. One row sits outside the
 band:
 
-- **Sage 0-ply**: self-play costs 2.6× (Zen 5) to 4.0× (Zen 3) the fixed-pool
-  figure — 0.165/0.365 ms against 0.063/0.091 ms fixed-pool, an absolute gap of
-  0.102 ms (Zen 5) and 0.274 ms (Zen 3). prob5 0-ply, measured the same way, is
-  within 5% of its fixed-pool cost on both hosts (0.169/0.447 ms self-play
-  against 0.167/0.427 ms fixed-pool, a gap of 0.002 and 0.020 ms).
+- **Sage 0-ply**: self-play costs 2.7× (Zen 5) to 4.0× (Zen 3) the fixed-pool
+  figure — 0.165/0.365 ms against 0.062/0.091 ms fixed-pool, an absolute gap of
+  0.103 ms (Zen 5) and 0.273 ms (Zen 3). prob5 0-ply, measured the same way, is
+  within ~5% of its fixed-pool cost on both hosts (0.169/0.447 ms self-play
+  against 0.167/0.424 ms fixed-pool, a gap of 0.002 and 0.023 ms).
 
-Full tables with CIs (five-sweep t-intervals):
-`results/selfplay_zen3_epyc7713p_20260811.txt`,
-`results/selfplay_zen5_9995wx_20260811.txt`,
-`results/fixedpool_cubeless_20260809.txt`,
-`results/fixedpool_cubeful_20260809.txt`.
+Full tables with CIs (five-sweep t-intervals): self-play rows in
+`results/selfplay_zen3_epyc7713p_20260811.txt` /
+`results/selfplay_zen5_9995wx_20260811.txt`; fixed-position rows in
+`results/fixedpool_zen3_epyc7713p_20260811.txt` /
+`results/fixedpool_zen5_9995wx_20260811.txt` (one bench.sh run produced
+both; the fixed-position files carry the split rows plus the cube-state
+sensitivity and timing-overhead measurement notes).
