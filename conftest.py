@@ -7,4 +7,5 @@ sys.path.insert(0, _ROOT)
 
 def pytest_configure(config):
     config.addinivalue_line(
-        "markers", "slow: long-running test (deselect with -m 'not slow')")
+        "markers", "slow: test shells out to gnubg or is otherwise slow"
+    )

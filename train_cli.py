@@ -12,9 +12,9 @@ import random
 import torch
 from agents import RandomAgent
 from backgammon_engine import BoardState, WHITE, get_legal_plays, switch_turn
-from encoding import CubefulEncoder
+from encoding import CubefulEncoder, CubefulTakeEncoder, MatchplayEncoder, MatchplayCube1HEncoder
 from model import TDNetwork, suggested_depth_expand_eps
-from modes import CubefulMoneyMode, CubelessMoneyMode, DMPMode
+from modes import CubefulMoneyMode, CubelessMoneyMode, DMPMode, MatchplayMode
 
 
 def parse_hidden_sizes(s: str):
@@ -40,13 +40,35 @@ def resolve_save_path(save: str, game_mode: str, hidden_sizes) -> str:
     return save
 
 
-def build_mode(name: str, jacoby: bool = True):
+def build_mode(name: str, jacoby: bool = True,
+               take_decision_state: bool = False,
+               match_length: int = 2,
+               score_curriculum: float = 0.0,
+               oracle_spec: str = None,
+               oracle_move_eps: float = None,
+               oracle_plies: int = 0,
+               oracle_act_prob: float = 0.0,
+               td_move_eps: float = 0.0,
+               oracle_1ply_eps: float = 0.0,
+               oracle_act_only: bool = False):
     if name == "dmp":
         return DMPMode()
     if name == "cubeless-money":
         return CubelessMoneyMode()
     if name == "cubeful-money":
-        return CubefulMoneyMode(jacoby=jacoby)
+        return CubefulMoneyMode(
+            jacoby=jacoby, take_decision_state=take_decision_state,
+        )
+    if name == "matchplay":
+        return MatchplayMode(match_length=match_length,
+                             score_curriculum=score_curriculum,
+                             oracle_spec=oracle_spec,
+                             oracle_move_eps=oracle_move_eps,
+                             oracle_plies=oracle_plies,
+                             oracle_act_prob=oracle_act_prob,
+                             td_move_eps=td_move_eps,
+                             oracle_1ply_eps=oracle_1ply_eps,
+                             oracle_act_only=oracle_act_only)
     raise ValueError(f"Unknown game mode: {name}")
 
 
@@ -90,12 +112,21 @@ def build_network(args) -> TDNetwork:
     # Mutual exclusivity guard
     warm_start_eq = getattr(args, "warm_start_equity", None)
     warm_start_cf = getattr(args, "warm_start_cubeful", None)
+    warm_start_cft = getattr(args, "warm_start_cubeful_take", None)
+    warm_start_mp = getattr(args, "warm_start_matchplay", None)
+    warm_start_mp1h = getattr(args, "warm_start_matchplay1h", None)
+    warm_start_mpcf = getattr(args, "warm_start_matchplay_cubeful", None)
+    warm_start_mpmet = getattr(args, "warm_start_matchplay_met", None)
     sources = [args.resume, args.expand, args.expand_depth,
-               warm_start_eq, warm_start_cf]
+               warm_start_eq, warm_start_cf, warm_start_cft,
+               warm_start_mp, warm_start_mp1h, warm_start_mpcf,
+               warm_start_mpmet]
     if sum(1 for s in sources if s) > 1:
         raise ValueError(
             "--resume, --expand, --expand-depth, --warm-start-equity, "
-            "and --warm-start-cubeful are mutually exclusive"
+            "--warm-start-cubeful, --warm-start-cubeful-take, "
+            "--warm-start-matchplay, --warm-start-matchplay1h and "
+            "--warm-start-matchplay-cubeful are mutually exclusive"
         )
 
     if args.resume:
@@ -161,6 +192,30 @@ def build_network(args) -> TDNetwork:
 
     if warm_start_cf:
         net = _warm_start_cubeful(warm_start_cf)
+        return net
+
+    if warm_start_cft:
+        net = _warm_start_cubeful_take(warm_start_cft)
+        return net
+
+    if warm_start_mp:
+        net = _warm_start_matchplay(warm_start_mp)
+        return net
+
+    if warm_start_mp1h:
+        net = _warm_start_matchplay1h(warm_start_mp1h)
+        return net
+
+    if warm_start_mpcf:
+        if getattr(args, "met_features", False):
+            from encoding import MatchplayMETEncoder
+            return _warm_start_matchplay_cubeful(
+                warm_start_mpcf, encoder=MatchplayMETEncoder(),
+            )
+        return _warm_start_matchplay_cubeful(warm_start_mpcf)
+
+    if warm_start_mpmet:
+        net = _warm_start_matchplay_met(warm_start_mpmet)
         return net
 
     return TDNetwork(
@@ -253,6 +308,351 @@ def _warm_start_cubeful(path: str) -> TDNetwork:
     return net
 
 
+def _warm_start_cubeful_take(path: str) -> TDNetwork:
+    """Load a cubeful model (200-input) and extend to cubeful_take (201-input).
+
+    Copies the first 200 columns of the input layer from the pretrained
+    cubeful model; the new is_cube_take_decision column is initialized
+    to zero. With zero weights for the new bit, the warm-started model
+    is bit-identical to the source on every state the source could
+    represent (is_cube_take_decision is only ever set on the new
+    take_decision state, which the source never sees), so training
+    starts from a known-good policy and the new state's value is
+    purely learned during fine-tuning.
+
+    Output mode stays equity. Accepts either a CubefulEncoder source
+    (encoder='cubeful_<base>') or, for safety, errors on non-cubeful
+    sources since the input layout would not align.
+    """
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    old_hidden = checkpoint["hidden_sizes"]
+    old_input = checkpoint.get("input_size", 200)
+    old_activation = checkpoint.get("activation", "relu")
+    old_encoder = checkpoint.get("encoder_name", "cubeful_perspective196")
+    if not old_encoder.startswith("cubeful_"):
+        raise ValueError(
+            f"--warm-start-cubeful-take expects a cubeful source model "
+            f"(encoder='cubeful_<base>'); got encoder={old_encoder!r}. "
+            f"For a cubeless source, use --warm-start-cubeful first."
+        )
+
+    encoder = CubefulTakeEncoder()
+    new_input = encoder.num_features  # 201
+    if new_input != old_input + 1:
+        raise ValueError(
+            f"--warm-start-cubeful-take expects source input_size+1 == "
+            f"new input_size; got {old_input}+1 != {new_input}"
+        )
+
+    net = TDNetwork(
+        hidden_sizes=old_hidden,
+        input_size=new_input,
+        activation=old_activation,
+        output_mode="equity",
+        encoder_name=encoder.name,
+    )
+
+    old_state = checkpoint.get("state_dict", checkpoint)
+    new_state = net.state_dict()
+
+    for key in new_state:
+        if key == "hidden_layers.0.weight":
+            old_weight = old_state[key]
+            # Zero-init the new column (is_cube_take_decision bit).
+            new_state[key].zero_()
+            new_state[key][:, :old_input] = old_weight
+        elif key in old_state:
+            new_state[key] = old_state[key]
+
+    net.load_state_dict(new_state)
+    print(f"Warm-started cubeful_take from: {path}")
+    print(f"  Input: {old_input} -> {new_input} "
+          f"(new is_cube_take_decision column zero-initialized)")
+    print(f"  Hidden: {old_hidden}, encoder: {encoder.name}")
+    return net
+
+
+def _warm_start_matchplay(path: str) -> TDNetwork:
+    """Load a 196-input model (DMP or cubeless-money) and extend it
+    to the matchplay encoder layout (204 inputs).
+
+    Equity sources (cubeless money): the output layer is copied as-is
+    and reinterpreted through the probability head’s sigmoid, giving
+    sigmoid(equity logit) — monotone in winning-ness and roughly
+    calibrated (equity 0 → P 0.5). The hidden layers carry
+    gammon-discriminating features that a DMP source lacks.
+
+    Copies the first 196 columns of the input layer from the source;
+    the 8 new match-feature columns (cube one-hot, is_cube_action,
+    cube_value, away scores, crawford) are zero-initialized, so the
+    warm-started model initially predicts the source's P(win game)
+    regardless of cube or score — exactly correct at 1-away/1-away
+    (DMP) and a sensible monotone starting point elsewhere. Score and
+    cube sensitivity is then purely learned during matchplay training.
+    """
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    old_hidden = checkpoint["hidden_sizes"]
+    old_input = checkpoint.get("input_size", 196)
+    old_activation = checkpoint.get("activation", "relu")
+    old_encoder = checkpoint.get("encoder_name", "perspective196")
+    old_output = checkpoint.get("output_mode", "probability")
+    if old_encoder != "perspective196":
+        raise ValueError(
+            f"--warm-start-matchplay expects a perspective196 source "
+            f"(e.g. a DMP model); got encoder={old_encoder!r}."
+        )
+    if old_output not in ("probability", "equity"):
+        raise ValueError(
+            f"--warm-start-matchplay expects a probability- or "
+            f"equity-output source; got output_mode={old_output!r}."
+        )
+
+    encoder = MatchplayEncoder()
+    new_input = encoder.num_features  # 204
+    if new_input != old_input + 8:
+        raise ValueError(
+            f"--warm-start-matchplay expects source input_size+8 == "
+            f"new input_size; got {old_input}+8 != {new_input}"
+        )
+
+    net = TDNetwork(
+        hidden_sizes=old_hidden,
+        input_size=new_input,
+        activation=old_activation,
+        output_mode="probability",
+        encoder_name=encoder.name,
+    )
+
+    old_state = checkpoint.get("state_dict", checkpoint)
+    new_state = net.state_dict()
+
+    for key in new_state:
+        if key == "hidden_layers.0.weight":
+            old_weight = old_state[key]
+            # Zero-init the 8 new match-feature columns.
+            new_state[key].zero_()
+            new_state[key][:, :old_input] = old_weight
+        elif key in old_state:
+            new_state[key] = old_state[key]
+
+    net.load_state_dict(new_state)
+    print(f"Warm-started matchplay from: {path}")
+    print(f"  Input: {old_input} -> {new_input} "
+          f"(8 new match-feature columns zero-initialized)")
+    print(f"  Hidden: {old_hidden}, encoder: {encoder.name}")
+    return net
+
+
+def _warm_start_matchplay1h(path: str) -> TDNetwork:
+    """Load a matchplay (204-input, raw cube scalar) net and convert
+    it to the matchplay1h layout (207 inputs, cube value one-hot).
+
+    Function-preserving: the old cube_value column contributed
+    w * cube_value to each first-layer unit; setting the one-hot
+    column for cube level 2^k to w * 2^k reproduces the identical
+    activation at every reachable cube, so the warm-started net plays
+    exactly like the source until training decouples the levels.
+    """
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    old_hidden = checkpoint["hidden_sizes"]
+    old_input = checkpoint.get("input_size", 196)
+    old_activation = checkpoint.get("activation", "relu")
+    old_encoder = checkpoint.get("encoder_name", "perspective196")
+    old_output = checkpoint.get("output_mode", "probability")
+    if old_encoder != "matchplay_perspective196":
+        raise ValueError(
+            f"--warm-start-matchplay1h expects a matchplay_perspective196 "
+            f"source; got encoder={old_encoder!r}."
+        )
+    if old_output != "probability":
+        raise ValueError(
+            f"--warm-start-matchplay1h expects probability output; "
+            f"got {old_output!r}."
+        )
+    encoder = MatchplayCube1HEncoder()
+    n_base = encoder._base.num_features  # 196
+    new_input = encoder.num_features     # 207
+    assert old_input == n_base + 8 and new_input == n_base + 11
+
+    net = TDNetwork(
+        hidden_sizes=old_hidden,
+        input_size=new_input,
+        activation=old_activation,
+        output_mode="probability",
+        encoder_name=encoder.name,
+    )
+    old_state = checkpoint.get("state_dict", checkpoint)
+    new_state = net.state_dict()
+    for key in new_state:
+        if key == "hidden_layers.0.weight":
+            w_old = old_state[key]
+            w_new = new_state[key]
+            w_new.zero_()
+            # base board features + [persp 3-hot, is_cube_action]
+            w_new[:, :n_base + 4] = w_old[:, :n_base + 4]
+            # cube one-hot: level 2^k gets old scalar column * 2^k
+            w_cv = w_old[:, n_base + 4]
+            for k in range(4):
+                w_new[:, n_base + 4 + k] = w_cv * float(2 ** k)
+            # away, away, crawford shift by 3
+            w_new[:, n_base + 8:n_base + 11] = w_old[:, n_base + 5:n_base + 8]
+        elif key in old_state:
+            new_state[key] = old_state[key]
+    net.load_state_dict(new_state)
+    print(f"Warm-started matchplay1h from: {path}")
+    print(f"  Input: {old_input} -> {new_input} (cube scalar -> one-hot, "
+          f"function-preserving w*2^k init)")
+    print(f"  Hidden: {old_hidden}, encoder: {encoder.name}")
+    return net
+
+
+def _warm_start_matchplay_cubeful(path: str, encoder=None) -> TDNetwork:
+    """Load a CUBEFUL MONEY net (200 inputs, equity head) and extend it
+    to a matchplay layout.
+
+    Why this source rather than DMP: the cubeful money encoder's four
+    appended columns — [cube 3-hot, is_cube_action] — are the same four
+    columns, in the same order, that the matchplay encoders append
+    first, so they transfer bit-for-bit (asserted in
+    tests/test_warm_start_cubeful.py). A DMP source has no cube columns
+    at all, and is trained on a game where gammons are worthless — a
+    poor prior for 3-point play where gammon pricing dominates.
+
+    Everything the source cannot know (cube LEVEL, away scores,
+    Crawford, and the MET block if present) is zero-initialised, so the
+    warm-started net initially predicts the source's cube-context-aware
+    value regardless of score. Zero-init is safe for INPUT columns:
+    unlike the width_expand dead-unit bug, the gradient w.r.t. an input
+    weight is (input value x upstream grad), which is non-zero as soon
+    as the feature is.
+
+    The equity head is reinterpreted through the probability head's
+    sigmoid, exactly as _warm_start_matchplay does for cubeless-money
+    sources: sigmoid(equity) is monotone in winning-ness and sends
+    equity 0 to P 0.5.
+    """
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    old_hidden = checkpoint["hidden_sizes"]
+    old_input = checkpoint.get("input_size", 200)
+    old_activation = checkpoint.get("activation", "relu")
+    old_encoder = checkpoint.get("encoder_name", "cubeful_perspective196")
+    old_output = checkpoint.get("output_mode", "equity")
+
+    if old_encoder != "cubeful_perspective196":
+        raise ValueError(
+            f"--warm-start-matchplay-cubeful expects a "
+            f"cubeful_perspective196 source (e.g. "
+            f"best_models/cubeful_money_512_512_256_256.pt); got "
+            f"encoder={old_encoder!r}."
+        )
+    if old_output not in ("equity", "probability"):
+        raise ValueError(
+            f"--warm-start-matchplay-cubeful expects an equity- or "
+            f"probability-output source; got {old_output!r}."
+        )
+
+    if encoder is None:
+        encoder = MatchplayCube1HEncoder()
+    n_base = encoder._base.num_features          # 196
+    n_shared = n_base + 4                        # base + [3-hot, is_cube_action]
+    new_input = encoder.num_features
+    if old_input != n_shared:
+        raise ValueError(
+            f"--warm-start-matchplay-cubeful expects a {n_shared}-input "
+            f"source (196 board + 4 cube); got {old_input}."
+        )
+    if new_input < old_input:
+        raise ValueError(
+            f"target encoder {encoder.name} has {new_input} inputs, "
+            f"fewer than the {old_input}-input source."
+        )
+
+    net = TDNetwork(
+        hidden_sizes=old_hidden,
+        input_size=new_input,
+        activation=old_activation,
+        output_mode="probability",
+        encoder_name=encoder.name,
+    )
+
+    old_state = checkpoint.get("state_dict", checkpoint)
+    new_state = net.state_dict()
+    for key in new_state:
+        if key == "hidden_layers.0.weight":
+            new_state[key].zero_()
+            new_state[key][:, :n_shared] = old_state[key][:, :n_shared]
+        elif key in old_state:
+            new_state[key] = old_state[key]
+    net.load_state_dict(new_state)
+
+    print(f"Warm-started matchplay from cubeful money: {path}")
+    print(f"  Input: {old_input} -> {new_input} "
+          f"({n_shared} copied incl. cube perspective, "
+          f"{new_input - n_shared} zero-init)")
+    print(f"  Output: {old_output} -> probability (via sigmoid)")
+    print(f"  Hidden: {old_hidden}, encoder: {encoder.name}")
+    return net
+
+
+def _warm_start_matchplay_met(path: str) -> TDNetwork:
+    """Extend a matchplay1h net (207) to the MET-feature layout (220).
+
+    Function-preserving: the 13 new columns are zero-initialised, so
+    the model is bit-identical to the source until training gives the
+    MET block weight. That makes a Phase-2 champion the natural
+    starting point for the feature arm, and any measured difference
+    attributable to the features alone.
+    """
+    from encoding import MatchplayMETEncoder
+
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    old_hidden = checkpoint["hidden_sizes"]
+    old_input = checkpoint.get("input_size", 207)
+    old_activation = checkpoint.get("activation", "relu")
+    old_encoder = checkpoint.get("encoder_name", "matchplay1h_perspective196")
+    old_output = checkpoint.get("output_mode", "probability")
+
+    if old_encoder != "matchplay1h_perspective196":
+        raise ValueError(
+            f"--warm-start-matchplay-met expects a "
+            f"matchplay1h_perspective196 source; got {old_encoder!r}."
+        )
+    if old_output != "probability":
+        raise ValueError(
+            f"--warm-start-matchplay-met expects probability output; "
+            f"got {old_output!r}."
+        )
+
+    encoder = MatchplayMETEncoder()
+    new_input = encoder.num_features
+    if new_input != old_input + 13:
+        raise ValueError(
+            f"expected source+13 == target; got {old_input}+13 != {new_input}"
+        )
+
+    net = TDNetwork(
+        hidden_sizes=old_hidden,
+        input_size=new_input,
+        activation=old_activation,
+        output_mode="probability",
+        encoder_name=encoder.name,
+    )
+    old_state = checkpoint.get("state_dict", checkpoint)
+    new_state = net.state_dict()
+    for key in new_state:
+        if key == "hidden_layers.0.weight":
+            new_state[key].zero_()
+            new_state[key][:, :old_input] = old_state[key]
+        elif key in old_state:
+            new_state[key] = old_state[key]
+    net.load_state_dict(new_state)
+    print(f"Warm-started matchplay MET features from: {path}")
+    print(f"  Input: {old_input} -> {new_input} "
+          f"(13 MET columns zero-init, function-preserving)")
+    print(f"  Hidden: {old_hidden}, encoder: {encoder.name}")
+    return net
+
+
 def eval_vs_random(agent, n_games: int = 200, seed: int = 99) -> float:
     """Play `n_games` of `agent` (WHITE) vs RandomAgent. Returns win rate."""
     rng = random.Random(seed)
@@ -277,11 +677,18 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     """Args shared by train_online.py and train_batch.py."""
     g_arch = parser.add_argument_group("network / game")
     g_arch.add_argument("--game-mode",
-                        choices=["dmp", "cubeless-money", "cubeful-money"],
+                        choices=["dmp", "cubeless-money", "cubeful-money",
+                                 "matchplay"],
                         required=True,
                         help="Game type: dmp (single game DMP), "
-                             "cubeless-money (money play, no cube), or "
-                             "cubeful-money (money play with doubling cube).")
+                             "cubeless-money (money play, no cube), "
+                             "cubeful-money (money play with doubling cube), "
+                             "or matchplay (N-point match; see "
+                             "--match-length).")
+    g_arch.add_argument("--match-length", type=int, default=2, metavar="N",
+                        help="Matchplay only: match length in points "
+                             "(episode = one full N-point match). "
+                             "Default: 2.")
     g_arch.add_argument("--jacoby", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Jacoby rule for cubeful-money: gammons/bgs "
@@ -343,6 +750,46 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
                            "196-input model (DMP or cubeless money). Extends "
                            "input 196->200 (adds cube features), sets output "
                            "to equity.")
+    g_io.add_argument("--warm-start-cubeful-take", default=None, metavar="PATH",
+                      help="Initialize a cubeful_take_* model from an "
+                           "existing cubeful_* model. Extends input "
+                           "200->201 (adds the is_cube_take_decision "
+                           "bit, zero-initialized so the new model is "
+                           "bit-identical to the source on chequer and "
+                           "cube-offer states). Pair with "
+                           "--take-decision-state in train_batch.")
+    g_io.add_argument("--warm-start-matchplay1h", default=None, metavar="PATH",
+                      help="Initialize a matchplay1h model (cube value "
+                           "one-hot, 207 inputs) from an existing "
+                           "matchplay_perspective196 model. "
+                           "Function-preserving (w*2^k column init).")
+    g_io.add_argument("--warm-start-matchplay-met", default=None,
+                      metavar="PATH",
+                      help="Extend a matchplay1h model (207 inputs) to the "
+                           "MET-feature layout (220 inputs: +6 no-double, "
+                           "+6 double-take, +1 double-drop outcome MWCs). "
+                           "Function-preserving (13 zero-init columns).")
+    g_io.add_argument("--met-features", action="store_true",
+                      help="With --warm-start-matchplay-cubeful, target the "
+                           "220-input MET-feature encoder instead of the "
+                           "207-input matchplay1h encoder.")
+    g_io.add_argument("--warm-start-matchplay-cubeful", default=None,
+                      metavar="PATH",
+                      help="Initialize a matchplay1h model (207 inputs) "
+                           "from a CUBEFUL MONEY model "
+                           "(cubeful_perspective196, 200 inputs, equity "
+                           "head). The 4 cube-context columns transfer "
+                           "bit-for-bit; cube level, away scores and "
+                           "crawford are zero-initialized. Preferred over "
+                           "--warm-start-matchplay (DMP), which starts "
+                           "from a gammon-blind net with no cube columns.")
+    g_io.add_argument("--warm-start-matchplay", default=None, metavar="PATH",
+                      help="Initialize a matchplay model from a 196-input "
+                           "probability model (e.g. a DMP net). Extends "
+                           "input 196->204 (adds cube + away-score + "
+                           "crawford features, zero-initialized so the "
+                           "model starts as the source's P(win game) at "
+                           "every score).")
     g_io.add_argument("--save", default=None,
                       help="Path to save the trained network at the end of the run.")
 

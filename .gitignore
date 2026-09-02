@@ -7,9 +7,14 @@ __pycache__/
 *.pt
 !best_models/**/*.pt
 
-# models/ and working_models/ are local training scratch — never committed.
-# Curated checkpoints live in best_models/ (whitelisted above).
+# models/ holds working output and per-run checkpoints -- NOT tracked.
+# Only promoted models belong in git, under best_models/.
+# Ignore everything in models/ except .gitkeep
+# (prevents stray .log/.json/.npz/etc. from being accidentally committed).
 models/
+models/**/*
+!models/.gitkeep
+# working_models/ is local training scratch — never committed.
 working_models/
 
 # build artifacts

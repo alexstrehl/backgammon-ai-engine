@@ -35,8 +35,8 @@ from backgammon_engine import (
     switch_turn,
 )
 from encoding import (
-    CubefulEncoder, CubePerspective, get_encoder,
-    OPP_OFF_INDEX, TERMINAL_OFF_THRESHOLD,
+    CubefulEncoder, CubefulTakeEncoder, CubePerspective, MatchplayEncoder,
+    get_encoder, OPP_OFF_INDEX, TERMINAL_OFF_THRESHOLD,
 )
 from model import TDNetwork
 
@@ -120,6 +120,15 @@ class TDAgent(Agent):
     equity output modes (inherited from the network).
     """
 
+    # ── GPU eval server hookup (opt-in, off by default) ──────────────
+    # Set by `trainer._collect_worker` when `--gpu-eval-server` is
+    # active: a `gpu_eval_server.RemoteEvaluator` that ships matchplay
+    # feature matrices to the single GPU server process instead of
+    # running the forward locally. Class attributes so the default path
+    # costs one attribute lookup and `__init__` is untouched.
+    _remote_eval = None          # None => every forward stays local
+    _remote_eval_moves = False   # also route choose_checker_action_matchplay
+
     def __init__(
         self,
         network: TDNetwork,
@@ -131,6 +140,8 @@ class TDAgent(Agent):
         twoply_k: int = 0,
         boltzmann_temp: float = 0.0,
         bf16_inference: bool = False,
+        met=None,
+        met_scopes=None,
     ):
         """
         Args:
@@ -182,10 +193,17 @@ class TDAgent(Agent):
             encoder = get_encoder(encoder_name)
         self.encoder = encoder
         self.is_cubeful = isinstance(encoder, CubefulEncoder)
+        self.is_cubeful_take = isinstance(encoder, CubefulTakeEncoder)
+        self.is_matchplay = isinstance(encoder, MatchplayEncoder)
         if self.is_cubeful and self.output_mode != "equity":
             raise ValueError(
                 "CubefulEncoder requires output_mode='equity'; "
                 f"got {self.output_mode!r}."
+            )
+        if self.is_matchplay and self.output_mode != "probability":
+            raise ValueError(
+                "MatchplayEncoder requires output_mode='probability' "
+                f"(P(win match)); got {self.output_mode!r}."
             )
         self.oneply = oneply
         self.twoply_k = int(twoply_k)
@@ -213,7 +231,7 @@ class TDAgent(Agent):
             and (
                 encoder_name == "perspective196"
                 or (
-                    self.is_cubeful
+                    (self.is_cubeful or self.is_matchplay)
                     and self.encoder.base_name == "perspective196"
                 )
             )
@@ -247,6 +265,20 @@ class TDAgent(Agent):
         # Optional bf16 inference copy for 1-ply target computation.
         # Built once from the current fp32 weights; re-build via
         # `refresh_bf16_inference()` after any state_dict reload.
+        # New-game MWC memo for matchplay (see _eval_new_game).
+        self._new_game_memo = {}
+        # Optional MatchEquityTable. When set, new-game MWC comes from
+        # the table instead of the network's own evaluation — see
+        # _eval_new_game for why that matters, and for what each scope
+        # covers. Default grounds every consumer.
+        self.met = met
+        self.met_scopes = frozenset(
+            met_scopes if met_scopes is not None
+            else ("cube", "terminal", "boundary")
+        )
+        unknown = self.met_scopes - {"cube", "terminal", "boundary"}
+        if unknown:
+            raise ValueError(f"unknown met scope(s): {sorted(unknown)}")
         self.bf16_inference = bool(bf16_inference)
         if self.bf16_inference and self._device_is_cpu \
                 and not cpu_supports_fast_bf16():
@@ -407,16 +439,36 @@ class TDAgent(Agent):
             return chosen[0], chosen[1], target
         return chosen
 
-    def _boltzmann_select(self, values: torch.Tensor) -> int:
+    def _boltzmann_select(self, values: torch.Tensor, rng=None) -> int:
         """Select an index using Boltzmann (softmax) sampling over
         opponent-view values. Lower values are better for us, so we
-        negate before softmax. Returns argmin when temp=0."""
+        negate before softmax. Returns argmin when temp=0.
+
+        `rng` (a `random.Random`) draws the sample from the EPISODE's own
+        stream instead of torch's global one. That is what makes temp > 0
+        usable in the vectorized collector: under lockstep many episodes
+        interleave in one process, so a global-RNG draw would depend on
+        the batch size B and the data would stop being reproducible. One
+        episode-rng draw per sampled decision is consumed in the same
+        order by the serial and generator collectors, so both produce
+        byte-identical episodes from a shared seed. temp == 0 consumes
+        NO draw, so greedy runs are unchanged.
+        """
         if self.boltzmann_temp <= 0.0 or len(values) == 1:
             return int(torch.argmin(values).item())
         # Negate: lower opp value = better for us = higher probability
         logits = -values.squeeze() / self.boltzmann_temp
         probs = torch.softmax(logits, dim=0)
-        return int(torch.multinomial(probs, 1).item())
+        if rng is None:
+            return int(torch.multinomial(probs, 1).item())
+        u = rng.random()
+        acc = 0.0
+        pl = probs.tolist()
+        for i, pi in enumerate(pl):
+            acc += pi
+            if u < acc:
+                return i
+        return len(pl) - 1
 
     def _terminal_opp_value(self, next_state: BoardState) -> float:
         """Value a terminal next_state from the opponent's view (i.e.
@@ -736,6 +788,27 @@ class TDAgent(Agent):
                 return self._bf16_net(t.to(torch.bfloat16)).to(torch.float32)
             return self.network(t)
 
+    def _matchplay_values_np(self, features: np.ndarray) -> np.ndarray:
+        """(N, n_feat) fp32 features -> (N,) fp32 values.
+
+        Routes through the GPU eval server when one is attached
+        (`--gpu-eval-server`), else runs the forward locally. The local
+        branch is byte-for-byte the expression it replaced, so with no
+        server attached -- the default -- this is not a behaviour change.
+
+        The server returns None when the request exceeds its shared
+        buffer, which is why the local forward is not an `else`: it is
+        also the overflow fallback.
+        """
+        remote = self._remote_eval
+        if remote is not None:
+            out = remote.forward(features)
+            if out is not None:
+                return out
+        t = self._to_device(torch.from_numpy(features))
+        with torch.no_grad():
+            return self.network(t).cpu().numpy().ravel()
+
     def _value_oneply_checker_batched(self, state: BoardState) -> float:
         """Same semantics as value_oneply_checker but issues ONE
         batched forward across all 21 inner dice, instead of 21
@@ -1054,9 +1127,8 @@ class TDAgent(Agent):
     # cubeless methods but take a CubePerspective so the cube one-hot
     # is appended to every encoding.
     #
-    # Scope: money-game cube actions only. Matchplay cube decisions
-    # will live on a MatchplayTDAgent subclass that overrides
-    # offer_double / respond_to_double / terminal_target.
+    # Scope: money-game cube actions only; matchplay cube decisions
+    # live in the matchplay section below.
     #
     # Value convention: the network learns the NORMALIZED per-unit
     # equity of a position (cube_value = 1). Actual equity at the
@@ -1110,6 +1182,446 @@ class TDAgent(Agent):
             return 1.0 >= v_no_double  # too good check
         return v_double_take > v_no_double
 
+    # ── Matchplay value / cube / checker methods ────────────────────────
+    #
+    # These exist only when self.is_matchplay is True. The network
+    # output is P(on-roll player wins the MATCH) ∈ [0, 1]; all values
+    # below are match-winning chances (MWC), never money equity, and
+    # cube_value NEVER multiplies a target — it only drives score
+    # transitions via MatchState.after_game.
+    #
+    # Perspective rules (the historical source of most matchplay bugs):
+    #   - MatchState stores away scores in WHITE's view, always.
+    #   - _match_features flips them to the viewer's view; the viewer
+    #     is state.turn for board encodings.
+    #   - Every value is P(<viewer> wins match); flip with 1 - V.
+
+    def _match_features(self, match_state, viewer: int):
+        """(cube_persp, cube_value, my_away, opp_away, crawford) from
+        `viewer`'s perspective. Away scores auto-flip for BLACK."""
+        from modes import cube_perspective  # local: modes imports td_agent
+        persp = cube_perspective(match_state.cube_owner, viewer)
+        if viewer == 0:  # WHITE
+            my_away, opp_away = match_state.my_away, match_state.opp_away
+        else:
+            my_away, opp_away = match_state.opp_away, match_state.my_away
+        return (
+            persp, match_state.cube_value, my_away, opp_away,
+            match_state.is_crawford,
+        )
+
+    def _encode_matchplay(
+        self, state: BoardState, match_state, is_cube_action: bool = False,
+    ) -> np.ndarray:
+        """Encode `state` from the on-roll player's perspective with
+        match features (cube + away scores + crawford) appended. Uses
+        the C fast path for base features when available."""
+        persp, cube_value, my_away, opp_away, crawford = (
+            self._match_features(match_state, state.turn)
+        )
+        if self._c_base_available:
+            base = _bg_fast.encode_state(state)
+        else:
+            base = self.encoder._base.encode(state)
+        return self.encoder.encode_with_base(
+            base, persp, cube_value, my_away, opp_away, crawford,
+            is_cube_action,
+        )
+
+    def evaluate_matchplay(
+        self, state: BoardState, match_state, is_cube_action: bool = False,
+    ) -> float:
+        """P(on-roll player at `state` wins the match)."""
+        x = self._encode_matchplay(state, match_state, is_cube_action)
+        t = torch.from_numpy(x)
+        t = self._to_device(t)
+        with torch.no_grad():
+            return self.network(t.unsqueeze(0)).item()
+
+    def _eval_new_game(self, match_state, player: int,
+                       scope: str = "cube") -> float:
+        """P(`player` wins the match) standing at the START of a new
+        game at `match_state`'s score, before the opening roll.
+
+        This is the single point through which ALL cross-game equity
+        enters matchplay: `v_dp` in the cube decision, the responder's
+        take point, terminal-successor pricing in move selection (i.e.
+        what a gammon is worth at this score), and the collector's
+        game-boundary grounding target.
+
+        With `self.met` set it is an exact table lookup. Without it the
+        network is its own match-equity table — every one of the above
+        becomes a bootstrap off the net's own values, and pure TD(0)
+        then admits self-consistent wrong fixed points at cube
+        decisions (the "grounding hole").
+
+        `scope` names the CALLER, so grounding can be applied per
+        consumer via `met_scopes`:
+          "cube"     — v_dp in offer/respond_to_double. This one is a
+                       PURE table lookup: being dropped scores
+                       cube_value points, and what that is worth is a
+                       MET entry with no board dependence at all.
+          "terminal" — gammon/backgammon pricing of terminal successors
+                       during move selection and 1-ply targets.
+          "boundary" — the collector's game-boundary training target.
+                       Unlike the other two this one trains the net's
+                       OWN scale toward the table.
+        v_nd and v_dt are deliberately absent: they are board-dependent
+        (they need this position's win/gammon/backgammon rates) and no
+        table can supply them. Grounding those needs a different output
+        representation, not a bigger table.
+
+        `_eval_new_game_net` keeps the learned version reachable — it
+        is the implicit-MET diagnostic (`eval_matchplay.py --met-only`),
+        and with a table pinned it becomes a direct measure of how far
+        the net's internal beliefs have drifted from ground truth.
+        """
+        if self.met is None or scope not in self.met_scopes:
+            return self._eval_new_game_net(match_state, player)
+        ms = match_state.start_game()
+        # MatchState stores away scores in WHITE's view, and player 0
+        # is WHITE — the same convention met.mwc() takes.
+        p_white = self.met.mwc(
+            ms.my_away, ms.opp_away, ms.crawford_done, ms.is_crawford,
+        )
+        return p_white if player == 0 else 1.0 - p_white
+
+    def _eval_new_game_net(self, match_state, player: int) -> float:
+        """The network's own new-game MWC (the pre-MET behaviour).
+
+        The network serves as its own implicit match-equity table:
+        evaluate the initial position once with WHITE on roll and once
+        with BLACK on roll, and average — who wins the opening roll is
+        worth real equity, and averaging removes that bias. Callers
+        must check match_over() first.
+
+        Memoized per weight-version: the score lattice is tiny (a few
+        (my_away, opp_away, crawford) combinations) while bear-off
+        moves can hit this dozens of times per turn via terminal
+        successors. The memo MUST be cleared whenever the network
+        weights change (see clear_matchplay_memo); collection workers
+        rebuild the agent per round so they are always consistent."""
+        key = (
+            match_state.my_away, match_state.opp_away,
+            match_state.crawford_done, match_state.match_length,
+        )
+        hit = self._new_game_memo.get(key)
+        if hit is None:
+            ms = match_state.start_game()
+            initial = BoardState.initial()
+            v_white_on_roll = self.evaluate_matchplay(initial, ms)
+            v_black_on_roll = self.evaluate_matchplay(switch_turn(initial), ms)
+            hit = 0.5 * (v_white_on_roll + (1.0 - v_black_on_roll))
+            self._new_game_memo[key] = hit
+        return hit if player == 0 else 1.0 - hit
+
+    def clear_matchplay_memo(self) -> None:
+        """Invalidate the new-game MWC memo. Must be called after any
+        in-place weight change when the same agent keeps collecting
+        (the master's single-process path); worker processes rebuild
+        their agent every round and never need it."""
+        self._new_game_memo.clear()
+
+    def offer_double_matchplay(self, state: BoardState, match_state) -> CubeOffer:
+        """Matchplay pre-roll cube decision for `state.turn`.
+
+        Compares MWC of playing on vs doubling:
+          v_nd: P(win match) playing on at the current cube.
+          v_dt: P(win match) if we double and opponent takes (cube
+                transfers, value doubles; we are still on roll).
+          v_dp: P(win match) if we double and opponent passes — we
+                score cube_value points and a new game starts (1.0 if
+                that wins the match).
+        The opponent picks the response worse for us, so:
+          double iff min(v_dt, v_dp) > v_nd.
+        """
+        player = state.turn
+        if not match_state.can_offer(player):
+            return CubeOffer(should_double=False, _cache=None)
+
+        v_nd = self.evaluate_matchplay(state, match_state, is_cube_action=False)
+        ms_take = match_state.after_take(player)
+        v_dt = self.evaluate_matchplay(state, ms_take, is_cube_action=False)
+        ms_pass = match_state.after_game(1, winner_is_me=(player == 0))
+        if ms_pass.match_over():
+            v_dp = 1.0
+        else:
+            v_dp = self._eval_new_game(ms_pass, player, scope="cube")
+
+        should_double = min(v_dt, v_dp) > v_nd
+        return CubeOffer(
+            should_double=should_double,
+            _cache={"v_nd": v_nd, "v_dt": v_dt, "v_dp": v_dp},
+        )
+
+    def respond_to_double_matchplay(
+        self,
+        state: BoardState,
+        match_state,
+        hint: Optional[CubeOffer] = None,
+    ) -> bool:
+        """Take/pass from the player who was just doubled. True = take.
+
+        Convention: `state.turn` is the DOUBLER (cube decisions happen
+        pre-roll, before the doubler's dice). All cached/recomputed
+        values are P(doubler wins match); zero-sum gives the responder
+        rule directly: take iff 1 - v_dt > 1 - v_dp, i.e. v_dp > v_dt.
+        """
+        if hint is not None and hint._cache and "v_dt" in hint._cache:
+            return hint._cache["v_dp"] > hint._cache["v_dt"]
+        doubler = state.turn
+        ms_take = match_state.after_take(doubler)
+        v_dt = self.evaluate_matchplay(state, ms_take, is_cube_action=False)
+        ms_pass = match_state.after_game(1, winner_is_me=(doubler == 0))
+        if ms_pass.match_over():
+            v_dp = 1.0
+        else:
+            v_dp = self._eval_new_game(ms_pass, doubler, scope="cube")
+        return v_dp > v_dt
+
+    def choose_checker_action_matchplay(
+        self, state: BoardState, dice, match_state, rng=None,
+    ):
+        """Matchplay 0-ply move selection. Returns `(next_state,
+        bootstrap)` or None on forced pass. `bootstrap` is P(mover wins
+        match) of the chosen successor.
+
+        Successors are encoded from the opponent's perspective (the
+        engine switches turn), so we argmin over P(opp wins match).
+        Terminal successors (mover just won the game) are overridden
+        with the true value: 1.0 if the resulting score wins the match,
+        else the new-game evaluation at the updated score — this is how
+        gammon value at the current score (e.g. 2-away) enters move
+        selection.
+        """
+        plays = get_legal_plays(state, dice)
+        if not plays:
+            return None
+        mover = state.turn
+        opponent = 1 - mover
+        next_states = [s for _, s in plays]
+
+        if self._c_base_available:
+            base_feats = np.stack([
+                _bg_fast.encode_state(s) for s in next_states
+            ])
+        else:
+            base = self.encoder._base
+            base_feats = np.stack([base.encode(s) for s in next_states])
+
+        persp, cube_value, my_away, opp_away, crawford = (
+            self._match_features(match_state, opponent)
+        )
+        opp_cube_action = match_state.can_offer(opponent)
+        extra_row = self.encoder.match_extras(
+            persp, cube_value, my_away, opp_away, crawford,
+            opp_cube_action,
+        )
+        extra = np.tile(extra_row, (len(next_states), 1))
+        features = np.concatenate([base_feats, extra], axis=1)
+
+        t = torch.from_numpy(features)
+        t = self._to_device(t)
+        # P(opp wins match) per successor. Only 4% of a worker's rows
+        # (mean batch ~18) for 50% of its forwards, so routing this is a
+        # separate opt-in: it doubles the server request rate to capture
+        # a twentieth of the FLOPs. `t` is still built either way -- it
+        # is a zero-copy view on CPU -- so the terminal-mask and
+        # selection code below is untouched.
+        values = None
+        if self._remote_eval is not None and self._remote_eval_moves:
+            _vals = self._remote_eval.forward(features)
+            if _vals is not None:
+                values = torch.from_numpy(_vals)
+        if values is None:
+            with torch.no_grad():
+                values = self.network(t)
+
+        terminal_mask = t[:, OPP_OFF_INDEX] >= TERMINAL_OFF_THRESHOLD
+        if terminal_mask.any():
+            values = values.clone()
+            for i in torch.nonzero(terminal_mask).flatten().tolist():
+                gr = next_states[i].game_result()
+                new_ms = match_state.after_game(
+                    gr, winner_is_me=(mover == 0),
+                )
+                if new_ms.match_over():
+                    mover_val = 1.0
+                else:
+                    mover_val = self._eval_new_game(
+                        new_ms, mover, scope="terminal")
+                values[i] = 1.0 - mover_val
+        idx = self._boltzmann_select(values, rng=rng)
+        chosen = next_states[idx]
+        bootstrap = 1.0 - float(values[idx].item())
+        return chosen, bootstrap
+
+    def value_oneply_checker_matchplay(self, state: BoardState, match_state,
+                                       cube_fold: bool = False) -> float:
+        """1-ply MWC target for `state.turn` at a checker decision.
+
+        Enumerates all 21 dice outcomes, picks the mover's best move
+        per dice by 0-ply matchplay evaluation, and averages over dice
+        probabilities. Terminal successors are priced exactly via
+        after_game -> 1.0 / new-game MWC at the updated score — gammon
+        value at the current score enters every dice branch here,
+        which is the main signal the 0-ply chosen-move bootstrap
+        only sees when a terminal move is actually on the board.
+
+        Mirrors choose_checker_action_matchplay's encoding: successors
+        are evaluated from the opponent's perspective with the
+        opponent's cube-phase eligibility flag set.
+
+        `cube_fold` (gnubg MakeCubePos/GetECF3 semantics): when the
+        opponent has a live cube window at the successors, price it
+        EXPLICITLY as the optimal-action composition the cube samples
+        train with —
+            V_opp(s') = max(v_nd', min(v_dt', v_dp'))
+            v_nd' = V(s' | current cube, is_cube_action=0)
+            v_dt' = V(s' | doubled cube, owner flipped, ca=0)
+            v_dp' = new-game MWC after the opponent scores cube_value
+        — instead of reading the net's is_cube_action=1 channel, which
+        carries an ownership-odd ~±10 mMWC miscalibration that the
+        plain 1-ply target would transport into every checker value;
+        the fold replaces the aliased read with the same backup
+        formula used everywhere else.
+        """
+        mover = state.turn
+        opponent = 1 - mover
+        persp, cube_value, my_away, opp_away, crawford = (
+            self._match_features(match_state, opponent)
+        )
+        opp_cube_action = match_state.can_offer(opponent)
+
+        feat_chunks: List[np.ndarray] = []
+        per_dice: List[Tuple[Optional[int], Optional[int], float, Optional[float]]] = []
+        term_overrides: List[Tuple[int, float]] = []  # (global idx, opp-view value)
+        forced_value: Optional[float] = None  # dice-independent
+        pos = 0
+        for d1, d2 in _DICE_OUTCOMES:
+            prob = (1.0 / 36.0) if d1 == d2 else (2.0 / 36.0)
+            if self._c_base_available:
+                # C fast path: move-gen + base encode in one call. The
+                # lazy states view is invalidated by the NEXT _bg_fast
+                # call, so terminal states are materialized within this
+                # iteration; the features array is owned and persists.
+                base_feats, states_view = _bg_fast.get_legal_plays_encoded(
+                    state, (d1, d2),
+                )
+                n_moves = base_feats.shape[0] if base_feats is not None else 0
+            else:
+                plays = get_legal_plays(state, (d1, d2))
+                n_moves = len(plays)
+                if n_moves:
+                    states_view = [s for _, s in plays]
+                    base = self.encoder._base
+                    base_feats = np.stack([
+                        base.encode(s) for s in states_view
+                    ])
+            if not n_moves:
+                if forced_value is None:
+                    opp_view = switch_turn(state)
+                    if cube_fold and match_state.can_offer(opp_view.turn):
+                        v_nd = self.evaluate_matchplay(
+                            opp_view, match_state, is_cube_action=False)
+                        ms_take = match_state.after_take(opp_view.turn)
+                        v_dt = self.evaluate_matchplay(
+                            opp_view, ms_take, is_cube_action=False)
+                        ms_pass = match_state.after_game(
+                            1, winner_is_me=(opp_view.turn == 0))
+                        v_dp = (1.0 if ms_pass.match_over()
+                                else self._eval_new_game(
+                                    ms_pass, opp_view.turn, scope="cube"))
+                        v_opp = max(v_nd, min(v_dt, v_dp))
+                    else:
+                        v_opp = self.evaluate_matchplay(
+                            opp_view, match_state,
+                            is_cube_action=match_state.can_offer(
+                                opp_view.turn),
+                        )
+                    forced_value = 1.0 - v_opp
+                per_dice.append((None, None, prob, forced_value))
+                continue
+            terminal_mask = base_feats[:, OPP_OFF_INDEX] >= TERMINAL_OFF_THRESHOLD
+            if terminal_mask.any():
+                for i in np.nonzero(terminal_mask)[0]:
+                    gr = states_view[int(i)].game_result()
+                    new_ms = match_state.after_game(
+                        gr, winner_is_me=(mover == 0),
+                    )
+                    if new_ms.match_over():
+                        mover_val = 1.0
+                    else:
+                        mover_val = self._eval_new_game(
+                        new_ms, mover, scope="terminal")
+                    term_overrides.append((pos + int(i), 1.0 - mover_val))
+            feat_chunks.append(base_feats)
+            per_dice.append((pos, pos + n_moves, prob, None))
+            pos += n_moves
+
+        if pos == 0:
+            return forced_value  # every dice is a forced pass
+
+        big_base = (
+            feat_chunks[0] if len(feat_chunks) == 1
+            else np.concatenate(feat_chunks, axis=0)
+        )
+        if cube_fold and opp_cube_action:
+            # Explicit GetECF3 fold at every successor: two ca=0 reads
+            # (current cube; doubled cube, owner flipped to the mover)
+            # composed with the score-only drop value. v_dp is
+            # successor-independent: it prices the opponent scoring
+            # cube_value points from the CURRENT score.
+            ms_take = match_state.after_take(1 - mover)
+            persp_t, cube_t, my_t, opp_t, craw_t = (
+                self._match_features(ms_take, opponent)
+            )
+            row_nd = self.encoder.match_extras(
+                persp, cube_value, my_away, opp_away, crawford, False,
+            )
+            row_dt = self.encoder.match_extras(
+                persp_t, cube_t, my_t, opp_t, craw_t, False,
+            )
+            ms_pass = match_state.after_game(
+                1, winner_is_me=(opponent == 0))
+            v_dp = (1.0 if ms_pass.match_over()
+                    else self._eval_new_game(ms_pass, opponent,
+                                             scope="cube"))
+            f_nd = np.concatenate(
+                [big_base, np.tile(row_nd, (big_base.shape[0], 1))],
+                axis=1)
+            f_dt = np.concatenate(
+                [big_base, np.tile(row_dt, (big_base.shape[0], 1))],
+                axis=1)
+            v_nd = self._matchplay_values_np(f_nd)
+            v_dt = self._matchplay_values_np(f_dt)
+            values = np.maximum(v_nd, np.minimum(v_dt, v_dp))
+        else:
+            extra_row = self.encoder.match_extras(
+                persp, cube_value, my_away, opp_away, crawford,
+                opp_cube_action,
+            )
+            extra = np.tile(extra_row, (big_base.shape[0], 1))
+            features = np.concatenate([big_base, extra], axis=1)
+
+            # P(opp wins match) per successor. Routed to the GPU eval
+            # server when one is attached; this is 96% of the rows a
+            # matchplay 1-ply worker pushes through the net.
+            values = self._matchplay_values_np(features)
+        for idx, v in term_overrides:
+            values[idx] = v
+
+        total = 0.0
+        for start, end, prob, forced in per_dice:
+            if start is None:
+                total += prob * forced
+            else:
+                # Mover picks the move minimizing the opponent's MWC.
+                total += prob * (1.0 - float(values[start:end].min()))
+        # Dice probabilities sum to 1 only up to float rounding; keep
+        # the MWC target inside [0, 1].
+        return min(1.0, max(0.0, total))
+
     def offer_double(self, state: BoardState, match_state) -> CubeOffer:
         """Money-game pre-roll cube decision.
 
@@ -1123,6 +1635,8 @@ class TDAgent(Agent):
         Caches v_cube_theirs in the returned CubeOffer so a self-play
         respond_to_double() call can skip the redundant forward pass.
         """
+        if self.is_matchplay:
+            return self.offer_double_matchplay(state, match_state)
         if not self.is_cubeful:
             return super().offer_double(state, match_state)
         if self.oneply:
@@ -1195,6 +1709,10 @@ class TDAgent(Agent):
 
         Matchplay agents override this for score-aware take points.
         """
+        if self.is_matchplay:
+            return self.respond_to_double_matchplay(
+                state, match_state, hint=hint,
+            )
         if not self.is_cubeful:
             return super().respond_to_double(state, match_state, hint=hint)
         # Read cached v_double_take at the matching resolution,
@@ -1270,6 +1788,10 @@ class TDAgent(Agent):
 
         Without: 0-ply argmin over opponent's network evaluation.
         """
+        if self.is_matchplay:
+            return self.choose_checker_action_matchplay(
+                state, dice, match_state,
+            )
         if not self.is_cubeful:
             return super().choose_checker_action_cubeful(
                 state, dice, match_state,

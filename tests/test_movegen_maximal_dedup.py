@@ -4,7 +4,9 @@ A 1-die bear-off (e.g. 2/off with the 2 of a 21) can reach the same final
 board as the full both-dice play (2/1, 1/off). The board-key dedup used to
 keep whichever play was generated first; when that was the shorter one, the
 maximal-dice filter then discarded the position entirely — a false forced
-pass on a WINNING play (found by differential testing against gnubg).
+pass on a WINNING play (found by differential testing against gnubg's
+move generator; ~1 per 7k turns of real self-play, always the mover's
+last checker).
 
 Both engines (Python get_legal_plays and the C fast path) must return the
 play in BOTH dice orders.
@@ -61,7 +63,7 @@ def test_python_no_false_pass(point, dice, swap, turn):
     play, succ = plays[0]
     # the surviving play must use BOTH dice (must-play-both rule)
     assert len(play) == 2
-    assert succ.off[turn] == 15
+    assert succ.off[turn] == 15  # and it wins the game
 
 
 @pytest.mark.parametrize("point,dice", CASES)

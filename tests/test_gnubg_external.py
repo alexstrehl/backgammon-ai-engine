@@ -732,3 +732,34 @@ def test_reaper_kills_true_orphans_only():
             os.kill(orphan_pid, 9)
         except OSError:
             pass
+
+
+def test_matchplay_specs_registered(tmp_path):
+    """Matchplay evaluation dispatches through eval_matchplay's own spec
+    parser (independent of play_models._detect_side_type).
+
+    The hazard this locks down: "gnubg-ext" also starts with "gnubg",
+    so if the gnubg-nn branch is matched first the external agent is
+    silently never used. GnubgExternalAgent creates its subprocess
+    lazily, so nothing is spawned here. The legacy full= alias must
+    translate onto the composable (prune, movefilter) pair.
+    """
+    from eval_matchplay import _build_agents
+    from gnubg_external import GnubgExternalAgent
+    from model import TDNetwork
+
+    model1 = tmp_path / "mp.pt"
+    TDNetwork(hidden_sizes=[8], input_size=207,
+              encoder_name="matchplay1h_perspective196",
+              output_mode="probability").save(str(model1))
+
+    for spec, plies, prune, movefilter in [
+            ("gnubg-ext", 0, True, None),
+            ("gnubg-ext:2", 2, True, None),
+            ("gnubg-ext-full", 0, False, "all"),
+            ("gnubg-ext-full:1", 1, False, "all")]:
+        _, a2 = _build_agents(str(model1), spec)
+        assert isinstance(a2, GnubgExternalAgent), spec
+        assert a2.plies == plies, spec
+        assert a2.prune is prune and a2.movefilter == movefilter, spec
+        assert a2._server is None, "agent must stay lazy"

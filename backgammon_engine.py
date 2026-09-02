@@ -327,13 +327,15 @@ def _generate_plays(
 
     if not found:
         # No legal move with any remaining_dice die -- this path is complete.
+        # Record the resulting position (deduplicated by board state).
+        # On a key collision keep the play that used MORE dice: a shorter
+        # game-ending play (e.g. 2/off with the 2 of a 21) can reach the
+        # same final board as the full both-dice play (2/1, 1/off); if the
+        # shorter one were kept, the maximal-dice filter would then discard
+        # the position entirely — a false forced pass.
         if dice_used > max_used[0]:
             max_used[0] = dice_used
         key = state._key()
-        # On a key collision keep the play using MORE dice: a shorter
-        # game-ending play (2/off with the 2 of a 21) can reach the same board
-        # as the full play, and the maximal-dice filter would then drop the
-        # position entirely — a false forced pass.
         prev = results.get(key)
         if prev is None or len(current_play) > len(prev[0]):
             results[key] = (current_play, state)
@@ -461,6 +463,38 @@ def switch_turn(state: BoardState) -> BoardState:
     s = state.copy()
     s.turn = 1 - s.turn
     return s
+
+
+def pip_count(state: BoardState) -> Tuple[int, int]:
+    """(white_pips, black_pips). WHITE bears off past index 0 (pip = i+1),
+    BLACK past index 23 (pip = 24-i); a checker on the bar counts 25."""
+    wp = 25 * state.bar[WHITE]
+    bp = 25 * state.bar[BLACK]
+    for i, v in enumerate(state.points):
+        if v > 0:
+            wp += v * (i + 1)
+        elif v < 0:
+            bp += (-v) * (NUM_POINTS - i)
+    return wp, bp
+
+
+def is_race(state: BoardState) -> bool:
+    """True when the position is a pure race (no contact possible).
+
+    WHITE moves toward index 0 and BLACK toward index 23, so contact is
+    possible iff some WHITE checker sits at a higher index than some
+    BLACK checker. Any checker on the bar re-enters behind the opponent
+    -> contact."""
+    if state.bar[WHITE] or state.bar[BLACK]:
+        return False
+    w_max = -1
+    b_min = NUM_POINTS
+    for i, v in enumerate(state.points):
+        if v > 0:
+            w_max = i
+        elif v < 0 and b_min == NUM_POINTS:
+            b_min = i
+    return w_max < b_min
 
 
 def move_label(move: Move) -> str:

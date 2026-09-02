@@ -8,6 +8,15 @@ gnubg-nn caveats (21pt-match cube approximation, Jacoby override,
 cube_plies>=1 clamp). Money is selected with match length 9999; rules are
 sent per-request (`jacobyrule on|off crawfordrule off beavers off`).
 
+N-POINT MATCH PLAY is supported: pass a MatchState with match_length > 0
+and the board line carries real match length, points-scored, and the
+post-Crawford flag, with `crawfordrule on`. Unlike the gnubg-nn wrapper
+this gives SCORE-AWARE CHEQUER play (verified: initial position, dice
+6-2, money plays `24/18 13/11` but DMP plays `24/18 18/16`) and gnubg's
+native match cube handling. `met_path` pins the match equity table so
+the referee and the agent under test share one; gnubg's default is
+already Kazaross-XG2.
+
 Search configuration is composable via two orthogonal knobs:
 
 * ``prune`` (default True): gnubg's pruning neural nets (the small nets
@@ -53,7 +62,11 @@ from agents import Agent, CubeOffer
 from backgammon_engine import BoardState, get_legal_plays, WHITE, BLACK
 from modes import CubeOwner, cube_perspective, CubePerspective
 
-GNUBG_CMD = os.environ.get("GNUBG_CMD", "/usr/games/gnubg")
+GNUBG_CMD = os.environ.get(
+    "GNUBG_CMD",
+    "/usr/local/bin/gnubg" if os.path.exists("/usr/local/bin/gnubg")
+    else "/usr/games/gnubg",
+)
 
 # PR_SET_PDEATHSIG: kernel kills gnubg whenever its owning worker dies.
 # Needed because Pool.terminate() SIGTERMs workers and atexit does not run
@@ -184,16 +197,34 @@ class _ExtServer:
 
     def __init__(self, plies: int, gnubg_cmd: str = GNUBG_CMD,
                  cubeless: bool = False, prune: bool = True,
-                 movefilter: str = None):
+                 movefilter: str = None, met_path: str = None):
         reap_orphaned_gnubg()
         self.plies = plies
         self.cubeless = cubeless
         self.prune = prune
         self.movefilter = movefilter
+        self.met_path = met_path
         self.proc = None
         self.sock = None
         self.fh = None
         extra = ""
+        if met_path:
+            # Two silent-failure modes make a pre-flight mandatory. A
+            # nonexistent path makes gnubg fall back to its compiled-in
+            # Zadeh table (NOT met/zadeh.xml — they differ), and a file
+            # that exists but is malformed SIGSEGVs gnubg, costing ~100s
+            # in connect retries before the real error surfaces. gnubg's
+            # warning goes to stderr, which we send to DEVNULL. Parsing it
+            # ourselves fails fast and cheaply.
+            met_path = os.path.abspath(met_path)
+            from met import validate_met_file
+            # Structural check only: gnubg accepts tables met.py itself
+            # refuses to read (per-player post-Crawford rows, parameterised
+            # types), and refusing them here would needlessly narrow the
+            # choice of referee.
+            validate_met_file(met_path)
+            self.met_path = met_path
+            extra += f"set matchequity {met_path}\n"
         if not prune:
             extra += ("set evaluation chequer evaluation prune off\n"
                       "set evaluation cubedecision evaluation prune off\n")
@@ -279,7 +310,14 @@ class _ExtServer:
         reply = self.fh.readline()
         if reply == "":
             raise RuntimeError("gnubg external connection closed")
-        return reply.strip()
+        reply = reply.strip()
+        if reply.startswith("Error"):
+            # Without this a malformed board reads as "no double" in
+            # offer_double and falls through to plays[0][1] in
+            # _match_successor — an encoding bug would surface as
+            # slightly worse play rather than a failure.
+            raise RuntimeError(f"gnubg rejected board line: {reply}\n{line}")
+        return reply
 
     def close(self):
         try:
@@ -317,17 +355,20 @@ class GnubgExternalAgent(Agent):
         movefilter="all"), the paper's stated matched-2-ply protocol
         (full-width root, shipped pruning for the replies). They may not
         be combined with each other or with explicit prune/movefilter.
+    met_path: pin gnubg's match equity table (match play; see module
+        docstring). None keeps gnubg's default (Kazaross-XG2).
     """
 
     def __init__(self, plies: int = 0, gnubg_cmd: str = GNUBG_CMD,
                  cubeless: bool = False, prune: bool = True,
                  movefilter: str = None, full: bool = False,
-                 root_full: bool = False):
+                 root_full: bool = False, met_path: str = None):
         self.plies = plies
         self.gnubg_cmd = gnubg_cmd
         self.cubeless = cubeless
         self.prune, self.movefilter = _legacy_search_kwargs(
             prune, movefilter, full, root_full)
+        self.met_path = met_path
         self._server = None  # lazy: one subprocess per worker process
 
     # ── plumbing ─────────────────────────────────────────────────────
@@ -335,13 +376,20 @@ class GnubgExternalAgent(Agent):
         if self._server is None:
             self._server = _ExtServer(self.plies, self.gnubg_cmd,
                                       self.cubeless, self.prune,
-                                      self.movefilter)
+                                      self.movefilter, self.met_path)
         return self._server
 
     @staticmethod
     def _rules(match_state) -> str:
         jac = "on" if getattr(match_state, "jacoby", True) else "off"
-        return f"jacobyrule {jac} crawfordrule off beavers off"
+        # crawfordrule MUST be on for match play: with it off gnubg forces
+        # fCrawford = FALSE regardless of the board fields and never models
+        # the Crawford game at all (same line replies "double" with the
+        # rule off, "roll" with it on). Kept off for money so money lines
+        # stay byte-identical. jacobyrule is inert at a match score
+        # (SetCubeInfoMatch clears fJacoby) but stays live for money.
+        crawford = "on" if getattr(match_state, "match_length", 0) > 0 else "off"
+        return f"jacobyrule {jac} crawfordrule {crawford} beavers off"
 
     def _board_line(self, state, mover, match_state, dice, doubled):
         b = fibs_board_ints(state, mover)
@@ -355,17 +403,59 @@ class GnubgExternalAgent(Agent):
         # gnubg evaluates the take from the wrong side and takes
         # hopeless positions.
         turn = -1 if doubled else 1
+
+        if getattr(match_state, "match_length", 0) > 0:
+            L = match_state.match_length
+            # gnubg rejects score >= match length with "badly formed
+            # board"; away >= 1 makes that unreachable, so assert it.
+            assert 1 <= match_state.my_away <= L and 1 <= match_state.opp_away <= L, (
+                f"away scores out of range for a {L}-point match: "
+                f"{match_state.my_away}/{match_state.opp_away}"
+            )
+            # gnubg wants POINTS SCORED, not away scores. MatchState
+            # stores away in WHITE's view, so index by absolute player.
+            pts = (L - match_state.my_away, L - match_state.opp_away)
+            # The two score fields are REVERSED relative to their FIBS
+            # names: field 5 carries the score of whoever is ON ROLL in
+            # the real game, field 4 the other player's. On an undoubled
+            # line that is the encoded mover; on a doubled line the board
+            # is encoded from the RESPONDER, so the on-roll player is the
+            # doubler. Getting this backwards yields plausible-but-wrong
+            # play with no error, so it is verified in the test suite at
+            # string level for both movers and both line shapes.
+            on_roll = (1 - mover) if doubled else mover
+            f_len, f4, f5 = str(L), str(pts[1 - on_roll]), str(pts[on_roll])
+            # Slot 51 is fPostCrawford. gnubg INFERS the Crawford game
+            # itself: crawfordrule on + this slot 0 + either side 1-away
+            # => Crawford, cube dead. So 0 is right both pre-Crawford and
+            # during Crawford; 1 only once it has been played. Same
+            # predicate as met.py's post-Crawford test.
+            f_post_crawford = (
+                "1" if (match_state.crawford_done
+                        and not match_state.is_crawford) else "0"
+            )
+        else:
+            f_len, f4, f5, f_post_crawford = "9999", "0", "0", "0"
+
         fields = (
-            ["board", "gnubg", "opp", "9999", "0", "0"]
+            ["board", "gnubg", "opp", f_len, f4, f5]
             + [str(x) for x in b]
             + [str(turn), str(d1), str(d2), "0", "0",
                # clamp: gnubg parses this with a 32-bit atoi; runaway
                # redouble wars can exceed 2**31 (money decisions are
                # per-unit, so the clamp cannot change any decision, and
                # +/-128-capped scoring saturates far below 4096).
-               str(min(int(match_state.cube_value), 4096)), str(may_i), str(may_o),
+               # Unreachable in match play, where cube <= match length.
+               str(min(int(match_state.cube_value), 4096)),
+               # NEVER emit may_i == may_o == 0: gnubg reinterprets an
+               # undoubled line with both flags clear as a TAKE decision
+               # (a move request comes back "take"). Dead-cube suppression
+               # is gnubg's job given the right score — do not express it
+               # here. cube_perspective can never produce 0/0.
+               str(may_i), str(may_o),
                str(1 if doubled else 0),
-               "1", "-1", "0", "25", "0", "0", "0", "0", "2", "0", "0", "0"]
+               "1", "-1", "0", "25", "0", "0", "0", "0", "2", "0",
+               f_post_crawford, "0"]
         )
         return ":".join(fields) + " " + self._rules(match_state)
 
@@ -459,3 +549,8 @@ class _MoneyCubeless:
     cube_owner = CubeOwner.CENTERED
     cube_value = 1
     jacoby = False
+    match_length = 0        # money: selects the 9999 / 0:0 line shape
+    my_away = 0
+    opp_away = 0
+    is_crawford = False
+    crawford_done = False

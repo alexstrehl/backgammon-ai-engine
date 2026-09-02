@@ -323,9 +323,11 @@ def play_and_record_cubeful(
     offer_double / respond_to_double / choose_checker_action_cubeful.
 
     When `record_moves=False`, skips the per-move Play recording —
-    saves a `get_legal_plays` call per turn. Use False for stat-only
-    runs (the cube actions and final result are still recorded so stake
-    computation works).
+    saves a `get_legal_plays` call per turn (the agent already
+    enumerated and chose internally; re-enumerating to find the
+    matching Play object is the dominant remaining cost in cubeful
+    self-play). Use False for stat-only runs (the cube actions and
+    final result are still recorded so stake computation works).
 
     The cube is intentionally UNCAPPED — redouble/take loops are left to
     run to completion (the +/-128 capped equity handles the statistics;
