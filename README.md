@@ -1,3 +1,7 @@
+> **The README below is identical to that of the `main` branch.** This branch
+> contains preliminary work applying the PureTD approach to match play. For
+> details see [MATCHPLAY.md](MATCHPLAY.md).
+
 # PureTD: Self-Play Reinforcement Learning for Backgammon
 
 A backgammon AI trained entirely through self-play [Reinforcement Learning](https://en.wikipedia.org/wiki/Reinforcement_learning).  The main approach is temporal difference learning with a neural network using Tesauro's original feature encoding (see [TD-Gammon](https://en.wikipedia.org/wiki/TD-Gammon)).  In addition to sampled Bellman backups, we implemented exact Bellman backups (sometimes called 1-ply backups), moving closer to an AlphaZero-style approach.  The framework supports multiprocessing and GPU acceleration to speed up training.  Currently it covers 1-point matches (DMP) and money games, but we plan to extend to match play (see experimental matchplay branch for partial work).
