@@ -20,12 +20,13 @@
 #                            because Sage games come from its native generator.
 #
 # Prerequisites:
-#   gnubg 1.08.003 CLI at /usr/games/gnubg  (apt-get install -y gnubg; or set
-#                                          GNUBG_CMD — judge AND gnubg-ext players)
+#   gnubg 1.08.003 CLI on GNUBG_CMD (judge AND gnubg-ext players). Recent
+#   Debian/Ubuntu apt ships 1.08.003; older releases ship 1.06 -- the runtime
+#   preflight verifies version + weights md5 and refuses anything else.
 #   pip install bgsage                    (Open Sage; needs AVX2) + Sage transcripts
 #   torch + this repo; model best_models/cubeful_money_512_512_256_256.pt
 #
-# Caveats to disclose (see the two-agent review notes): runs are not seeded / no
+# Caveats to disclose: runs are not seeded / no
 # common-random-numbers across engines; Sage transcripts are generated with
 # Beaver on while ours/gnubg in-process self-play has no beaver. Set workers to
 # PHYSICAL core count (gnubg N-ply is compute-bound; SMT/oversubscription hurts).
@@ -59,7 +60,10 @@ SAGE_UNPRUNED=1 python3 experiments/offline_analysis/run_cubeful_memg.py \
     --save-pergame "$OUT"
 
 # --- process output: pooled equal-n table (chequer/cube/overall, bootstrap CIs) ---
-python3 experiments/offline_analysis/run_cubeful_memg.py --combine "$OUT"
+# --players must name the sage row explicitly: the default "all" covers only
+# the ours-*/gnubg-ext-* rows, and --combine would silently drop sage.
+python3 experiments/offline_analysis/run_cubeful_memg.py --combine "$OUT" \
+    --players ours-0ply,ours-1ply,gnubg-ext-0ply,gnubg-ext-1ply,sage-analyzer-1ply
 
 # The sage-analyzer-0ply row is produced by the same driver, at Sage's
 # production filter (no SAGE_UNPRUNED):

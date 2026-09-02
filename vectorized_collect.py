@@ -1,5 +1,5 @@
-"""Option 2b: generator-based vectorized self-play for cubeful-money
-1-ply collection.
+"""Generator-based vectorized self-play for cubeful-money 1-ply
+collection.
 
 Each game is a Python generator that runs the normal episode logic but
 `yield`s a feature matrix (N, n_feat) whenever it needs a network
@@ -43,7 +43,9 @@ count flows into the same round-log line as the CPU paths.
 from __future__ import annotations
 
 import random
-from typing import List, Optional, Tuple
+from typing import List
+
+import os
 
 import numpy as np
 import torch
@@ -278,21 +280,14 @@ def _value_oneply_checker_cubeless_gen(agent, state):
     """Generator mirror of TDAgent.value_oneply_checker — PER-DICE, one
     yield per dice outcome, exactly like the reference.
 
-    WHY PER-DICE (2026-08-05). The reference runs a SEPARATE small
-    forward for each of the 21 dice outcomes, with terminal successor
-    rows INCLUDED in the batch and overridden afterwards. fp32 forwards
-    are not batch-composition invariant (kernel blocking varies with M;
-    measured 1-ulp row differences), so the previous single-batched-
-    forward version of this mirror produced targets 1 ulp off the
-    reference on essentially every episode — caught by
-    tests/test_vectorized_cubeless.py, which requires bit-exact targets.
-    Per-dice yields restore bitwise parity with the CPU path. The GPU
-    win survives: the lockstep driver still batches each yield step
+    WHY PER-DICE. The reference runs a SEPARATE small forward for each
+    of the 21 dice outcomes, with terminal successor rows INCLUDED in
+    the batch and overridden afterwards. fp32 forwards are not
+    batch-composition invariant (kernel blocking varies with M), so a
+    single batched forward here lands 1 ulp off the reference —
+    tests/test_vectorized_cubeless.py requires bit-exact targets. The
+    GPU win survives: the lockstep driver still batches each yield step
     ACROSS the B in-flight games.
-
-    (Post-release option, gated on a strength twin: batch the CPU
-    reference itself over all 21 dice — as the cubeful reference already
-    does — then this mirror can go back to one yield per position.)
 
     Mirrored details, all load-bearing for bitwise equality:
       * forward input INCLUDES terminal successor rows (net output then
@@ -339,6 +334,137 @@ def _value_oneply_checker_cubeless_gen(agent, state):
         oneply_sum += prob * agent._flip_value(best_for_next)
     return oneply_sum
 
+
+def _value_oneply_checker_cubeless_gen_fast(agent, state):
+    """FAST path: one batched `expand_21` forward per position (one
+    yield), instead of 21 per-dice yields.
+
+    See the `_CUBELESS_1PLY_GEN` note below for which models used this
+    path. It is ~5x faster under multi-worker GPU
+    collection (measured 500 vs 107 ep/s at W=24), because the per-dice
+    version costs ~22 GPU roundtrips per ply instead of ~2 and 24 worker
+    contexts serialise on those small launches.
+
+    It is NOT bitwise-identical to the CPU reference: fp32 forwards are
+    not batch-composition invariant, so the reduction differs in the last
+    ulp. That is why the default path is the per-dice one, which
+    `tests/test_vectorized_cubeless.py` holds to bit-exactness. Select
+    this one with BG_VEC_CUBELESS_FAST=1 when reproducing a chain that
+    used it, or when the 5x matters more than bit-exact agreement with
+    the CPU mirror.
+
+    Generator mirror of TDAgent.value_oneply_checker. Yields a single
+    (n_rows, n_feat) feature matrix of all non-terminal 21-dice replies;
+    receives the (n_rows,) fp32 network values; returns the 1-ply
+    per-unit value (float) for the on-roll player.
+
+    Cubeless = NO cube features, NO cube decision: the encoding is the
+    plain perspective196 base encoding (== agent.encoder.encode). The
+    mover-view flip and terminal handling follow agent.output_mode
+    exactly as value_oneply_checker does:
+        equity:      non-term -> -V,  term -> +game_result
+        probability: non-term -> 1-V, term -> +1
+    Forced-pass dice (no legal reply) are folded into expand_21's
+    buckets, identical to value_oneply_checker's pass_prob branch.
+    """
+    is_equity = agent.output_mode == "equity"
+
+    # Fast path: one C 21-dice expansion + vectorized per-dice reduction,
+    # exactly like _value_oneply_checker_cubeful_gen but with no cube
+    # columns. expand_21 returns replies in _DICE_OUTCOMES order with a
+    # per-dice count, so np.maximum.reduceat over the segment offsets
+    # gives the per-dice best mover value; _ONEPLY_PROBS weights them.
+    if agent._c_base_available:
+        exp = _bg_fast.expand_21(state)
+        if exp is not None:
+            base_feats, counts, gr, n_rows = exp
+            if n_rows:
+                # base_feats is already the full cubeless encoding.
+                V = (yield np.ascontiguousarray(base_feats))
+                V = np.asarray(V, dtype=np.float32).ravel()
+            else:
+                V = np.empty(0, dtype=np.float32)
+            nonterm = gr == 0
+            # Per-unit mover value per reply.
+            vmover = np.empty(gr.shape[0], dtype=np.float64)
+            if is_equity:
+                # non-term -> -V; term -> +game_result.
+                vmover[~nonterm] = gr[~nonterm]
+                vmover[nonterm] = -V
+            else:
+                # probability: non-term -> 1-V; term -> +1.
+                vmover[~nonterm] = 1.0
+                vmover[nonterm] = 1.0 - V
+            seg = np.empty(counts.shape[0], dtype=np.int64)
+            seg[0] = 0
+            np.cumsum(counts[:-1], out=seg[1:])
+            dice_max = np.maximum.reduceat(vmover, seg)
+            return float(_ONEPLY_PROBS @ dice_max)
+
+    # Slow path: per-dice expansion accumulated into ONE yielded batch
+    # (mirrors value_oneply_checker's single batched forward). Forced-
+    # pass dice eval switch_turn(state); dedup is unnecessary for
+    # correctness (probabilities sum the same).
+    feat_chunks = []
+    chunk_meta = []          # (prob, start, end, term_overrides)
+    pass_prob = 0.0
+    pass_feat = None
+    offset = 0
+    for di, (d1, d2) in enumerate(_DICE_OUTCOMES):
+        prob = float(_ONEPLY_PROBS[di])
+        features, next_states = agent._get_legal_plays_encoded(state, (d1, d2))
+        if len(next_states) == 0:
+            pass_prob += prob
+            if pass_feat is None:
+                pass_feat = agent.encode_state(switch_turn(state))
+            continue
+        n = len(next_states)
+        feat_chunks.append(features)
+        term = {
+            int(i): agent._terminal_opp_value(next_states[int(i)])
+            for i in np.flatnonzero(
+                features[:, OPP_OFF_INDEX] >= TERMINAL_OFF_THRESHOLD
+            )
+        }
+        chunk_meta.append((prob, offset, offset + n, term))
+        offset += n
+
+    # Build one batch: legal-reply chunks + (optionally) one pass row.
+    parts = list(feat_chunks)
+    pass_off = None
+    if pass_prob > 0.0:
+        pass_off = offset
+        parts.append(pass_feat[None, :])
+        offset += 1
+    if not parts:
+        return 0.0
+    big = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
+    allv = (yield big)
+    allv = np.asarray(allv, dtype=np.float32).ravel()
+
+    oneply_sum = 0.0
+    for prob, s, e, term in chunk_meta:
+        v = allv[s:e].copy()
+        for i, tv in term.items():
+            v[i] = tv
+        oneply_sum += prob * agent._flip_value(float(v.min()))
+    if pass_off is not None:
+        oneply_sum += pass_prob * agent._flip_value(float(allv[pass_off]))
+    return oneply_sum
+
+
+# Which cubeless 1-ply generator to use. Default is the per-dice mirror,
+# which tests/test_vectorized_cubeless.py holds bit-exact against the CPU
+# reference. BG_VEC_CUBELESS_FAST=1 selects the batched expand_21 path:
+# ~5x faster at W=24 (500 vs 107 ep/s measured), 1 ulp off the reference
+# (tests/test_vectorized_cubeless_fast.py bounds the divergence). The
+# current 4-layer cubeless model, and the cubeless stage in the
+# production 4-layer cubeful model's lineage, used the fast path.
+_CUBELESS_1PLY_GEN = (
+    _value_oneply_checker_cubeless_gen_fast
+    if os.environ.get("BG_VEC_CUBELESS_FAST") == "1"
+    else _value_oneply_checker_cubeless_gen
+)
 
 def _choose_checker_action_cubeless_0ply_gen(agent, state, dice):
     """Generator mirror of TDAgent.choose_checker_action 0-ply cubeless
@@ -401,7 +527,7 @@ def _collect_episode_cubeless_money_gen(
         enc_list.append(agent.encode_state(state))
 
         # 1-ply target for the current (checker) state.
-        target = yield from _value_oneply_checker_cubeless_gen(agent, state)
+        target = yield from _CUBELESS_1PLY_GEN(agent, state)
         targets.append(target)
 
         # 0-ply move selection.

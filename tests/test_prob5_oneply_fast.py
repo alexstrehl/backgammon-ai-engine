@@ -6,8 +6,8 @@ segment reduction + a numpy equity mirror) whenever the C engine is in
 use, and to `_oneply_target_vec_perdice` (21 move-gen calls, a Python
 loop over every successor, 21 torch `prob5_to_equity` calls) otherwise.
 
-The reference is `_oneply_target_vec_perdice` — it is the code that
-trained every published prob5 checkpoint. The fast path is only safe if
+The reference is `_oneply_target_vec_perdice` — the straightforward
+per-dice implementation. The fast path is only safe if
 it reproduces it BIT FOR BIT, because the failure mode here is silent:
 every wrong target is still finite, still in [0, 1], still passes BCE,
 and only differs in the last ulp of one probability or in which of two
@@ -683,7 +683,7 @@ class TestDispatch:
 # ── against the real production checkpoint ───────────────────────────
 
 
-_PROD = "best_models/cubeless_prob5_512_512_256_128.pt"
+_PROD = "best_models/cubeless_prob5_512_512_256_256.pt"
 
 
 @pytest.mark.skipif(not os.path.exists(_PROD),

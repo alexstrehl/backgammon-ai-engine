@@ -84,11 +84,8 @@ class OpenSageAgent(Agent):
             # bgsage can emit rule-ILLEGAL moves (e.g. playing only the
             # smaller die when exactly one die is playable — the rules force
             # the larger), and with the move filter widened Sage's eval can
-            # prefer one, which used to trip the mismatch guard here
-            # (2026-07-12, unpruned run, dice=(1,2)). Whenever Sage's native
-            # pick is legal the argmax over either set is identical
-            # (replay-verified: 0 divergences in 1639 decisions under the
-            # production filter).
+            # prefer one. Whenever Sage's native pick is legal the argmax
+            # over either set is identical.
             cands = [self._to_sage_board(ns, mover) for _, ns in actions]
             return actions[self._strat.best_move_index(cands, pre)]
         # DMP: maximise the mover's win probability.
@@ -133,8 +130,7 @@ class OpenSageAnalyzerAgent(Agent):
         # disables root move pruning. NOTE: BgBotAnalyzer accepts these
         # kwargs but SILENTLY DROPS them for the multi-ply eval levels —
         # _MultiPlyAnalyzer hardwires FILTER_MAX_MOVES=5 /
-        # FILTER_THRESHOLD=0.08 as class attributes (verified 2026-07-12:
-        # 53/53 checker choices identical under the ctor kwargs alone).
+        # FILTER_THRESHOLD=0.08 as class attributes.
         # So we also shadow them with instance attributes on the actual
         # inner analyzer, which checker_play_analytics reads via self.
         self._an = BgBotAnalyzer(
@@ -172,7 +168,7 @@ class OpenSageAnalyzerAgent(Agent):
         r = self._an.checker_play(
             pre, dice[0], dice[1],
             # clamp: money decisions are per-unit; raw value overflows the
-            # 32-bit binding in runaway redouble wars (2**31 seen 2026-07-23)
+            # 32-bit binding in runaway redouble wars
             cube_value=min(int(match_state.cube_value), 4096),
             cube_owner=self._owner_str(state, match_state),
             jacoby=match_state.jacoby, beaver=self.beaver,

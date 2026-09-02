@@ -1,9 +1,10 @@
 /*
  * nn_eval.c -- Neural network inference for backgammon models.
  *
- * Sample code illustrating how the trained model can be run from pure C
- * for inclusion in other projects. Loads BGNN binary format, runs forward
- * pass on CPU. No external dependencies beyond stdlib and math.
+ * Runs a trained model from pure C: loads BGNN binary format, forward
+ * pass on CPU, no dependencies beyond stdlib and math. Linked into
+ * libbg_nply.so for --c-engine training, and usable standalone as a
+ * starting point for other projects.
  */
 
 #include "nn_eval.h"

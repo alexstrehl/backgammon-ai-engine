@@ -6,8 +6,11 @@ export_weights.py), then call the value/move functions with Python
 BoardState objects. Cube perspective / cube-action / gammons-count flags
 follow the same convention as td_agent.py's cubeful methods.
 """
+import atexit
 import ctypes
 import os
+import shutil
+import tempfile
 
 from backgammon_engine import BoardState, switch_turn  # noqa
 from c_engine.bg_fast import _CBoardState, _python_to_c  # reuse layout
@@ -17,6 +20,18 @@ _SO = os.path.join(_HERE, "libbg_nply.so")
 
 _lib = None
 _loaded_path = None
+_export_dir = None
+
+
+def _private_export_path() -> str:
+    """Per-process weight-export path inside a freshly created 0700 temp
+    dir (unpredictable name, unreadable by other users, removed at exit).
+    Model weights must never land at a predictable world-readable path."""
+    global _export_dir
+    if _export_dir is None:
+        _export_dir = tempfile.mkdtemp(prefix="bgn_w_")
+        atexit.register(shutil.rmtree, _export_dir, ignore_errors=True)
+    return os.path.join(_export_dir, "weights.bin")
 
 
 def _ensure_lib():
@@ -113,14 +128,13 @@ def enable_c_engine(agent, twoply_k: int = 0):
     once per round after the agent's weights are refreshed. Returns True on
     success, False if the C engine is unavailable (caller keeps PyTorch).
     """
-    import tempfile
     from export_weights import export_live
     from modes import cube_perspective, CubeOwner
     try:
         _ensure_lib()
     except Exception:
         return False
-    binp = os.path.join(tempfile.gettempdir(), f"bgn_w_{os.getpid()}.bin")
+    binp = _private_export_path()
     export_live(agent.network, binp)
     load_model(binp)
 

@@ -8,10 +8,15 @@ All scoring with `LC_ALL=C`, `OMP_NUM_THREADS=1`, `GNUBG_CUBELESS_EVAL=1`
 gammons/backgammons count, no cube leverage). n=4000 self-play games per row,
 legal openings by construction.
 
+**`prob5-*` model**: `best_models/cubeless_prob5_512_512_256_256.pt` md5
+`ac95a983a114c269257225e0b84a5d9f` (prod; rows re-measured 2026-08-23 on this
+model — the runner prints the md5 of the model it loaded, so check it against
+this pin before trusting a run).
+
 ## Layout
 
 - `cubeless_memg.csv` — summary table (means + game-level bootstrap 95% CIs
-  via `--combine`, B=10,000 seed 42), regenerated from the per-game data below.
+  via `--combine`, B=100,000, seed 42), regenerated from the per-game data below.
 - `pergame/<player>.jsonl` — one line per game (`chequer` mEMG), one file per
   main-table row. Player names match `run_cubeless_memg.py --players` keys, so
   the pooled CI is reproducible directly:
@@ -23,8 +28,8 @@ legal openings by construction.
 
 | player | config | mEMG |
 |---|---|---|
-| prob5-1ply | full-width 1-ply | 0.698 [0.679, 0.717] |
-| prob5-0ply | prod prob5 | 1.351 [1.320, 1.383] |
+| prob5-1ply | full-width 1-ply | 0.69 [0.68, 0.71] |
+| prob5-0ply | prod prob5 4L256 | 1.35 [1.32, 1.38] |
 | gnubg-ext-1ply | true gnubg 1.08 binary, full/unpruned | 1.626 [1.591, 1.660] |
 | sage-1ply | SAGE_UNPRUNED (paper convention) | 1.670 [1.626, 1.717] |
 | gnubg-ext-0ply | true gnubg 1.08 binary | 2.878 [2.825, 2.933] |
@@ -49,6 +54,7 @@ Notes:
 ```bash
 # one row (repeat per player: prob5-0ply, prob5-1ply, gnubg-ext-0ply,
 # gnubg-ext-1ply, sage-0ply, sage-1ply; sage paper row: prefix SAGE_UNPRUNED=1)
+# GNUBG_CMD must be a 1.08.003 build (the preflight verifies version + weights)
 LC_ALL=C OMP_NUM_THREADS=1 GNUBG_CMD=/usr/games/gnubg \
 python3 experiments/offline_analysis/run_cubeless_memg.py \
     --players prob5-0ply --games 4000 --plies 4 \

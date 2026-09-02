@@ -21,7 +21,7 @@ Usage
 
     REPO       repo root to scan (default: the repo containing this file)
     --compare  also diff the flag surface of shared files against a git ref,
-               e.g. ``--compare repro``. Path-keyed, so it says nothing about
+               e.g. ``--compare origin/main``. Path-keyed, so it says nothing about
                files that MOVED between the two trees -- check renames
                separately (basename matching is a cheap first pass).
 

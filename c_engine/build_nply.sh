@@ -28,14 +28,11 @@ fi
 echo "Building libbg_nply.so (BLAS: $BLAS_LINK) ..."
 
 # NO -ffast-math. It implies -ffinite-math-only, which lets the compiler
-# assume expf() never overflows to inf -- but the sigmoid is
-# 1/(1+expf(-x)), and a large negative pre-activation legitimately
-# overflows (mathematically -> 0). With -ffast-math that path produced
-# **NaN on ~0.13% of real positions** (11 of 8218 sampled encodings), which
-# would silently poison BCE targets in training. Measured cost of removing
-# it: none -- the build is actually 1.6% FASTER without it, because the hot
-# path is OpenBLAS sgemm (hand-tuned asm), which compiler math flags do not
-# touch. See PROB5_C_ENGINE_FINDINGS.md.
+# assume expf() never overflows to inf -- but the sigmoid is 1/(1+expf(-x)),
+# and a large negative pre-activation legitimately overflows (-> 0). With
+# the flag that path produced NaNs on real positions, silently poisoning
+# BCE targets. No speed cost: the hot path is OpenBLAS sgemm, which
+# compiler math flags do not touch.
 gcc -O3 -march=native -funroll-loops -shared -fPIC \
     -o libbg_nply.so \
     bg_nply.c bg_engine.c ../c_inference/nn_eval.c \

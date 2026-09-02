@@ -16,10 +16,12 @@ slower on this host and were removed.
 
 ## Method
 
-- Model `best_models/cubeless_prob5_512_512_256_128.pt`
-  (md5 `c8b2b265470e79e84320d8dadcf08253`).
+- Model: the then-prod prob5 `[512,512,256,128]`
+  (md5 `c8b2b265470e79e84320d8dadcf08253`; since superseded and no longer
+  shipped in `best_models/` — throughput is architecture-dependent only, so
+  the current 4L256 reproduces these ratios within a few percent).
 - `--lr 1e-8` (net effectively frozen, so arms cannot diverge through
-  training), `--seed 12345 --torch-seed 12345`, `BG_MAX_PLIES=200`.
+  training), `--seed 12345 --torch-seed 12345`.
 - **`LD_PRELOAD=c_engine/libfakeintel.so` on every arm.** Without the
   MKL shim the fp32 CPU baseline is ~24% slow, which silently flatters
   every alternative.

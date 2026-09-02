@@ -25,7 +25,8 @@ from memg_common import _safe_gnubg_worker, append_pergame, combine_dir
 # "spawn" context, so workers re-import this module and would see the default.
 PROB5 = os.environ.get(
     "PROB5_MODEL",
-    os.path.join(_REPO, "best_models", "cubeless_prob5_512_512_256_128.pt"))
+    # Prod prob5 (4L256, ac95a983); PROB5_MODEL re-measures any other.
+    os.path.join(_REPO, "best_models", "cubeless_prob5_512_512_256_256.pt"))
 CL3L  = os.path.join(_REPO, "best_models", "cubeless_money_512_512_256.pt")
 PLAYERS = ["prob5-0ply", "prob5-1ply", "gnubg-ext-0ply", "gnubg-ext-1ply",
            "sage-0ply", "sage-1ply"]
@@ -167,7 +168,9 @@ def main():
     # would otherwise complete with results attributed to the candidate.
     override = "PROB5_MODEL override" if os.environ.get("PROB5_MODEL") \
         else "default; set PROB5_MODEL to override"
-    print(f"### prob5 model: {PROB5} ({override}) ###", flush=True)
+    from memg_common import file_md5
+    print(f"### prob5 model: {PROB5} (md5 {file_md5(PROB5)}; {override}) ###",
+          flush=True)
     rows = []
     for p in players:
         print(f"\n--- {p} ---", flush=True)

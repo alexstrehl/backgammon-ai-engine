@@ -41,7 +41,6 @@ import argparse
 import math
 import multiprocessing as mp
 import random
-import sys
 import time
 from typing import Callable, List, Optional, Tuple
 
@@ -61,7 +60,8 @@ from encoding import (
     encode_state as _py_encode_state,
     get_encoder, OPP_OFF_INDEX, TERMINAL_OFF_THRESHOLD,
 )
-from model import ProbNetwork, prob5_to_equity, prob5_postprocess
+from model import (ProbNetwork, prob5_to_equity, prob5_postprocess,
+                   suggested_depth_expand_eps)
 from train_cli import parse_hidden_sizes, resolve_save_path
 
 try:
@@ -177,6 +177,43 @@ def _prob5_equity_np(m: np.ndarray) -> np.ndarray:
     return e
 
 
+# ── GPU inference server routing (gpu_eval_server.py) ────────────────
+# One GPU process coalesces all workers' forwards; each worker's own net
+# stays on CPU (row-cap fallback only), so no worker builds a CUDA context.
+_WORKER_REMOTE = None   # set per worker by _worker_init_gpu in server mode
+
+
+def _worker_init_gpu(handles):
+    """Pool initializer (GPU-server mode): claim a shared-memory slot and
+    build this worker's RemoteEvaluator. Runs once per worker process.
+
+    The slot is claimed once and never returned, so the pool must not
+    recycle workers (no maxtasksperchild) while the server is active.
+    """
+    global _WORKER_REMOTE
+    from gpu_eval_server import RemoteEvaluator
+    slot = handles.free_slots.get()
+    _WORKER_REMOTE = RemoteEvaluator(slot, handles)
+
+
+def _net_raw(network, xnp, device, remote):
+    """Raw network output (pre-sigmoid, pre-postprocess) as a torch tensor.
+
+    Routes to the GPU eval server when `remote` is attached, else runs the
+    forward locally. `remote.forward` returns None when the row count
+    exceeds the shared-memory cap; that falls through to the local path.
+
+    The caller applies `sigmoid`/`prob5_postprocess`, exactly as it does
+    for a local forward, so routing changes only WHERE the matmul runs --
+    never the arithmetic performed on its output.
+    """
+    if remote is not None:
+        out = remote.forward(np.ascontiguousarray(xnp, dtype=np.float32))
+        if out is not None:
+            return torch.from_numpy(np.ascontiguousarray(out))
+    return network(torch.from_numpy(xnp).to(device))
+
+
 # ── 1-ply exact Bellman backup ────────────────────────────────────────
 
 
@@ -186,6 +223,7 @@ def _oneply_target_vec(
     encode_fn: Callable[[BoardState], np.ndarray],
     gpe_fn: Callable,
     device: str,
+    remote=None,
 ) -> np.ndarray:
     """Exact 1-ply Bellman target for `state`.
 
@@ -196,11 +234,13 @@ def _oneply_target_vec(
     equivalents; see `_oneply_target_vec_expand21`.
     """
     if getattr(gpe_fn, "use_expand21", False):
-        fast = _oneply_target_vec_expand21(state, network, encode_fn, device)
+        fast = _oneply_target_vec_expand21(
+            state, network, encode_fn, device, remote,
+        )
         if fast is not None:
             return fast
     return _oneply_target_vec_perdice(
-        state, network, encode_fn, gpe_fn, device,
+        state, network, encode_fn, gpe_fn, device, remote,
     )
 
 
@@ -209,6 +249,7 @@ def _oneply_target_vec_expand21(
     network: ProbNetwork,
     encode_fn: Callable[[BoardState], np.ndarray],
     device: str,
+    remote=None,
 ) -> Optional[np.ndarray]:
     """`_oneply_target_vec_perdice` with the 21 move-gen calls and the
     per-successor Python loops replaced by one `bg_fast.expand_21` C
@@ -284,9 +325,8 @@ def _oneply_target_vec_expand21(
     # ── One forward over every non-terminal reply ────────────────────
     if n_rows:
         x_np = base_feats if order is None else base_feats[order]
-        x = torch.from_numpy(x_np).to(device)
         with torch.no_grad():
-            out = network(x)
+            out = _net_raw(network, x_np, device, remote)
             if network.raw_logits:
                 out = torch.sigmoid(out)
             out = prob5_postprocess(out)
@@ -355,6 +395,7 @@ def _oneply_target_vec_perdice(
     encode_fn: Callable[[BoardState], np.ndarray],
     gpe_fn: Callable,
     device: str,
+    remote=None,
 ) -> np.ndarray:
     """Reference 1-ply target: 21 separate move-gen calls.
 
@@ -399,9 +440,8 @@ def _oneply_target_vec_perdice(
     total_rows = len(pass_buf) + len(play_buf)
     if total_rows:
         stack = pass_buf + play_buf
-        x = torch.from_numpy(np.stack(stack)).to(device)
         with torch.no_grad():
-            out = network(x)
+            out = _net_raw(network, np.stack(stack), device, remote)
             if network.raw_logits:
                 out = torch.sigmoid(out)
             out = prob5_postprocess(out)
@@ -445,6 +485,7 @@ def _collect_one_episode(
     gpe_fn: Callable,
     oneply: bool,
     device: str,
+    remote=None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Play one self-play episode. Returns (encodings Nx196, targets Nx5)."""
     state, dice = opening_roll(rng)
@@ -471,8 +512,7 @@ def _collect_one_episode(
             # reachable and both must be safe.)
             if len(next_states):
                 with torch.no_grad():
-                    x = torch.from_numpy(features).to(device)
-                    opp_probs = network(x)
+                    opp_probs = _net_raw(network, features, device, remote)
                     if network.raw_logits:
                         opp_probs = torch.sigmoid(opp_probs)
                     opp_probs = prob5_postprocess(opp_probs)
@@ -494,7 +534,7 @@ def _collect_one_episode(
             else:
                 next_state = switch_turn(state)
             tgts.append(_oneply_target_vec(
-                state, network, encode_fn, gpe_fn, device,
+                state, network, encode_fn, gpe_fn, device, remote,
             ))
             state = next_state
         else:
@@ -616,6 +656,7 @@ def _collect_worker(args):
         enc, tgt = _collect_one_episode(
             net, rng, encode_fn, gpe_fn,
             oneply=oneply, device=oneply_device,
+            remote=_WORKER_REMOTE,
         )
         if len(enc) > 0:
             enc_chunks.append(enc)
@@ -669,6 +710,7 @@ def train(
     save_every: int,
     warmup_cycles: int,
     pipeline_collect: bool = False,
+    gpu_eval_server: bool = False,
 ) -> None:
     """Round-based batch TD(0) on the 5-output prob network.
 
@@ -695,11 +737,80 @@ def train(
         f"| workers={workers} | device={device}"
     )
 
-    pool = (
-        mp.get_context("spawn").Pool(processes=workers)
-        if workers > 1
-        else None
-    )
+    # ── GPU eval server: one CUDA context total, in the server process ─
+    eval_server = None
+    if gpu_eval_server:
+        if workers <= 1:
+            print("  NOTE: --gpu-eval-server ignored (needs --workers > 1)")
+        elif not oneply:
+            print("  NOTE: --gpu-eval-server ignored (only used with --oneply)")
+        elif not torch.cuda.is_available():
+            print("  NOTE: --gpu-eval-server ignored (no CUDA device)")
+        else:
+            from gpu_eval_server import EvalServer
+            eval_server = EvalServer(
+                mp.get_context("spawn"),
+                num_slots=workers,
+                n_feat=net.input_size,
+                out_dim=NUM_OUTPUTS,
+                max_rows=int(os.environ.get("GPU_EVAL_MAX_ROWS", "8192")),
+                build_spec={
+                    "net_type": "prob5",
+                    "hidden_sizes": net.hidden_sizes,
+                    "input_size": net.input_size,
+                    # Not a parameter tensor, so load_state_dict cannot
+                    # catch a mismatch; dropping it serves wrong targets.
+                    "activation": net.activation,
+                    "encoder_name": net.encoder_name,
+                    "raw_logits": net.raw_logits,
+                },
+                init_state_dict=net.state_dict(),
+                device="cuda",
+            )
+            eval_server.start()
+            print(f"  GPU eval server: ON ({workers} slots, fp32 cuda, "
+                  f"net spec: hidden={net.hidden_sizes} "
+                  f"act={net.activation} raw_logits={net.raw_logits})")
+
+    if eval_server is not None:
+        # NOTE: maxtasksperchild MUST stay unset here. Each worker claims a
+        # slot exactly once in _worker_init_gpu and never returns it, so a
+        # recycled worker would block forever on free_slots.get() with the
+        # pool deadlocked and no error. Covered by
+        # tests/test_gpu_eval_server_validity.py::test_slot_exhaustion.
+        pool = mp.get_context("spawn").Pool(
+            processes=workers,
+            initializer=_worker_init_gpu,
+            initargs=(eval_server.client_handles(),),
+        )
+        # SIGTERM/SIGINT: daemon=True is not enough (atexit skipped on
+        # SIGTERM leaves the server holding GPU memory). Order matters:
+        # pool first (else workers block on a dead server's events), then
+        # server, then os._exit so finally cannot re-join a dead pool.
+        import signal as _signal
+
+        def _shutdown(signum, frame):
+            try:
+                pool.terminate()
+            except Exception:
+                pass
+            try:
+                eval_server.stop()
+            except Exception:
+                pass
+            os._exit(128 + signum)
+
+        for _sig in (_signal.SIGTERM, _signal.SIGINT):
+            try:
+                _signal.signal(_sig, _shutdown)
+            except (ValueError, OSError):
+                pass    # not on the main thread
+    else:
+        pool = (
+            mp.get_context("spawn").Pool(processes=workers)
+            if workers > 1
+            else None
+        )
 
     rng = random.Random(seed)
     num_rounds = math.ceil(num_episodes / episodes_per_round)
@@ -709,21 +820,20 @@ def train(
     def _build_worker_args(size: int):
         """Worker args carrying the CURRENT weights. Called eagerly when
         pipelining, which is what makes those targets one round stale."""
-        # .clone() is REQUIRED, not defensive — the same race dd3cdc9 fixed on
-        # the trainer.py side. train_prob5 does not import trainer.py, so that
-        # fix did not reach here. On a CPU net `.cpu()` is a no-op returning a
-        # VIEW sharing storage with the live parameter, so the tensors handed
+        # .clone() is REQUIRED, not defensive. On a CPU net `.cpu()` is a
+        # no-op returning a VIEW of the live parameter, so the tensors handed
         # to map_async are pickled by the pool's task thread WHILE
-        # optimizer.step() mutates them in place — workers can receive torn
-        # weights. Reachable in exactly the prob5 1-ply recipe (--device cpu +
+        # optimizer.step() mutates them — workers can receive torn weights
+        # (a real nondeterminism source: identical CPU runs diverge).
+        # Reachable in exactly the prob5 1-ply recipe (--device cpu +
         # --pipeline-collect + map_async); NOT on --device cuda, where .cpu()
-        # genuinely copies in the master thread. Harm is bounded (a worker sees
-        # an element-wise blend of net(t) and net(t+1), inside the one-round
-        # staleness pipelining already accepts) and no bad value reaches the
-        # master — workers return only (encodings, targets). But it is a real
-        # nondeterminism source: identical CPU runs diverge. Cost: ~2MB/round.
+        # genuinely copies. Cost: ~2MB/round.
         sd = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
-        dev = device if oneply else "cpu"
+        # In server mode the worker's local net is the row-cap FALLBACK only
+        # and must stay on the CPU: putting it on cuda would give every
+        # worker its own context, which is the cost this design exists to
+        # avoid.
+        dev = "cpu" if eval_server is not None else (device if oneply else "cpu")
         return [
             (
                 sd, net.hidden_sizes, net.input_size, net.activation,
@@ -736,6 +846,14 @@ def train(
     # ── Pipeline pre-roll ─────────────────────────────────────────────
     # Overlap round N+1's collection with round N's training step, so the
     # train step hides behind collection instead of serialising after it.
+    # Mutually exclusive with the server (the SystemExit below says why).
+    if pipeline_collect and eval_server is not None:
+        raise SystemExit(
+            "ERROR: --pipeline-collect and --gpu-eval-server are mutually "
+            "exclusive. The server's between-round weight push requires that "
+            "no worker is mid-request, but pipelining keeps the next round's "
+            "workers running across that push. Pick one."
+        )
     use_pipeline = pipeline_collect and pool is not None
     if pipeline_collect and pool is None:
         print("  NOTE: --pipeline-collect ignored (needs --workers > 1)")
@@ -809,6 +927,9 @@ def train(
                 enc_chunks = [r[0] for r in results if len(r[0]) > 0]
                 tgt_chunks = [r[1] for r in results if len(r[1]) > 0]
             else:
+                # Push weights before dispatch; safe between rounds only.
+                if eval_server is not None:
+                    eval_server.update_weights(net.state_dict())
                 results = pool.map(_collect_worker,
                                    _build_worker_args(round_size))
                 enc_chunks = [r[0] for r in results if len(r[0]) > 0]
@@ -899,12 +1020,12 @@ def train(
                 )
 
             if save_path and save_every > 0 and episodes_played % save_every < round_size:
-                # NEVER overwrite. `episodes_played` counts within THIS run, so
-                # a leg resumed from a partial restarts it at 0 and would
-                # silently clobber the earlier run's checkpoints -- and the
-                # surviving file then carries a name that understates how much
-                # training it contains, which is worse than losing it.
-                ck_path = _unique_ckpt_path(f"{save_path}_ep{episodes_played}.pt")
+                # NEVER overwrite: `episodes_played` counts within THIS run,
+                # so a resumed leg restarts it at 0 (see _unique_ckpt_path).
+                # splitext, so `--save m.pt` gives m_ep10000.pt.
+                _root, _ext = os.path.splitext(save_path)
+                ck_path = _unique_ckpt_path(
+                    f"{_root}_ep{episodes_played}{_ext or '.pt'}")
                 net.save(ck_path)
                 print(f"    -> checkpoint saved to {ck_path}")
 
@@ -912,6 +1033,10 @@ def train(
         if pool is not None:
             pool.close()
             pool.join()
+        if eval_server is not None:
+            # After the pool, so no worker can be blocked on an event the
+            # server would never set.
+            eval_server.stop()
 
     if save_path:
         # Same never-overwrite rule as the periodic checkpoints: a resumed
@@ -956,7 +1081,7 @@ def _warm_start_equity_trunk(
     is why ``--resume`` on one dies with a raw torch key error instead of a
     useful message. Hence the explicit validation here.
     """
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
 
     model_type = ckpt.get("model_type")
     if model_type is not None and model_type != "td":
@@ -1024,8 +1149,7 @@ def _warm_start_equity_trunk(
         copied.append(i)
     net.load_state_dict(new_sd)
 
-    # Loud summary: this whole flag previously did nothing at all, silently,
-    # so it must be impossible to not notice what it did.
+    # Loud summary: a misconfigured warm start must be impossible to miss.
     total = sum(v.numel() for v in new_sd.values())
     print(f"Warm-started trunk from EQUITY checkpoint {path}")
     print(f"  source hidden={src_hidden} -> target hidden={target_hidden}")
@@ -1097,12 +1221,26 @@ def _build_network(args) -> ProbNetwork:
 
     if args.expand_depth:
         src = ProbNetwork.load(args.expand_depth)
+        if args.expand_depth_eps is None:
+            w = args.expand_depth_size or src.hidden_sizes[-1]
+            raise SystemExit(
+                "ERROR: --expand-depth requires --expand-depth-eps. There is "
+                "no default on purpose -- the safe value is net-specific "
+                "(measurements in model.py, DEPTH_EXPAND_EPS_SCALE).\n"
+                f"  --expand-depth-eps 0.0     exact copy, but symmetric (the new "
+                f"layer differentiates slowly)\n"
+                f"  --expand-depth-eps {suggested_depth_expand_eps(w):.6f}  suggested "
+                f"starting point for width {w}\n"
+                "MEASURE the equity deviation on real positions before "
+                "spending a training budget on the result."
+            )
         net = ProbNetwork.depth_expand(
-            src, new_layer_size=args.expand_depth_size,
+            src, new_layer_size=args.expand_depth_size, eps=args.expand_depth_eps,
         )
         print(
             f"Depth-expanded from {args.expand_depth}: "
-            f"{src.hidden_sizes} -> {net.hidden_sizes}"
+            f"{src.hidden_sizes} -> {net.hidden_sizes} "
+            f"(eps={args.expand_depth_eps:g})"
         )
         return net
 
@@ -1130,32 +1268,21 @@ def _build_network(args) -> ProbNetwork:
 def reject_cuda_oneply(args):
     """Refuse ``--oneply`` with a non-CPU device, loudly.
 
-    prob5 1-ply GPU collection is UNSUPPORTED in this release, by
-    measurement, not omission: a bit-exact vectorized GPU collector was
-    built and A/B'd on this codebase and lost to the CPU pipeline
-    (130.6 ep/s best GPU sweep vs 251 ep/s CPU at the production
-    W=64 --pipeline-collect config; see
-    experiments/benchmarks/prob5_collect_levers_ab.md). Worse, the previous
-    behavior of this flag combination put the net on the GPU in EVERY
-    worker (~64 CUDA contexts ~= 16 GB) -- an OOM bomb on consumer
-    cards. Refusing is strictly better than either: nothing is lost,
-    because under --pipeline-collect the master train step hides behind
-    collection, so cuda buys ~0%% at 1-ply even where it fits.
-
-    0-ply training (no --oneply) keeps full --device cuda support
-    (+82%% on the train step); every published 1-ply recipe of record
-    already passes --device cpu.
+    Per-worker ``--device cuda`` at 1-ply opens one CUDA context per
+    worker (an OOM bomb on consumer cards) and measured slower than the
+    CPU pipeline (experiments/benchmarks/prob5_collect_levers_ab.md).
+    GPU 1-ply collection is supported through --gpu-eval-server instead,
+    which keeps one context in a single daemon. 0-ply training keeps
+    full --device cuda support.
     """
     if args.oneply and args.device != "cpu":
         raise SystemExit(
-            "ERROR: prob5 1-ply training does not support --device "
-            f"{args.device!r} in this release. The GPU collector was "
-            "built, validated bit-exact, and measured SLOWER than the "
-            "CPU pipeline on this codebase "
-            "(experiments/benchmarks/prob5_collect_levers_ab.md); the old behavior "
-            "also opened one CUDA context per worker and OOM'd consumer "
-            "GPUs. Use --device cpu for 1-ply legs (the recipes of "
-            "record all do); --device cuda remains supported (and "
+            "ERROR: prob5 1-ply training does not support per-worker "
+            f"--device {args.device!r}: one CUDA context per worker OOMs "
+            "consumer GPUs, and it measured slower than the CPU pipeline "
+            "(experiments/benchmarks/prob5_collect_levers_ab.md). Use "
+            "--device cpu for 1-ply legs, with --gpu-eval-server for GPU "
+            "evaluation; --device cuda remains supported (and "
             "recommended, +82%) for 0-ply training."
         )
 
@@ -1191,6 +1318,13 @@ def main():
                            "one hidden layer.")
     g_io.add_argument("--expand-depth-size", type=int, default=None,
                       help="Size of the new layer under --expand-depth.")
+    g_io.add_argument("--expand-depth-eps", type=float, default=None,
+                      help="REQUIRED with --expand-depth. Symmetry-breaking "
+                           "noise on the near-identity init. No default -- "
+                           "0.0 is exact but symmetric, injected deviation "
+                           "grows as eps*sqrt(width), and the equity cost is "
+                           "net-specific. Measure it (see model.py, "
+                           "DEPTH_EXPAND_EPS_SCALE).")
     g_io.add_argument("--save", default=None,
                       help="Save final network to this path.")
     g_io.add_argument("--save-every", type=int, default=0,
@@ -1226,6 +1360,12 @@ def main():
                          help="overlap round N+1's collection with round N's "
                               "training step (needs --workers>1). Targets "
                               "become one round stale.")
+    g_train.add_argument("--gpu-eval-server", action="store_true",
+                         help="route 1-ply collection forwards to a single "
+                              "GPU process that batches across all workers "
+                              "(needs --workers>1 and --oneply). Workers stay "
+                              "on the CPU, so only ONE CUDA context exists. "
+                              "Mutually exclusive with --pipeline-collect.")
 
     args = p.parse_args()
 
@@ -1260,6 +1400,7 @@ def main():
         save_every=args.save_every,
         warmup_cycles=args.warmup_cycles,
         pipeline_collect=args.pipeline_collect,
+        gpu_eval_server=args.gpu_eval_server,
     )
 
 

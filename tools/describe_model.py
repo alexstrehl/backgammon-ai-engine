@@ -18,7 +18,7 @@ def describe(path: str) -> None:
         print(f"ERROR: {path} not found")
         return
 
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     size_mb = os.path.getsize(path) / (1024 * 1024)
 
     is_prob5 = checkpoint.get("model_type") == "prob5"

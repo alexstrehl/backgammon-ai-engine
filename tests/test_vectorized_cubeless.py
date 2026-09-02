@@ -2,10 +2,8 @@
 
 tests/test_vectorized_collect.py validates the cubeful generator against
 trainer._collect_episode_cubeful_money. The cubeless generator
-(_collect_episode_cubeless_money_gen) shipped in the same port but had NO
-test coverage, and the only training-leg validation of the vectorized
-path (cf4L e5, +0.69 [0.14, 1.25] vs its CPU twin at 8M games) was
-cubeful. These tests close that gap at the generator level: same seed,
+(_collect_episode_cubeless_money_gen) shipped in the same port with no
+test coverage. These tests close that gap at the generator level: same seed,
 same CPU net, the generator driven by hand must reproduce
 trainer.collect_episode's (encodings, targets) bit-for-bit, including
 the discard decision.

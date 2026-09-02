@@ -8,33 +8,44 @@ gnubg-nn caveats (21pt-match cube approximation, Jacoby override,
 cube_plies>=1 clamp). Money is selected with match length 9999; rules are
 sent per-request (`jacobyrule on|off crawfordrule off beavers off`).
 
-Two supported configurations (H-H specs `gnubg-ext` / `gnubg-ext-full`):
+Search configuration is composable via two orthogonal knobs:
 
-* production (default): gnubg exactly as shipped — pruning neural nets
-  ON, Normal move filter (keep 0 forced + up to 8 more within 0.16).
-* full (`full=True`): "totally unpruned" — pruning nets OFF and a
-  keep-all move filter, so EVERY legal move gets the deep evaluation.
-  This reproduces the full-width search of the historical gnubg-nn
-  wrapper (`gnubg` spec) and is gnubg's most thorough
-  (and ~4x slowest) 1-ply. Head-to-head the two are statistically tied
-  at 1-ply cubeless (direct duel: -0.4 mEq [-1.8, +0.9] at 4M).
+* ``prune`` (default True): gnubg's pruning neural nets (the small nets
+  that prune opponent-reply enumeration inside deep evaluations).
+* ``movefilter`` (default None = gnubg's shipped Normal filter, keep 0
+  forced + up to 8 more within 0.16): a GUI preset name from
+  ``_MOVEFILTERS`` (``tiny``/``narrow``/``normal``/``large``/``huge``)
+  or ``"all"`` for keep-all (every legal move deep-evaluated).
+
+The three named H-H specs map onto these:
+
+* ``gnubg-ext`` (production): ``prune=True, movefilter=None`` — gnubg
+  exactly as shipped.
+* ``gnubg-ext-full``: ``prune=False, movefilter="all"`` — "totally
+  unpruned", the full-width search of the historical gnubg-nn wrapper;
+  gnubg's most thorough (and ~4x slowest) 1-ply.
+* ``gnubg-ext-rootfull``: ``prune=True, movefilter="all"`` — every legal
+  move evaluated at the root, shipped pruning for the replies; the
+  paper's stated matched-2-ply protocol.
+
+``full=True`` / ``root_full=True`` remain as convenience aliases for the
+last two and translate onto the composable pair.
 
 Cubeless sessions also send `set evaluation chequer evaluation cubeful
 off`: gnubg's "Cubeful evaluations" flag survives `set cube use off`,
 and without this the opponent ranks moves by cubeful money equity in
 cubelessly-scored games — a mis-specified objective measured at ~11
-mEq/game (found 2026-07-20; regression-tested in
-tests/test_gnubg_external.py).
+mEq/game (regression-tested in tests/test_gnubg_external.py).
 
-Protocol/field layout verified live 2026-07-20 against gnubg 1.08.003
-(gnubg git external.c / external_y.y); throughput per process: ~3.4k
-moves/s + 12k cube/s at 0-ply, ~390 + 880 at 1-ply (production).
-GNUBG_CMD overrides the binary path.
+Protocol/field layout follows gnubg 1.08.003 (gnubg git external.c /
+external_y.y). GNUBG_CMD overrides the binary path.
 """
 import atexit
 import os
+import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -43,6 +54,21 @@ from backgammon_engine import BoardState, get_legal_plays, WHITE, BLACK
 from modes import CubeOwner, cube_perspective, CubePerspective
 
 GNUBG_CMD = os.environ.get("GNUBG_CMD", "/usr/games/gnubg")
+
+# PR_SET_PDEATHSIG: kernel kills gnubg whenever its owning worker dies.
+# Needed because Pool.terminate() SIGTERMs workers and atexit does not run
+# on SIGTERM, which orphaned one gnubg per worker. libc resolved at import
+# because preexec_fn runs between fork and exec (no fresh allocation there).
+if sys.platform.startswith("linux"):
+    import ctypes
+
+    _LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
+    _PR_SET_PDEATHSIG = 1
+
+    def _kill_with_parent():
+        _LIBC.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
+else:  # non-Linux: no pdeathsig; atexit remains the only cleanup
+    _kill_with_parent = None
 
 
 def _mover_arrays(state: BoardState, mover: int):
@@ -82,39 +108,105 @@ def fibs_board_ints(state: BoardState, mover: int):
     return b
 
 
+# gnubg GUI move-filter presets, level-0 row: (extra moves, equity window).
+# All presets keep 0 forced moves and add up to N within the window.
+# "all" = keep-all (every legal move deep-evaluated; wrapper-style
+# full-width search).
+_MOVEFILTERS = {
+    "tiny": (5, 0.08), "narrow": (8, 0.12), "normal": (8, 0.16),
+    "large": (16, 0.32), "huge": (20, 0.44),
+}
+
+
+def _legacy_search_kwargs(prune, movefilter, full, root_full):
+    """Translate the legacy ``full``/``root_full`` booleans onto the
+    composable (prune, movefilter) pair. The legacy flags are pure
+    sugar: they may not be combined with each other or with non-default
+    composable values."""
+    if full or root_full:
+        if full and root_full:
+            raise ValueError("full and root_full are mutually exclusive")
+        if prune is not True or movefilter is not None:
+            raise ValueError(
+                "full/root_full are aliases; don't combine them with "
+                "prune/movefilter")
+        if full:
+            return False, "all"        # unpruned + keep-all
+        return True, "all"             # rootfull: keep-all, nets stay on
+    if movefilter is not None and movefilter != "all" \
+            and movefilter not in _MOVEFILTERS:
+        raise ValueError(
+            f"unknown movefilter {movefilter!r}; expected 'all' or one of "
+            f"{sorted(_MOVEFILTERS)}")
+    return prune, movefilter
+
+_REAPER_RAN = False
+
+
+def reap_orphaned_gnubg(min_age_s: int = 600) -> int:
+    """Kill orphaned gnubg externals (ppid==1, older than min_age_s).
+
+    A live server always has its owner as parent, so ppid==1 is unambiguous;
+    the age guard avoids racing pdeathsig on a just-orphaned process. Runs
+    once per process, at first server construction. Returns kills."""
+    global _REAPER_RAN
+    if _REAPER_RAN:
+        return 0
+    _REAPER_RAN = True
+    import re
+    killed = 0
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid,ppid,etimes,args"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except Exception:
+        return 0
+    for line in out.splitlines()[1:]:
+        m = re.match(r"\s*(\d+)\s+1\s+(\d+)\s+(\S+)\s+-t\s+-q\s*$", line)
+        if not m:
+            continue
+        pid, age, cmd = int(m.group(1)), int(m.group(2)), m.group(3)
+        if cmd.endswith("gnubg") and age >= min_age_s:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except OSError:
+                pass
+    if killed:
+        print(f"[gnubg_external] reaped {killed} orphaned gnubg "
+              f"process(es)", flush=True)
+    return killed
+
+
 class _ExtServer:
     """One gnubg subprocess serving `external localhost:<port>`."""
 
     def __init__(self, plies: int, gnubg_cmd: str = GNUBG_CMD,
-                 cubeless: bool = False, full: bool = False,
-                 root_full: bool = False):
+                 cubeless: bool = False, prune: bool = True,
+                 movefilter: str = None):
+        reap_orphaned_gnubg()
         self.plies = plies
         self.cubeless = cubeless
-        self.full = full
-        self.root_full = root_full
+        self.prune = prune
+        self.movefilter = movefilter
         self.proc = None
         self.sock = None
         self.fh = None
         extra = ""
-        if full:
-            # "Totally unpruned": no pruning nets + keep-all move filter
-            # (level-0 row per depth; deeper sub-level rows are irrelevant
-            # once every root move is kept).
+        if not prune:
             extra += ("set evaluation chequer evaluation prune off\n"
                       "set evaluation cubedecision evaluation prune off\n")
+        if movefilter is not None:
+            # Level-0 row per depth; deeper sub-level rows keep gnubg
+            # defaults ("all" makes them irrelevant; with prune=True this
+            # is the paper's rootfull protocol).
             for ply in (1, 2, 3, 4):
-                extra += f"set evaluation movefilter {ply} 0 1000 0 10.0\n"
-        elif root_full:
-            # Full-width ROOT only: every legal move gets the deep
-            # evaluation, but the opponent's replies keep gnubg's shipped
-            # pruning (pruning nets stay ON and the deeper filter levels
-            # keep their defaults). This is the 2-ply protocol the paper
-            # states -- "evaluate every legal move per position but use the
-            # default settings for pruning the opponent's responses" --
-            # and is NOT the same as full=True, which also drops the
-            # pruning nets. Only the level-0 row is overridden.
-            for ply in (1, 2, 3, 4):
-                extra += f"set evaluation movefilter {ply} 0 1000 0 10.0\n"
+                if movefilter == "all":
+                    extra += f"set evaluation movefilter {ply} 0 1000 0 10.0\n"
+                else:
+                    n, tol = _MOVEFILTERS[movefilter]
+                    extra += f"set evaluation movefilter {ply} 0 0 {n} {tol}\n"
         # This Popen discards gnubg's output, so its startup warnings can
         # never be seen -- check the bearoff databases BEFORE spawning.
         # Independent of the port, so it belongs outside the retry loop
@@ -132,8 +224,8 @@ class _ExtServer:
                 # Cubeless: kill the cube AND switch the move criterion to
                 # cubeless equity — "Cubeful evaluations" stays on through
                 # `set cube use off` and would otherwise pick moves by
-                # cubeful money equity in cubelessly-scored games (found
-                # 2026-07-20: this mis-specification cost ~11 mEq/game).
+                # cubeful money equity in cubelessly-scored games
+                # (~11 mEq/game; see module docstring).
                 + ("set cube use off\n"
                    "set evaluation chequer evaluation cubeful off\n"
                    if cubeless else "")
@@ -147,6 +239,7 @@ class _ExtServer:
                 [gnubg_cmd, "-t", "-q"], stdin=open(script),
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 env=dict(os.environ, LC_ALL="C", OMP_NUM_THREADS="1"),
+                preexec_fn=_kill_with_parent,
             )
             os.unlink(script)
             try:
@@ -157,6 +250,7 @@ class _ExtServer:
             except OSError as e:
                 last_err = e
                 self.proc.kill()
+                self.proc.wait()      # reap; we retry in a loop
         raise RuntimeError(f"could not start gnubg external server: {last_err}")
 
     @staticmethod
@@ -199,8 +293,10 @@ class _ExtServer:
                 closer.close()
             except Exception:
                 pass
-        if self.proc and self.proc.poll() is None:
-            self.proc.kill()
+        if self.proc:
+            if self.proc.poll() is None:
+                self.proc.kill()
+            self.proc.wait()          # reap before dropping the handle
         self.fh = self.sock = self.proc = None
 
 
@@ -210,30 +306,36 @@ class GnubgExternalAgent(Agent):
     plies: gnubg evaluation plies for BOTH chequer and cube decisions.
     cubeless: money play with the cube disabled; move selection by
         cubeless equity (see module docstring re the criterion fix).
-    full: False = production config (pruning nets + Normal move filter,
-        gnubg as shipped); True = totally unpruned (no pruning nets,
-        keep-all filter — full-width search, ~4x slower at 1-ply).
-    root_full: every legal move evaluated at the root, but gnubg's default
-        pruning for the opponent's replies (pruning nets stay ON). This is
-        the paper's stated 2-ply protocol; distinct from full=True.
+    prune: gnubg's pruning neural nets (True = production). False drops
+        them (full-width deep evaluation inside the search).
+    movefilter: None = gnubg's shipped Normal filter; a preset name from
+        ``_MOVEFILTERS`` (tiny/narrow/normal/large/huge); or "all" =
+        keep-all (every legal root move deep-evaluated).
+    full / root_full: legacy aliases. full=True == (prune=False,
+        movefilter="all"), the totally-unpruned full-width config
+        (~4x slower at 1-ply); root_full=True == (prune=True,
+        movefilter="all"), the paper's stated matched-2-ply protocol
+        (full-width root, shipped pruning for the replies). They may not
+        be combined with each other or with explicit prune/movefilter.
     """
 
     def __init__(self, plies: int = 0, gnubg_cmd: str = GNUBG_CMD,
-                 cubeless: bool = False, full: bool = False,
+                 cubeless: bool = False, prune: bool = True,
+                 movefilter: str = None, full: bool = False,
                  root_full: bool = False):
         self.plies = plies
         self.gnubg_cmd = gnubg_cmd
         self.cubeless = cubeless
-        self.full = full
-        self.root_full = root_full
+        self.prune, self.movefilter = _legacy_search_kwargs(
+            prune, movefilter, full, root_full)
         self._server = None  # lazy: one subprocess per worker process
 
     # ── plumbing ─────────────────────────────────────────────────────
     def _srv(self) -> _ExtServer:
         if self._server is None:
             self._server = _ExtServer(self.plies, self.gnubg_cmd,
-                                      self.cubeless, self.full,
-                                      self.root_full)
+                                      self.cubeless, self.prune,
+                                      self.movefilter)
         return self._server
 
     @staticmethod
@@ -250,8 +352,8 @@ class GnubgExternalAgent(Agent):
         # FIBS 'turn': 1 = gnubg (the mover we encode for) is on turn;
         # -1 = the opponent is. A double RESPONSE happens on the
         # doubler's turn, so doubled requests must send -1 — with 1,
-        # gnubg evaluates the take from the wrong side (found the hard
-        # way: 0 drops in 400 games; hopeless positions "taken").
+        # gnubg evaluates the take from the wrong side and takes
+        # hopeless positions.
         turn = -1 if doubled else 1
         fields = (
             ["board", "gnubg", "opp", "9999", "0", "0"]

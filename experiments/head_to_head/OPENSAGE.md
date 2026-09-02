@@ -44,7 +44,7 @@ cubeful strength.
       --side1 best_models/cubeful_money_512_512_256_256.pt \
       --side2 opensage-analyzer --sage-plies 1 \
       --game-mode cubeful-money --games 1000000 --workers 30 \
-      --save experiments/head_to_head/results/puretd_vs_opensage_analyzer_0ply
+      --save ~/hh_out/puretd_vs_opensage_analyzer_0ply   # raw .npz stays outside the repo; only summary CSVs are committed
 
 Runs may be split across machines and pooled with `--combine <dir>`;
 worker RNGs are entropy-seeded and the combiner rejects byte-identical

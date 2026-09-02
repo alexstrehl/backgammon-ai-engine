@@ -6,8 +6,8 @@
  * the inner loop. This removes the per-call framework overhead that
  * dominates single-thread move throughput in the Python path.
  *
- * Built into libbg_engine.so alongside bg_engine.c + nn_eval.c and called
- * from Python via ctypes (see c_engine/bg_nply Python wrapper in bg_fast).
+ * Built by build_nply.sh into libbg_nply.so alongside bg_engine.c +
+ * nn_eval.c, and called from Python via ctypes by c_engine/bg_nply.py.
  *
  * Cubeful-money perspective convention matches td_agent.py exactly:
  *   - per-unit equity at cube_value=1 (equity output mode)

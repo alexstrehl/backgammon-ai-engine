@@ -26,8 +26,10 @@ import os
 import platform
 import random
 import subprocess
+import sys
 import time as _time
 import tempfile
+import hashlib
 import re
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
@@ -58,43 +60,107 @@ if platform.system() == "Windows":
 else:
     GNUBG_CMD = "/usr/games/gnubg"
 
-# The GNUBG_CMD env var overrides the platform default, so a non-standard gnubg path works
-# for the whole pipeline (self-play + analysis), matching experiments/offline_analysis/sage_money_memg.py and
-# what the wrappers/README advertise.
+# GNUBG_CMD overrides the platform default, so a non-standard gnubg path
+# works for the whole pipeline (self-play + analysis).
 GNUBG_CMD = os.environ.get("GNUBG_CMD", GNUBG_CMD)
 
 
-# ── Bearoff-database preflight ───────────────────────────────────────────────
+# ── Judge preflight: pinned version/weights + bearoff database ───────────────
 
 _BEAROFF_OK: dict = {}
+_VERSION_OK: dict = {}
+
+# Every published row is judged by this exact binary + net. A different
+# version (older Debian/Ubuntu packages are 1.06) or a different gnubg.wd
+# (gnubg >= 1.08 ships retrained nets) produces non-comparable numbers
+# while everything appears to work.
+GNUBG_REQUIRED_VERSION = "1.08.003"
+GNUBG_REQUIRED_WEIGHTS_MD5 = "14184acc9c60ef67be0fad88548fd51a"
+
+
+def _gnubg_version(cmd: str):
+    """Version string of the binary at `cmd`, or None if it will not run."""
+    try:
+        out = subprocess.run([cmd, "--version"], capture_output=True,
+                             text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"GNU Backgammon\s+(\S+)", out or "")
+    return m.group(1) if m else None
+
+
+def _gnubg_weights_md5(cmd: str):
+    """md5 of the gnubg.wd the binary at `cmd` will load, or None.
+
+    gnubg will not report its pkgdatadir, so derive it the standard
+    autotools way (<prefix>/bin/gnubg -> <prefix>/share/gnubg/gnubg.wd).
+    None (file absent / non-standard layout) degrades to the version
+    check alone rather than refusing to run."""
+    prefix = os.path.dirname(os.path.dirname(os.path.realpath(cmd)))
+    wd = os.path.join(prefix, "share", "gnubg", "gnubg.wd")
+    if not os.path.isfile(wd):
+        return None
+    h = hashlib.md5()
+    with open(wd, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _assert_gnubg_pinned_judge(cmd: str) -> None:
+    """Refuse to run on a gnubg other than the pinned version + weights.
+
+    A wrong binary passes every other preflight (it exists, it runs, it
+    may even have the bearoff DBs) and then produces silently different
+    equities. GNUBG_ALLOW_VERSION_MISMATCH=1 opts out deliberately."""
+    if cmd in _VERSION_OK:
+        return
+    if os.environ.get("GNUBG_ALLOW_VERSION_MISMATCH") == "1":
+        _VERSION_OK[cmd] = True
+        return
+    v = _gnubg_version(cmd)
+    if v != GNUBG_REQUIRED_VERSION:
+        raise RuntimeError(
+            f"gnubg at '{cmd}' is version {v!r}, but results are pinned to "
+            f"{GNUBG_REQUIRED_VERSION}. Package-manager versions vary "
+            f"(recent Debian/Ubuntu ship 1.08.003, older ship 1.06) -- "
+            f"install or build 1.08.003 and set GNUBG_CMD, or set "
+            f"GNUBG_ALLOW_VERSION_MISMATCH=1 to run on a different gnubg "
+            f"ON PURPOSE (results will not be comparable)."
+        )
+    w = _gnubg_weights_md5(cmd)
+    if w is None:
+        # Non-autotools layout: the weights pin cannot be checked. The
+        # pin is the point of this preflight, so refuse rather than fail
+        # open on the version check alone.
+        raise RuntimeError(
+            f"cannot locate gnubg.wd for '{cmd}' (expected "
+            f"<prefix>/share/gnubg/gnubg.wd), so the weights pin "
+            f"{GNUBG_REQUIRED_WEIGHTS_MD5} cannot be verified. Set "
+            f"GNUBG_ALLOW_VERSION_MISMATCH=1 to run unverified ON PURPOSE."
+        )
+    if w != GNUBG_REQUIRED_WEIGHTS_MD5:
+        raise RuntimeError(
+            f"gnubg.wd for '{cmd}' has md5 {w}, but results are pinned to "
+            f"{GNUBG_REQUIRED_WEIGHTS_MD5} (gnubg >= 1.08 ships retrained "
+            f"nets, so the version alone does not pin the judge). Set "
+            f"GNUBG_ALLOW_VERSION_MISMATCH=1 to override ON PURPOSE."
+        )
+    _VERSION_OK[cmd] = True
 
 
 def assert_gnubg_bearoff(gnubg_cmd: str = None) -> None:
-    """Refuse to run unless gnubg has its TWO-SIDED bearoff database.
-
-    gnubg ships two bearoff databases and a normal build installs both
-    (`Makefile.am`: `gnubg_os0.bd` and `gnubg_ts0.bd` are both build targets
-    and both listed in `pkgdata_DATA`). The two-sided one supplies EXACT
-    CUBEFUL equities in bearoff. Without it gnubg silently falls back to a
-    net estimate, which shifts its cube decisions in bearoff races when it
-    plays, and fabricates cube errors when it judges.
-
-    There is no gnubg setting for this and nothing in a run's provenance
-    records it -- it is ambient host state. The only signal is a startup
-    warning, and every launch site used to discard it (gnubg_external.py
-    piped both stdout and stderr to DEVNULL). A fleet once ran a whole
-    experiment one-sided without anything noticing, so read the warning here.
-
-    Debian installs the file to /var/lib/gnubg/ while a source build puts it
-    in the package data dir, so we ask gnubg itself rather than looking on
-    disk. Result is cached per binary (one ~0.2 s probe per process).
-
-    Override with GNUBG_ALLOW_ONESIDED_BEAROFF=1 only to deliberately
-    reproduce a one-sided run; results are NOT comparable with two-sided ones.
-    """
+    """Refuse to run unless gnubg has its TWO-SIDED bearoff database
+    (gnubg_ts0.bd). Without it gnubg silently substitutes a net estimate
+    for exact cubeful bearoff equities -- wrong cube play, fabricated cube
+    errors when judging -- and the only signal is a startup warning that
+    the launch sites discard. Install location varies (Debian:
+    /var/lib/gnubg/), so ask gnubg itself; cached per binary (~0.2s once).
+    GNUBG_ALLOW_ONESIDED_BEAROFF=1 opts out deliberately."""
     cmd = gnubg_cmd or GNUBG_CMD
     if cmd in _BEAROFF_OK:
         return
+    _assert_gnubg_pinned_judge(cmd)
     if os.environ.get("GNUBG_ALLOW_ONESIDED_BEAROFF") == "1":
         _BEAROFF_OK[cmd] = True
         return
@@ -383,8 +449,20 @@ def _dice_str(dice: Tuple[int, int]) -> str:
     return f"{dice[0]}{dice[1]}"
 
 
+# .mat play-row layout: "%3d)" + space, then the white field padded to
+# _MAT_W_WIDTH, then black. XG reads the winner off the column its token sits
+# in, so the winner line must use these same offsets.
+_MAT_W_WIDTH = 33
+_MAT_COL_W = 5
+_MAT_COL_B = _MAT_COL_W + _MAT_W_WIDTH
+
+# A roll with no legal play, written as "DD:" with nothing after it.
+_FORCED_PASS = re.compile(r"^\s*[1-6][1-6]:\s*$")
+
+
 def export_mat(
     record: GameRecord, game_id: int = 1, money_game: bool = False,
+    white: str = "white", black: str = "black",
 ) -> str:
     """Export a GameRecord to Jellyfish .mat format string.
 
@@ -395,15 +473,27 @@ def export_mat(
     interleaved into the appropriate columns following gnubg's
     left-to-right reading order. `money_game=True` writes a "0 point
     match" header (= money game).
+
+    `white` / `black` name the players; XG shows them as profile names.
     """
     lines = []
 
-    # Header
+    # Money games need the XG rules block: without it XG assumes Beavers
+    # and misreads the cube sequence. Jacoby "On" matches the jacoby=True
+    # money path; match exports skip the block.
+    if money_game:
+        lines.append('; [Jacoby "On"]')
+        lines.append('; [Beaver "Off"]')
+        lines.append('; [CubeLimit "1024"]')
+        lines.append('; [Unrated "On"]')
+
     lines.append("")
     lines.append(" 0 point match" if money_game else " 1 point match")
     lines.append("")
     lines.append(f" Game {game_id}")
-    lines.append(" white : 0                      black : 0")
+    # XG surfaces these as the profile names in a stats export, so naming them
+    # after the engine/checkpoint makes an export self-identifying.
+    lines.append(f" {white} : 0                      {black} : 0")
 
     # Rows are [left_col, right_col] (left=WHITE, right=BLACK).
     rows: List[List[str]] = []
@@ -414,6 +504,33 @@ def export_mat(
 
     w_next = 0  # next row index where WHITE can write to the left col
     b_next = 0  # next row index where BLACK can write to the right col
+
+    def _clear_of_cube(row: int, other_col: int) -> int:
+        """First row at or after `row` whose `other_col` holds no cube token.
+
+        The mirror of _clear_of_pass: that one keeps a cube action off a row
+        whose other column is already a forced pass, but a forced pass written
+        LATER could still land beside a cube token, which is the same
+        ambiguity from the other direction.
+        """
+        while row < len(rows) and rows[row][other_col].strip().startswith(
+                ("Doubles", "Takes", "Drops")):
+            row += 1
+        _ensure_row(row)
+        return row
+
+    def _clear_of_pass(row: int, other_col: int) -> int:
+        """First row at or after `row` whose `other_col` is not a forced pass.
+
+        A cube token sharing a row with a bare "DD:" (roll, no legal play) is
+        where XG has been observed to lose the cube: it reported a 2-point win
+        for a game the record scores at 8 (cube 4, gammon). Giving the cube
+        action its own row removes the ambiguity.
+        """
+        while row < len(rows) and _FORCED_PASS.match(rows[row][other_col]):
+            row += 1
+        _ensure_row(row)
+        return row
 
     i = 0
     entries = record.moves
@@ -431,8 +548,8 @@ def export_mat(
 
             if entry.player == WHITE:
                 # WHITE doubles (left col) + response (right col) on SAME row.
-                row = w_next
-                _ensure_row(row)
+                _ensure_row(w_next)
+                row = _clear_of_pass(w_next, 1)
                 rows[row][0] = dbl_str
                 rows[row][1] = resp_str
                 w_next = row + 1
@@ -440,12 +557,11 @@ def export_mat(
             else:
                 # BLACK doubles: double on right col of current row, response
                 # on left col of NEXT row (gnubg reads left-to-right).
-                row = b_next
-                _ensure_row(row)
+                _ensure_row(b_next)
+                row = _clear_of_pass(b_next, 0)
                 rows[row][1] = dbl_str
                 b_next = row + 1
-                resp_row = max(w_next, b_next)
-                _ensure_row(resp_row)
+                resp_row = _clear_of_pass(max(w_next, b_next), 1)
                 rows[resp_row][0] = resp_str
                 w_next = resp_row + 1
                 b_next = max(b_next, resp_row)
@@ -455,14 +571,17 @@ def export_mat(
             dice = _dice_str(entry.dice)
             s = f"{dice}: {notation}" if notation else f"{dice}: "
 
+            forced_pass = not notation
             if entry.player == WHITE:
                 _ensure_row(w_next)
-                rows[w_next][0] = s
-                w_next += 1
+                row = _clear_of_cube(w_next, 1) if forced_pass else w_next
+                rows[row][0] = s
+                w_next = row + 1
             else:
                 _ensure_row(b_next)
-                rows[b_next][1] = s
-                b_next += 1
+                row = _clear_of_cube(b_next, 0) if forced_pass else b_next
+                rows[row][1] = s
+                b_next = row + 1
                 w_next = max(w_next, b_next)
 
         i += 1
@@ -488,31 +607,30 @@ def export_mat(
     # row so gnubg reads it correctly -- but ONLY in the WINNER's column. The
     # winner of a dropped double is the DOUBLER, not the dropper, so appending
     # it to whichever column happens to hold " Drops" silently credits the game
-    # to the loser. XG reads the winner off the column the token sits in, so
-    # that inverted ~25% of games (every white-doubles/black-drops game) in
-    # every export. When the winner's column on the last row is already taken
+    # to the loser -- readers take the winner from the column the token sits
+    # in. When the winner's column on the last row is already taken
     # (white doubled there), fall back to a separate winner-column line.
     winner_col = 0 if winner == WHITE else 1
     drop_wins_separate = False
     if record.ended_by_drop and rows:
         last = rows[-1]
         if not last[winner_col]:
-            last[winner_col] = f" {wins_str}"
+            last[winner_col] = wins_str
         else:
             drop_wins_separate = True
 
     for idx, (w, b) in enumerate(rows):
         num = f"{idx + 1:>3d})"
         if b:
-            lines.append(f"{num} {w:<33s}{b}")
+            lines.append(f"{num} {w:<{_MAT_W_WIDTH}s}{b}")
         else:
             lines.append(f"{num} {w}")
 
+    # Same columns as the play rows above, so a standalone winner line sits in
+    # the same column as that player's moves.
     if not record.ended_by_drop or drop_wins_separate:
-        if winner == BLACK:
-            lines.append(f"                                  {wins_str}")
-        else:
-            lines.append(f"      {wins_str}")
+        pad = _MAT_COL_B if winner == BLACK else _MAT_COL_W
+        lines.append(" " * pad + wins_str)
     lines.append("")
 
     return "\n".join(lines)
@@ -604,10 +722,10 @@ def run_gnubg_analysis(
         print(f"  working dir:   {work_dir}")
 
     # No timeout: dropping slow games would bias mEMG against long/complex
-    # games (user directive 2026-07-21 — every game must be scored; a hang
-    # here means a code bug, which we want surfaced, not silently skipped).
-    # Instead, chunks slower than the old budget (120 + 960s/game at 4-ply)
-    # are LOGGED with elapsed time + per-game move counts so we can tell
+    # games — every game must be scored; a hang here means a code bug,
+    # which we want surfaced, not silently skipped.
+    # Instead, chunks slower than a reference budget are LOGGED with
+    # elapsed time + per-game move counts so we can tell
     # "long game" (many moves) from "stuck gnubg" (few moves, huge time).
     slow_after = 120 + len(mat_files) * 60 * (4 ** max(0, plies - 2))
     _t0 = _time.monotonic()
@@ -811,6 +929,9 @@ def evaluate_with_gnubg_parallel(
         assert_cubeful_supported(model_path, cubeful)
     if gnubg_cmd is None:
         gnubg_cmd = GNUBG_CMD
+    # Preflight the judge BEFORE generating games: a wrong binary would
+    # otherwise be discovered only after the whole generation phase.
+    assert_gnubg_bearoff(gnubg_cmd)
 
     if work_dir is None:
         work_dir = tempfile.mkdtemp(prefix="gnubg_eval_")

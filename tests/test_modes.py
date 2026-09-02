@@ -21,7 +21,7 @@ from model import TDNetwork
 
 def _terminal_state_with_winner(winner: int, *, gammon=False, backgammon=False) -> BoardState:
     """Build a synthetic terminal BoardState where `winner` has borne off
-    all 15 checkers. Per the new wart-free engine convention, the
+    all 15 checkers. Per the engine turn convention, the
     returned state has `turn = loser` (the engine would have switched
     after the winning move)."""
     state = BoardState(

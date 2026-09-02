@@ -173,8 +173,10 @@ def main():
     from gnubg_eval import assert_gnubg_bearoff
     assert_gnubg_bearoff(GNUBG_CMD)
 
+    from memg_common import file_md5
     print(f"### CUBEFUL {args.plies}-ply mEMG | {args.games} self-play games/player "
-          f"| model={CUBEFUL_MODEL} | jacoby={JACOBY} ###", flush=True)
+          f"| model={CUBEFUL_MODEL} (md5 {file_md5(CUBEFUL_MODEL)}) "
+          f"| jacoby={JACOBY} ###", flush=True)
     rows = []
     for p in players:
         print(f"\n--- {p} ---", flush=True)

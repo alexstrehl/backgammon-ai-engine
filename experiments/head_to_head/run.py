@@ -18,23 +18,23 @@ Each side (--side1 / --side2) is a checkpoint path OR an engine keyword:
 Examples (cubeless money, 1M games each):
   # PureTD 0-ply vs Open Sage 0-ply
   python experiments/head_to_head/run.py \
-      --side1 best_models/cubeless_prob5_512_512_256_128.pt \
+      --side1 best_models/cubeless_prob5_512_512_256_256.pt \
       --side2 opensage --sage-plies 1 \
-      --game-mode cubeless-money --games 1000000 --workers 32 --save head_to_head/results
+      --game-mode cubeless-money --games 1000000 --workers 32 --save ~/hh_out
 
   # gnubg 0-ply vs Open Sage 0-ply (real gnubg 1.08 over the external socket)
   python experiments/head_to_head/run.py --side1 gnubg-ext --side2 opensage \
-      --plies 0 --sage-plies 1 --game-mode cubeless-money --games 1000000 --workers 32 --save head_to_head/results
+      --plies 0 --sage-plies 1 --game-mode cubeless-money --games 1000000 --workers 32 --save ~/hh_out
 
   # PureTD 0-ply vs gnubg 1-ply (unpruned paper config)
   python experiments/head_to_head/run.py \
-      --side1 best_models/cubeless_prob5_512_512_256_128.pt \
-      --side2 gnubg-ext-full --plies 1 --game-mode cubeless-money --games 1000000 --workers 32 --save head_to_head/results
+      --side1 best_models/cubeless_prob5_512_512_256_256.pt \
+      --side2 gnubg-ext-full --plies 1 --game-mode cubeless-money --games 1000000 --workers 32 --save ~/hh_out
 
   # PureTD 0-ply vs Open Sage 1-ply
   python experiments/head_to_head/run.py \
-      --side1 best_models/cubeless_prob5_512_512_256_128.pt \
-      --side2 opensage --sage-plies 2 --game-mode cubeless-money --games 1000000 --workers 32 --save head_to_head/results
+      --side1 best_models/cubeless_prob5_512_512_256_256.pt \
+      --side2 opensage --sage-plies 2 --game-mode cubeless-money --games 1000000 --workers 32 --save ~/hh_out
 
 Open Sage sides:
   ``opensage`` is cubeless-money / DMP only. For ``--game-mode
@@ -94,6 +94,12 @@ def main():
         return
     if not (a.side1 and a.side2):
         ap.error("--side1 and --side2 are required (unless --combine is given)")
+
+    # Preflight the two-sided bearoff DB once (~0.2s), before any game;
+    # _ExtServer's own assert only fires per worker, after pool spawn.
+    if any(str(s).startswith("gnubg-ext") for s in (a.side1, a.side2)):
+        from gnubg_eval import assert_gnubg_bearoff
+        assert_gnubg_bearoff()
 
     run_head_to_head(
         a.side1, a.side2,

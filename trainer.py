@@ -41,21 +41,14 @@ from modes import GameMode, cube_perspective
 # round barrier (pool.map get()) and worker RSS climbs until the OOM
 # killer fires.
 #
-# Calibration: on a healthy cubeful-money net, episodes average ~129
-# samples with a max of ~341 over 2000 episodes; a cubeful turn emits
-# 1-2 samples (checker always, cube when eligible), so healthy play is
-# ~65-340 plies. 1500 plies is ~4-20x the healthy maximum -- far enough
-# above legitimate play that it never fires on a healthy run, while
-# still bounding a runaway episode to a few thousand samples instead of
-# millions.
+# Healthy play is ~65-340 plies, so 1500 never fires on a healthy run
+# while still bounding a runaway episode to a few thousand samples.
 DEFAULT_MAX_EPISODE_PLIES = 1500
 
 # VRAM preflight for the vectorized GPU collector. Each vectorized
-# worker process owns a full CUDA context (measured 250-500 MB on the
-# boxes this repo runs on: prob5 W=16xB=16 fit an 8 GB card, W=32xB=32
-# did not; the eval-server daemon idles at ~498 MB). The estimate below
-# is deliberately conservative -- a capped-but-running collector beats
-# an OOM forty minutes into a leg.
+# worker process owns a full CUDA context (~420 MB); the estimate is
+# deliberately conservative -- a capped-but-running collector beats an
+# OOM forty minutes into a leg.
 VEC_PER_WORKER_BYTES = 420 * 2**20
 VEC_RESERVE_BYTES = 512 * 2**20   # master context / display / allocator slack
 
@@ -360,8 +353,7 @@ def _collect_worker(args):
     because modes can carry config (e.g. CubefulMoneyMode.jacoby).
 
     NOTE: the args tuple arity must stay in sync with
-    `_build_worker_args` in Trainer.train — a mismatch here has bitten
-    this file before.
+    `_build_worker_args` in Trainer.train.
     """
     os.environ["OMP_NUM_THREADS"] = "1"
     torch.set_num_threads(1)
@@ -373,12 +365,10 @@ def _collect_worker(args):
     from model import TDNetwork
     from td_agent import TDAgent
 
-    # `activation` MUST be threaded through and applied here. Before
-    # 2026-08-05 the worker rebuilt with the constructor default
-    # ("relu") regardless of the checkpoint — activation is not a
-    # parameter tensor, so load_state_dict succeeds and a tanh/sigmoid
-    # net silently trains against relu-computed targets. Invisible only
-    # while every checkpoint happens to be relu.
+    # `activation` MUST be threaded through: it is not a parameter
+    # tensor, so load_state_dict succeeds even when the rebuilt net's
+    # activation is wrong — a tanh/sigmoid checkpoint would silently
+    # train against relu-computed targets.
     net = TDNetwork(
         hidden_sizes=hidden_sizes,
         input_size=input_size,
@@ -578,8 +568,9 @@ class Trainer:
 
         `warmup_cycles`: if > 0, ramps the (annealed) LR from
         `lr * 0.1` up to the full scheduled LR over the first
-        `warmup_cycles` rounds. Useful when starting from a depth-
-        expanded model whose new layer needs gentle initial steps.
+        `warmup_cycles` rounds. For task transfers (DMP -> cubeless,
+        cubeless -> cubeful), where a freshly-initialised head sits on
+        a trained trunk; not for expansions.
         Composes with `end_lr` (multiplicative).
 
         `pipeline_collect`: when True (and workers > 1), overlap the
@@ -711,12 +702,9 @@ class Trainer:
         # oneply (the collector is 1-ply-only by construction), a real
         # worker pool, and CUDA.
         #
-        # Everything this path turns off is announced. The original
-        # implementation disabled pipelining silently, which made a
-        # recipe change (one-round-stale targets -> fresh targets)
-        # invisible in the logs; and it predates --c-engine entirely, so
-        # a run passing both would have silently got neither the C
-        # engine nor a warning.
+        # Everything this path turns off is announced — silently
+        # dropping pipelining changes the recipe (one-round-stale
+        # targets -> fresh targets), which must be visible in logs.
         if vectorized_collect and not vec_active and vec_workers == workers:
             # (VRAM-cap fallback already printed its own WARN above.)
             reasons = []
@@ -739,10 +727,9 @@ class Trainer:
                 f"max_episode_plies={max_episode_plies})",
                 flush=True,
             )
-            # Spec echo: the worker REBUILDS the net from these fields.
-            # Anything not echoed here has silently defaulted before
-            # (activation; cf. the eval server rebuilding every net as
-            # ReLU) -- print exactly what workers will construct.
+            # Spec echo: workers REBUILD the net from these fields, so
+            # print exactly what they will construct. A field missing
+            # here defaults silently in the worker.
             _sn = self.agent.network
             print(
                 f"  worker net spec: hidden={list(_sn.hidden_sizes)} "
@@ -794,13 +781,11 @@ class Trainer:
         def _build_worker_args(round_size: int):
             splits = _split_episodes(round_size, workers)
             # .clone() is REQUIRED, not defensive. On a CPU net `.cpu()` is a
-            # no-op that returns a VIEW sharing storage with the live parameter,
-            # so the tensors handed to map_async are pickled by the pool's task
-            # thread WHILE optimizer.step() mutates them in place — workers can
-            # receive torn weights. Demonstrated 2026-08-04: identical CPU runs
-            # diverged (pool 31771 x4, 31943 x1). Not reachable on --device cuda
-            # (there .cpu() genuinely copies, in the master thread). Cost is one
-            # ~2MB copy per round, i.e. nothing.
+            # no-op returning a VIEW of the live parameter, so the tensors
+            # handed to map_async are pickled by the pool's task thread WHILE
+            # optimizer.step() mutates them — workers can receive torn
+            # weights. Not reachable on --device cuda (there .cpu() genuinely
+            # copies). Cost is one ~2MB copy per round.
             state_dict = {
                 k: v.detach().cpu().clone()
                 for k, v in net.state_dict().items()
@@ -824,14 +809,8 @@ class Trainer:
         # `vectorized_collect_worker` in vectorized_collect.py.
         def _build_vec_args(round_size: int):
             splits = _split_episodes(round_size, vec_workers)
-            # .clone() is REQUIRED, not defensive. On a CPU net `.cpu()` is a
-            # no-op that returns a VIEW sharing storage with the live parameter,
-            # so the tensors handed to map_async are pickled by the pool's task
-            # thread WHILE optimizer.step() mutates them in place — workers can
-            # receive torn weights. Demonstrated 2026-08-04: identical CPU runs
-            # diverged (pool 31771 x4, 31943 x1). Not reachable on --device cuda
-            # (there .cpu() genuinely copies, in the master thread). Cost is one
-            # ~2MB copy per round, i.e. nothing.
+            # .clone() REQUIRED — same torn-weights hazard as
+            # _build_worker_args above.
             state_dict = {
                 k: v.detach().cpu().clone()
                 for k, v in net.state_dict().items()
@@ -1004,13 +983,9 @@ class Trainer:
                 tgt_chunks = None
                 n = len(pool_enc)
 
-                # Shuffle + batch via index slicing. We used to
-                # materialize `sh_enc = pool_enc[perm]` — a full shuffled
-                # copy of the entire pool — which doubled peak RSS for
-                # the whole training phase of the round. Fancy-indexing
-                # per batch holds only a batch-sized copy at a time,
-                # and the per-batch op cost is negligible next to the
-                # forward/backward pass.
+                # Fancy-index per batch: a materialized `pool_enc[perm]`
+                # would double peak RSS for the round, and the per-batch
+                # op cost is negligible next to forward/backward.
                 for _epoch in range(epochs_per_round):
                     perm = np.arange(n)
                     rng_np = np.random.default_rng(rng.randint(0, 2**31 - 1))

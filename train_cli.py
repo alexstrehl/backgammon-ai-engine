@@ -13,7 +13,7 @@ import torch
 from agents import RandomAgent
 from backgammon_engine import BoardState, WHITE, get_legal_plays, switch_turn
 from encoding import CubefulEncoder
-from model import TDNetwork
+from model import TDNetwork, suggested_depth_expand_eps
 from modes import CubefulMoneyMode, CubelessMoneyMode, DMPMode
 
 
@@ -131,11 +131,26 @@ def build_network(args) -> TDNetwork:
     if args.expand_depth:
         source = TDNetwork.load(args.expand_depth)
         depth_size = getattr(args, "expand_depth_size", None)
-        net = TDNetwork.depth_expand(source, new_layer_size=depth_size)
+        depth_eps = getattr(args, "expand_depth_eps", None)
+        if depth_eps is None:
+            w = depth_size or source.hidden_sizes[-1]
+            raise SystemExit(
+                "ERROR: --expand-depth requires --expand-depth-eps. There is "
+                "no default on purpose -- the safe value is net-specific "
+                "(measurements in model.py, DEPTH_EXPAND_EPS_SCALE).\n"
+                f"  --expand-depth-eps 0.0     exact copy, but symmetric\n"
+                f"  --expand-depth-eps {suggested_depth_expand_eps(w):.6f}  suggested "
+                f"starting point for width {w}\n"
+                "MEASURE the equity deviation on real positions first."
+            )
+        net = TDNetwork.depth_expand(source, new_layer_size=depth_size,
+                                     eps=depth_eps)
+        used_eps = depth_eps
         print(
             f"Depth-expanded from {args.expand_depth}: "
             f"{source.hidden_sizes} -> {net.hidden_sizes} "
-            f"(output_mode={net.output_mode}, encoder={net.encoder_name})"
+            f"(output_mode={net.output_mode}, encoder={net.encoder_name}, "
+            f"eps={used_eps:g})"
         )
         return net
 
@@ -161,7 +176,7 @@ def _warm_start_equity(path: str, reinit_output: bool = True) -> TDNetwork:
     Copies all hidden layer weights. If reinit_output=True, re-initializes
     the output layer; if False, copies the output layer weights as-is.
     """
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     old_output = checkpoint.get("output_mode", "probability")
     if old_output != "probability":
         raise ValueError(
@@ -205,7 +220,7 @@ def _warm_start_cubeful(path: str) -> TDNetwork:
     model. The 4 new columns (cube features) get Kaiming initialization.
     Output mode is set to equity.
     """
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     old_hidden = checkpoint["hidden_sizes"]
     old_input = checkpoint.get("input_size", 196)
     old_activation = checkpoint.get("activation", "relu")
@@ -304,8 +319,17 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
                            "Function is preserved at init.")
     g_io.add_argument("--expand-depth-size", type=int, default=None, metavar="N",
                       help="Size of the new layer when using --expand-depth. "
-                           "Defaults to the last hidden layer's size. Must be "
-                           "<= the last hidden size (for identity init).")
+                           "Defaults to the last hidden layer's size, and must "
+                           "EQUAL it (square identity init). Grow other layers "
+                           "with --expand instead.")
+    g_io.add_argument("--expand-depth-eps", type=float, default=None,
+                      metavar="EPS",
+                      help="REQUIRED with --expand-depth. Symmetry-breaking "
+                           "noise on the near-identity init. No default -- "
+                           "0.0 is exact but symmetric, injected deviation "
+                           "grows as eps*sqrt(width), and the equity cost is "
+                           "net-specific. Measure it (see model.py, "
+                           "DEPTH_EXPAND_EPS_SCALE).")
     g_io.add_argument("--warm-start-equity", default=None, metavar="PATH",
                       help="Initialize an equity-output model from a "
                            "probability-output (DMP) model. Copies hidden "

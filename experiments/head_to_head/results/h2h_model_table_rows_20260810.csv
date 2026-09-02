@@ -1,41 +1,25 @@
-# The four README model-table rows that the 2026-08-08 move-generator redo did
-# not cover (three money rows 2026-08-10, the DMP row 2026-08-11). That redo re-measured only the two headline checkpoints
-# (PureTD_prob5 cubeless, PureTD_4L cubeful); these four rows are for OTHER
-# checkpoints and so were still pre-fix. Re-measured 2026-08-10/11, 10M games
-# each (the money rows pooled 10.5M / 24M / 10.5M, trimmed to exactly
-# 10,000,000 in sorted-path order), on two hosts (48 and 32 workers).
+# The four README model-table rows for checkpoints OTHER than the two headline
+# ones (money rows 2026-08-10, DMP row 2026-08-11). 10M games each (the money
+# rows pooled 10.5M / 24M / 10.5M, trimmed to exactly 10,000,000 in sorted-path
+# order), on two hosts (48 and 32 workers).
 #
-# Matchups reproduce the published commands EXACTLY -- only the move generator
-# differs. Per the README footnote both cubeful rows play the real gnubg
-# 1.08.003 binary over its external-player socket (gnubg-ext, native money cube,
-# Jacoby); the cubeless rows use the gnubg-nn wrapper (--gnubg). Changing the
-# opponent would have confounded the move-generator delta.
+# The cubeful row plays the real gnubg 1.08.003 binary over its external-player
+# socket (gnubg-ext, native money cube, Jacoby) on a host carrying both bearoff
+# databases; the cubeless and DMP rows use the gnubg-nn wrapper (--gnubg),
+# which has no bearoff database in the loop at all.
 #
-# Both hosts were verified before launch: all H-H sources plus c_engine/
-# bg_engine.c hash-identical, gnubg weights md5 14184acc9c60ef67be0fad88548fd51a,
-# and the fix confirmed BUILT (not merely present in source) by exercising the
-# false-forced-pass cases through the Python generator AND the compiled C fast
-# path on each host.
-model,checkpoint,opponent,mode,games,prefix_mEq,current_mEq,ci_lo,ci_hi,delta,metric
-Best cubeful 3L,cubeful_money_512_512_256.pt,gnubg-ext,cubeful-money,10000000,53.5,53.6,51.9,55.4,+0.1,capped128
-Best cubeless,cubeless_money_512_512_256_256.pt,gnubg-nn,cubeless-money,10000000,42.3,44.2,43.4,45.1,+1.9,mean
-Best cubeless 3L,cubeless_money_512_512_256.pt,gnubg-nn,cubeless-money,10000000,27.9,28.6,27.8,29.5,+0.7,mean
-Best DMP,dmp_512_512_256_256.pt,gnubg-nn,dmp,10000000,51.84,51.801,51.770,51.832,-0.039,win_pct
+# Both hosts ran hash-identical sources and gnubg weights
+# (md5 14184acc9c60ef67be0fad88548fd51a), with the corrected move generator
+# verified built in both the Python generator and the compiled C fast path.
+model,checkpoint,opponent,mode,games,edge,ci_lo,ci_hi,metric
+Best cubeful 3L,cubeful_money_512_512_256.pt,gnubg-ext,cubeful-money,10000000,53.6,51.9,55.4,capped128
+Best cubeless,cubeless_money_512_512_256_256.pt,gnubg-nn,cubeless-money,10000000,44.2,43.4,45.1,mean
+Best cubeless 3L,cubeless_money_512_512_256.pt,gnubg-nn,cubeless-money,10000000,28.6,27.8,29.5,mean
+Best DMP,dmp_512_512_256_256.pt,gnubg-nn,dmp,10000000,51.801,51.770,51.832,win_pct
 #
-# Pre- and post-fix are independent 10M samples, so the 95% null band on a delta
-# is the quadrature sum of the two standard errors: ~+-1.2 mEq cubeless and
-# ~+-2.5 cubeful. Only the Best cubeless (4L) delta clears it:
-#   Best cubeful 3L  +0.1 vs +-2.5  -> within noise
-#   Best cubeless    +1.9 vs +-1.2  -> MOVED
-#   Best cubeless 3L +0.7 vs +-1.2  -> within noise
-# Direction and size match the 2026-08-08 redo, where the ten headline rows
-# shifted between -4.0 and +1.2 mEq (h2h_redo_validation_20260808.csv).
-#
-# DMP NOTE: that row is a WIN PERCENTAGE, not mEq -- the prefix/current/ci
-# columns are percentage points for it. Re-measured 2026-08-11, 10M games,
-# 5M each on two hosts, sage_unpruned=0 on every chunk. Its null band is
-# +-0.044 pp (two independent 10M binomials at p=0.518), so -0.039 pp is
-# within noise: the bear-off defect did not measurably move DMP.
+# DMP NOTE: that row is a WIN PERCENTAGE, not mEq -- the edge/ci columns are
+# percentage points for it. Measured 2026-08-11, 10M games, 5M each on two
+# hosts, sage_unpruned=0 on every chunk.
 #
 # With this row the README model table is fully post-fix.
 #

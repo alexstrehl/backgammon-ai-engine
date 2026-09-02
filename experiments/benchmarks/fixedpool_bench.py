@@ -46,10 +46,12 @@ import torch
 torch.set_grad_enabled(False)
 torch.set_num_threads(1)
 
-from bench_common import load_fixedpool, rate, sage_conv
+from bench_common import load_fixedpool, rate, sage_conv, model_stamp
 from play_models import _load_agent
 
-PROB5 = os.path.join(_REPO, "best_models", "cubeless_prob5_512_512_256_128.pt")
+# Prod prob5 (4L256, ac95a983); PROB5_MODEL overrides. Rows carry a stamp.
+PROB5 = os.environ.get("PROB5_MODEL", os.path.join(
+    _REPO, "best_models", "cubeless_prob5_512_512_256_256.pt"))
 CUBEFUL = "best_models/cubeful_money_512_512_256_256.pt"
 CUBEFUL_POOL = os.path.join(_HERE, "fixedpool_cubeful_positions.json")
 
@@ -110,7 +112,8 @@ def run_cubeless(cap, configs, out):
         CHK["sage-1ply"] = (lambda bd: schk(s2, bd), sb)
 
     header = (f"=== Fixed-pool cubeless per-decision (native, single pinned core, "
-              f"committed pool of {len(chk)}, cap={cap}) ===")
+              f"committed pool of {len(chk)}, cap={cap}) ===\n"
+              f"    prob5 workload: {model_stamp(PROB5)}")
     lines = [header]
     for name in wanted:
         fn, items = CHK[name]

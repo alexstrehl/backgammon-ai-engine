@@ -19,10 +19,11 @@
 #                                   (the runner sets it by default; --cubeful-eval disables).
 #
 # Prerequisites:
-#   gnubg 1.08.003 CLI at /usr/games/gnubg  (apt-get install -y gnubg; or set
-#                                          GNUBG_CMD — judge AND gnubg-ext players)
+#   gnubg 1.08.003 CLI on GNUBG_CMD (judge AND gnubg-ext players). Recent
+#   Debian/Ubuntu apt ships 1.08.003; older releases ship 1.06 -- the runtime
+#   preflight verifies version + weights md5 and refuses anything else.
 #   pip install bgsage                    (sage-0ply / sage-1ply players; needs AVX2)
-#   torch + this repo; model best_models/cubeless_prob5_512_512_256_128.pt
+#   torch + this repo; model best_models/cubeless_prob5_512_512_256_256.pt (prod; override with PROB5_MODEL)
 # ============================================================================
 set -euo pipefail
 cd "$(dirname "$0")/../.."                    # repo root

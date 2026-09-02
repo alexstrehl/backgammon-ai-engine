@@ -1,4 +1,4 @@
-"""Release-behavior tests for --oneply --device cuda (2026-08-05).
+"""Release-behavior tests for --oneply --device cuda.
 
 Covers, without needing a GPU:
   * the train_batch routing table (AUTO vectorized under cuda+oneply,

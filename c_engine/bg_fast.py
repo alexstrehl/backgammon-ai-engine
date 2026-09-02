@@ -41,11 +41,18 @@ def _find_or_build_library() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     lib_path = os.path.join(here, "libbg_engine.so")
     source = os.path.join(here, "bg_engine.c")
+    # Freshness is checked against EVERY input gcc reads, not just the .c.
+    # bg_engine.c includes bg_engine.h, and MAX_PLAYS is mirrored at the top
+    # of this file: a stale .so with a changed header is silently wrong
+    # behaviour, not a build error.
+    deps = [source, os.path.join(here, "bg_engine.h")]
 
     if (
         os.path.isfile(lib_path)
         and os.path.isfile(source)
-        and os.path.getmtime(lib_path) >= os.path.getmtime(source)
+        and os.path.getmtime(lib_path) >= max(
+            os.path.getmtime(d) for d in deps if os.path.isfile(d)
+        )
     ):
         return lib_path
 

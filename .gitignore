@@ -12,16 +12,6 @@ __pycache__/
 models/
 working_models/
 
-# model_logs/ holds ONLY the curated human-readable model histories below;
-# raw run logs (bench_*, hh_*, train_*, ...) are local-only and cannot be
-# added even by a bulk `git add`. Patterns are unanchored (**/) so they apply
-# wherever the directory sits, including under experiments/.
-**/model_logs/*
-!**/model_logs/cubeful_money_4L_model_log.md
-!**/model_logs/cubeless_money_4L_model_log.md
-!**/model_logs/cubeless_prob5_model_log.md
-!**/model_logs/dmp_4L_model_log.md
-
 # build artifacts
 c_engine/*.so
 c_engine/*.dll
@@ -47,3 +37,15 @@ logs/
 
 # c-engine build artifact
 c_engine/libbg_nply.so
+
+# c_inference build artifacts (build_play.sh)
+c_inference/play_models
+c_inference/test_nn
+
+# Training run logs — run artifacts, not source.
+runlogs/
+
+# Saved-game dirs the README/h2h examples write into.
+cubeful_selfplay_games/
+cubeful_selfplay_1ply_games/
+runaway_games/

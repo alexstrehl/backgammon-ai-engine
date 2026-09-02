@@ -3,9 +3,11 @@
 # opponents UNPRUNED (gnubg: prune nets off + keep-all filter; Sage:
 # SAGE_UNPRUNED=1). Cubeless criterion fix applied (chequer eval cubeful off).
 # Superseded wrapper-era rows (gnubg-nn in-process opponent): see git history.
-side1,side1_plies,side2,side2_plies,mode,games,edge_mEq,ci_lo,ci_hi
-PureTD_prob5,0,gnubg-ext,0,cubeless-money,10000000,46.3,45.5,47.2
-PureTD_prob5,0,gnubg-ext-full,1,cubeless-money,10000000,12.8,11.9,13.6
-PureTD_prob5,0,opensage,0,cubeless-money,10000000,39.4,38.6,40.3
-PureTD_prob5,0,opensage_unpruned,1,cubeless-money,10000000,8.1,7.2,9.0
-gnubg-ext-full,1,opensage_unpruned,1,cubeless-money,10000000,-3.4,-4.2,-2.5
+# Per-game npz raws retained offline; CIs recreatable via run.py --combine.
+side1,side1_md5,side1_plies,side2,side2_plies,mode,games,edge_mEq,ci_lo,ci_hi,status
+PureTD_prob5,ac95a983,0,gnubg-ext,0,cubeless-money,10000000,45.8,45.0,46.7,current
+PureTD_prob5,ac95a983,0,gnubg-ext-full,1,cubeless-money,10000000,12.3,11.5,13.2,current
+PureTD_prob5,ac95a983,0,opensage,0,cubeless-money,10000000,40.0,39.2,40.9,current
+PureTD_prob5,ac95a983,0,opensage_unpruned,1,cubeless-money,10000000,8.6,7.8,9.5,current
+PureTD_prob5,ac95a983,0,PureTD_prob5_c8b2b265,0,cubeless-money,10000000,1.0,0.2,1.9,current
+gnubg-ext-full,,1,opensage_unpruned,1,cubeless-money,10000000,-3.4,-4.2,-2.5,current

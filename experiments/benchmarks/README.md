@@ -11,47 +11,29 @@ Method:
 
 - **Same game count per row across boxes.** Native rows are seeded, so a row
   replays an identical workload on every box and in every sweep
-  (`PureTD 0-ply cube-on`: the same 22,129 checker decisions each time), which
-  makes a cross-box ratio a pure hardware comparison. gnubg draws its own dice
-  internally, so its workload varies (19,829–21,206 checker decisions across
-  the five Zen 5 sweeps) and its ratios hold only statistically. Counts vary
-  by row (200–600).
+  (`PureTD 0-ply cube-on`: the same 22,129 checker decisions each time), so the
+  workload contributes nothing to a cross-box difference. gnubg draws its own
+  dice internally, so its workload varies (19,829–21,206 checker decisions
+  across the five Zen 5 sweeps) and its ratios hold only statistically.
 - **A single pinned core, the same one for every engine** (`sched_setaffinity`;
   `BENCH_CORE` selects it, `BENCH_NO_PIN` disables pinning). Wall-time is then
   a true single-core cost even where an engine spawns helper threads. Rows or
   sweeps timed on different cores are not comparable. `bench.sh` exports one
   `BENCH_CORE` to all four scripts.
 - **Counting convention.** One checker decision per board-and-dice turn; one
-  cube decision per pre-roll turn in which the player on roll may double, plus
-  each take/drop response.
+  cube decision per pre-roll turn in which the player on roll may double.
 - **The core is warmed before every timed region** (`BENCH_WARMUP_S`, default
   3 s; a cache-neutral scalar spin in `bench_common._spin_ramp`). An idle core
   sits at base clock and requires ~2 s of sustained load to reach boost
   (3720 → 5005 MHz measured on Zen 5); timed cold, prob5 0-ply reads
-  0.197 ms/dec against 0.170 warm. The penalty is approximately fixed at
-  ~0.4 s, so it distorts cross-engine ratios, affecting the cheapest engines
-  most. All four scripts ramp.
-- **Repeat each benchmark to sample variance, rather than lengthen it.**
+  0.197 ms/dec against 0.170 warm.
+- **Repeat each benchmark to estimate variance.**
   `SWEEPS=5` runs the whole suite five times as five fresh processes (90 s idle
   between them, `SWEEP_GAP`), writing `$OUTDIR/bench_<host>_sweep<N>.txt`.
   `aggregate_sweeps.py` then reports each row as the mean of the five with a
   95% t-interval over them.
 - **Game counts are tiered by measured cost**: `G_FAST`=600 for rows under
-  ~100 ms/game, `G_SLOW`=200 for the two Open Sage analyzer rows. Search depth
-  is not a reliable proxy — Sage's analyzer at 0-ply costs 0.70 s/game against
-  gnubg's 0.055 s/game at 1-ply. The counts place each row's within-sweep
-  sampling error below the between-sweep standard deviation rather than
-  equalising precision, which is unattainable given a ~1100× span in per-game
-  cost; the gnubg rows consequently carry the widest intervals (~1.5–2%).
-  Every native timed region runs at least ~2.5 s, most between 15 and 85 s.
-- **gnubg's session record is reset every 250 games** (`GNUBG_RESET_EVERY`).
-  gnubg's per-game bookkeeping scales with the in-memory record's length:
-  3.5 → 6.1 ms/game across 2000 games in one session, flat at ~3.0 when reset.
-  This affects only the benchmark, which drives gnubg's own game loop; the
-  head-to-head runs use the external-player interface, where gnubg only
-  evaluates positions. Per-game decision counts are harvested from the record
-  *before* each reset, so the per-game (time, decisions) pairs are identical to
-  an unreset run. `new session` does not clear gnubg's evaluation cache.
+  ~100 ms/game, `G_SLOW`=200 for the two Open Sage analyzer rows.
 - **The per-sweep output also carries within-sweep bootstrap CIs**
   (`bench_common`, resampling calls or games). These are not the intervals the
   tables quote. Resampling games estimates variation across different games;
@@ -99,7 +81,12 @@ fixed-pool + self-play), and skips the multi-hour deep-search rows unless
 `RUN_DEEP=1`. `VENV` must be a python with torch **and** bgsage. The individual
 scripts, if you want one at a time:
 
-    # gnubg self-play — MUST use a threads-disabled build (recipe below).
+    # gnubg self-play — MUST use a threads-disabled build. Recipe (needs
+    # flex + bison): download the gnubg 1.08.003 source tarball from
+    # ftp.gnu.org/gnu/gnubg, then
+    #   ./configure --disable-threads --prefix=$HOME/gnubg-st && make -j && make install
+    # A stock (threaded) build polls at ~10 ms and reads ~99 moves/s at
+    # every ply, which is timing the poll loop, not the engine.
     # BENCH_CORE must match the native runs below; rows timed on different
     # cores are not comparable.
     BENCH_CORE=8 GNUBG_BENCH_PLIES=0,1 GNUBG_BENCH_G0=600 GNUBG_BENCH_G1=600 \
@@ -119,50 +106,17 @@ scripts, if you want one at a time:
 
 `libfakeintel` (`c_engine/build_fakeintel.sh`) reports an Intel vendor ID so
 MKL takes its fast code paths on AMD; it affects only the torch/MKL-backed
-PureTD rows (~5–7%). Preload it (or don't) consistently when comparing boxes.
+PureTD rows (gnubg and Open Sage are torch-free and immune). The effect is
+strongly architecture-dependent — **+7.8% on Zen 3 but +51% on Zen 5**
+(measured 2026-08-24).
 
-## Building the threads-disabled gnubg (required)
+**Protocol: shim ON for every box.** It is a win on both architectures, and
+production uses it.
 
-    curl -O https://ftp.gnu.org/gnu/gnubg/gnubg-release-1.08.003-sources.tar.gz
-    tar xzf gnubg-release-1.08.003-sources.tar.gz && cd gnubg-1.08.003
-    # needs flex, bison, glib-2.0 dev headers, python3 dev headers
-    ./configure --disable-threads --with-python=python3 --without-gtk --prefix=$HOME/gnubg-st
-    make -j && make install
-    md5sum $HOME/gnubg-st/share/gnubg/gnubg.wd   # must be 14184acc9c60ef67be0fad88548fd51a
+### Refresh rule: a column is re-measured whole, never row by row
 
-No source is modified — `--disable-threads` is an upstream configure option.
-The build auto-selects gnubg's AVX SIMD tier (`-O3 -ffast-math -mavx`, the same
-level as the official Windows "AVX" installer); its only higher tier,
-`--enable-simd=fma`, measured performance-neutral in a direct A/B on this suite
-(no row moved beyond the ~1% between-run sd; that A/B's raw output is not
-committed). gnubg has no AVX-512 evaluation path.
-
-Threads-disabled is required because the stock threaded build routes every
-in-play evaluation through its multi-thread task queue, whose completion wait is
-a ~10 ms sleep-poll (`WaitForAllTasks`, multithread.c): self-play measures ~101
-decisions/s at ANY depth — pure dispatch latency, not compute (~350× the true
-0-ply cost, ~12× at 1-ply). Affinity pinning cannot remove a timed sleep;
-compiling the queue out can. The single-thread build's costs cross-check against
-gnubg's own `calibrate` rate.
-
-## Why one combined number is fair: the decision-mix ratio
-
-The combined metric folds cube and checker decisions into one denominator,
-which is comparable across engines only if the decision *mix* is similar. It
-is — measured on the same 2026-08-11 five-sweep runs as the results (Zen 5
-column, means over the five sweeps; Sage analyzer rows N=200, the rest N=600):
-
-| engine | checker/game | cube/game | cube:checker ratio |
-|---|---|---|---|
-| gnubg 0-ply | 34.1 | 25.7 | 0.754 |
-| gnubg 1-ply | 35.7 | 26.6 | 0.744 |
-| PureTD 0-ply | 36.9 | 27.1 | 0.735 |
-| Open Sage 0-ply | 40.8 | 27.7 | 0.679 |
-| Open Sage 1-ply | 42.0 | 28.4 | 0.677 |
-
-The ratio spans 0.68–0.75 across every engine and depth, and game lengths are
-near-identical — a combined per-decision cost misprices no engine by more
-than a few percent of denominator mix.
+**If any row in a column changes, re-measure every row in that column, in one
+session, on the same pinned core.**
 
 ## Results — cubeful money (combined ms/decision; dec/s [95% CI]), one pinned core
 
@@ -183,6 +137,19 @@ than a few percent of denominator mix.
 | PureTD prob5 0-ply | 0.447 (2,237 [2,230, 2,244]) | 0.169 (5,911 [5,892, 5,929]) |
 | gnubg 1-ply, default pruning (cube-off) | 1.430 (699 [690, 709]) | 0.890 (1,124 [1,101, 1,146]) |
 | Open Sage 1-ply production | 1.780 (562 [560, 564]) | 1.024 (976 [962, 991]) |
+
+> **The prob5 rows above are stale:** measured with the superseded `c8b2b265`.
+> Prod is the 4L256 `ac95a983`, ~5-8% slower (+6.4% parameters). Per the
+> refresh rule the whole column is due a re-run; the figures below are from a
+> separate 2026-08-24 session, so they are magnitude only, not table rows.
+>
+> | prob5 0-ply, dec/s | Zen 3, no shim | Zen 3, +shim | Zen 5, no shim | Zen 5, +shim |
+> |---|---|---|---|---|
+> | 4L256 `ac95a983` (prod) | 2059 | 2262 | 3831 | 5639 |
+> | 512.512.256.128 `c8b2b265` | 2239 | 2413 | 4013 | 6055 |
+>
+> 1-ply moves the same way (Zen 3 10.3 vs 10.9; Zen 5 26.3 vs 27.6 dec/s).
+
 
 Both tables are the mean of **five independent sweeps** (2026-08-11); brackets
 are 95% t-intervals over those five, not within-run bootstrap CIs. Per-sweep

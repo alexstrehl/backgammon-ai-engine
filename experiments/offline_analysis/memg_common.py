@@ -1,10 +1,23 @@
 """Shared mEMG pipeline helpers (gnubg-judge worker wrapper, per-game
 persistence, pooled loading). Used by run_cubeless_memg.py and
 run_cubeful_memg.py; each runner keeps its own summary-table formatting."""
+import hashlib
 import os
 
 from gnubg_eval import _gnubg_worker
 from stats import bootstrap_ci  # noqa: F401  (re-exported for the runners)
+
+
+def file_md5(path):
+    """md5 of a file, or 'MISSING' — for stamping the measured model into
+    the run header so results are attributable to an exact checkpoint."""
+    if not os.path.isfile(path):
+        return "MISSING"
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _safe_gnubg_worker(args):
@@ -75,7 +88,8 @@ def combine_dir(out_dir, players):
             print(f"{p:<12} {'--':>6}  (no data at {path})"); continue
         v = load_pergame(path, ("overall", "chequer"))
         ovr, chk = v["overall"], v["chequer"]
-        oci = bootstrap_ci(ovr); cci = bootstrap_ci(chk)
+        # Same B as the fresh-run summaries, so --combine reproduces them.
+        oci = bootstrap_ci(ovr, n_boot=100_000); cci = bootstrap_ci(chk, n_boot=100_000)
         print(f"{p:<12} {len(ovr):>6}  "
               f"{sum(ovr)/len(ovr):.2f} [{oci[0]:.2f}, {oci[1]:.2f}]{'':<8}  "
               f"{sum(chk)/len(chk):.2f} [{cci[0]:.2f}, {cci[1]:.2f}]")

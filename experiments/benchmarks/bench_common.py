@@ -43,7 +43,6 @@ if not os.environ.get("BENCH_NO_PIN"):
                   file=sys.stderr)
 import time
 import random
-import statistics as st
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(os.path.dirname(_HERE))
@@ -172,3 +171,22 @@ def ratio_ci(dts, counts, B=10000, seed=1):
         out.append(sc / sd)
     out.sort()
     return out[int(0.025 * B)], out[int(0.975 * B)]
+
+
+def model_stamp(path) -> str:
+    """'<basename> md5 <8hex>' for a model path, for bench output headers.
+
+    Bench rows record a MACHINE, but the number depends on which model was
+    the workload: prob5 tail-256 is 2-6% slower than tail-128 on identical
+    hardware, large enough to be misread as a hardware or code regression
+    across eras. Stamping the md5 makes that impossible.
+    """
+    import hashlib
+    import os
+    if not path or not os.path.isfile(path):
+        return f"{path} (MISSING)"
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return f"{os.path.basename(path)} md5 {h.hexdigest()[:8]}"

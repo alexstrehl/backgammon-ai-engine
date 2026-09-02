@@ -314,13 +314,13 @@ class TestFastEngineParity:
 
 
 class TestShippedCheckpoint:
-    PATH = "best_models/cubeless_prob5_512_512_256_128.pt"
+    PATH = "best_models/cubeless_prob5_512_512_256_256.pt"
 
     @pytest.mark.skipif(not os.path.exists(PATH), reason="artifact not present")
     def test_loads_with_expected_metadata(self):
         net = load_model(self.PATH)
         assert isinstance(net, ProbNetwork)
-        assert net.hidden_sizes == [512, 512, 256, 128]
+        assert net.hidden_sizes == [512, 512, 256, 256]
         assert net.encoder_name == "perspective196"
 
 

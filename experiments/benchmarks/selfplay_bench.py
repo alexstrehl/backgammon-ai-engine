@@ -40,10 +40,13 @@ import torch
 
 from play_models import _load_agent
 from gnubg_eval import play_and_record, play_and_record_cubeful
-from bench_common import ratio_ci, _spin_ramp, WARMUP_S
+from bench_common import ratio_ci, _spin_ramp, WARMUP_S, model_stamp
 
 PURETD_CUBEFUL = "best_models/cubeful_money_512_512_256_256.pt"
-PROB5 = "best_models/cubeless_prob5_512_512_256_128.pt"
+# Prod prob5 (4L256, ac95a983). PROB5_MODEL must be an env var, not an
+# edit: worker pools spawn and re-import. Rows carry a model stamp.
+PROB5 = os.environ.get(
+    "PROB5_MODEL", "best_models/cubeless_prob5_512_512_256_256.pt")
 
 
 
@@ -217,7 +220,7 @@ def run_cubeless(player, sage_unpruned, games, seed):
         # Record-free loop via ProbAgent.choose_next_state: at 0-ply this is
         # the FUSED path (move-gen + encode in one C call + one batched
         # forward) -- the engine-native cost, bit-identical selection to the
-        # actions-list path (parity-verified over 1920 decisions 2026-07-27).
+        # actions-list path.
         from backgammon_engine import switch_turn, opening_roll
 
         def play_one():
@@ -255,6 +258,10 @@ def run_cubeless(player, sage_unpruned, games, seed):
     lo, hi = ratio_ci(gdts, gdecs)
     tag = ("unpruned" if sage_unpruned else "production") \
         if player.startswith("sage") else "prod"
+    if player.startswith("prob5"):
+        # Which model was the workload -- prob5 tail-256 is 2-6% slower than
+        # tail-128, enough to look like a hardware regression across eras.
+        print("    workload: %s" % model_stamp(PROB5), flush=True)
     print("CUBELESS %s %s: %d games %.2fs (%.2f g/s) | checker %d (%.1f dec/s, %.3f ms/dec) 95%%CI [%.1f,%.1f]"
           % (player, tag, games, dt, games / dt,
              counts["checker"], counts["checker"] / dt,

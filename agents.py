@@ -54,6 +54,21 @@ try:
 except ImportError:
     _GNUBG_NN_AVAILABLE = False
 
+_GNUBG_NN_WARNED = False
+
+
+def _warn_gnubg_nn():
+    """One loud line per process when a gnubg-nn agent is built: gnubg-nn
+    is a fast CUBE-BLIND approximation of gnubg (21pt-match cube, no
+    Jacoby); H-H sanity checks only. Real gnubg = the gnubg-ext specs."""
+    global _GNUBG_NN_WARNED
+    if not _GNUBG_NN_WARNED:
+        import sys
+        print("[gnubg-nn] WARNING: fast cube-blind APPROXIMATION of gnubg "
+              "(21pt cube approx, no Jacoby). H-H sanity checks only; never "
+              "label results 'gnubg'. Real gnubg = gnubg-ext.", file=sys.stderr)
+        _GNUBG_NN_WARNED = True
+
 
 class Agent:
     """Base class for backgammon agents."""
@@ -217,6 +232,7 @@ class GnubgNNAgent(Agent):
     """
 
     def __init__(self, plies: int = 0, cubeless_money: bool = False):
+        _warn_gnubg_nn()
         if not _GNUBG_NN_AVAILABLE:
             raise ImportError("gnubg-nn is not installed. Run: pip install gnubg-nn")
         self.plies = plies

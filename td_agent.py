@@ -1897,8 +1897,8 @@ class TDAgent(Agent):
 
         For each candidate move m, compute opp's value at the resulting
         state using value_twoply_checker_cubeful_filtered (which itself
-        includes opp's cube decision at level 2 per the post-fix
-        implementation). Pick the move maximizing mover equity.
+        includes opp's cube decision at level 2). Pick the move
+        maximizing mover equity.
 
         Simpler than the 1-ply chequer selector (no per-candidate batching
         across opp dice) — each candidate just calls the 2-ply value
@@ -1929,8 +1929,8 @@ class TDAgent(Agent):
                 )
             else:
                 # Opp is on roll at next_state. The 2-ply value function
-                # returns opp's per-unit equity (now including opp's
-                # cube decision in the level-2 expansion).
+                # returns opp's per-unit equity, including opp's cube
+                # decision in the level-2 expansion.
                 opp_value = self.value_twoply_checker_cubeful_filtered(
                     next_state, match_state, k=k,
                 )

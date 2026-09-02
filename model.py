@@ -34,6 +34,23 @@ def _get_activation_fn(name: str):
         raise ValueError(f"Unknown activation: {name}. Choose from: sigmoid, relu, tanh, leaky_relu, hardsigmoid")
 
 
+# Depth expansion appends a hidden layer initialised as ``I + eps*randn``
+# (function-preserving up to the eps symmetry-breaking term). `eps` is
+# REQUIRED -- no default. Measured cost of the old flat 0.01:
+#   prob5  +256   eps=0.01  -38.3 mEq [-42.2,-34.3];  eps=0.001  +1.4 (null)
+#   cubeful+256   eps=0.01  mean|d| 37.07 / max 164.9; eps=0.001  3.71 / 16.5
+# Equity damage is net-specific (a 1/sqrt(n) rule still cost 6.25 mEq on a
+# 128-wide tail), so choose eps per net and MEASURE the deviation on real
+# positions. suggested_depth_expand_eps() is a starting point only.
+DEPTH_EXPAND_EPS_SCALE = 0.016
+
+
+def suggested_depth_expand_eps(new_layer_size: int) -> float:
+    """Starting point only: holds eps*sqrt(n) at the known-good
+    (n=256, eps=0.001) anchor. Measure the deviation before relying on it."""
+    return DEPTH_EXPAND_EPS_SCALE / (float(new_layer_size) ** 0.5)
+
+
 class TDNetwork(nn.Module):
     """Feedforward network for backgammon value estimation.
 
@@ -109,8 +126,15 @@ class TDNetwork(nn.Module):
 
     @classmethod
     def load(cls, path: str, map_location="cpu") -> "TDNetwork":
-        """Load a saved model. Defaults to CPU to handle models saved on GPU."""
-        checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+        """Load a saved model. Defaults to CPU to handle models saved on GPU.
+
+        `weights_only=True` because a checkpoint is a pickle and the False
+        setting executes whatever it contains -- fine for files you trained,
+        a code-execution hole for one you were sent. Everything these
+        checkpoints hold (build spec, state_dict, train_params) is plain
+        tensors and builtins, so nothing needs the unsafe loader.
+        """
+        checkpoint = torch.load(path, map_location=map_location, weights_only=True)
 
         model = cls(
             hidden_sizes=checkpoint["hidden_sizes"],
@@ -194,7 +218,7 @@ class TDNetwork(nn.Module):
         return expanded
 
     @classmethod
-    def depth_expand(cls, source: "TDNetwork", new_layer_size: int = None, eps: float = 0.01) -> "TDNetwork":
+    def depth_expand(cls, source: "TDNetwork", new_layer_size: int = None, *, eps: float) -> "TDNetwork":
         """Create a deeper network by appending one hidden layer, initialized as near-identity.
 
         The new layer is inserted before the output layer and initialized as
@@ -212,10 +236,8 @@ class TDNetwork(nn.Module):
             new_layer_size:  Size of the appended layer.  Must equal the last
                              hidden size (required for square identity init).
                              Defaults to ``source.hidden_sizes[-1]``.
-            eps:             Scale of random perturbation around identity.
-                             0.01 is a good default: large enough for Adam to
-                             differentiate neurons quickly, small enough not to
-                             disturb the preserved function.
+            eps:             REQUIRED, keyword-only; see the module-level
+                             note. 0.0 = exact copy but symmetric.
 
         Returns:
             A new TDNetwork with one additional hidden layer.
@@ -392,7 +414,7 @@ class ProbNetwork(nn.Module):
 
     @classmethod
     def load(cls, path: str, map_location="cpu") -> "ProbNetwork":
-        ckpt = torch.load(path, map_location=map_location, weights_only=False)
+        ckpt = torch.load(path, map_location=map_location, weights_only=True)
         mt = ckpt.get("model_type")
         if mt is not None and mt != "prob5":
             raise ValueError(
@@ -469,7 +491,8 @@ class ProbNetwork(nn.Module):
         cls,
         source: "ProbNetwork",
         new_layer_size: int = None,
-        eps: float = 0.01,
+        *,
+        eps: float,
     ) -> "ProbNetwork":
         """Append one near-identity hidden layer before the output head."""
         last_size = source.hidden_sizes[-1]
@@ -524,7 +547,7 @@ def load_model(path: str, map_location: str = "cpu"):
     :class:`ProbNetwork` based on the saved ``model_type`` (legacy
     files without that field load as ``TDNetwork``).
     """
-    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    ckpt = torch.load(path, map_location=map_location, weights_only=True)
     if ckpt.get("model_type") == "prob5":
         return ProbNetwork.load(path, map_location=map_location)
     # Guard: a prob5-shaped checkpoint missing model_type must NOT silently

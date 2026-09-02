@@ -15,6 +15,8 @@ if "OMP_NUM_THREADS" not in os.environ:
 
 import argparse
 import random
+import signal
+import sys
 import time
 import math
 import multiprocessing as mp
@@ -162,9 +164,10 @@ def _build_side(spec, spec_type, *, plies, sage_plies, cubeless_money,
     `sage_plies` is Open Sage's ply (1=0-ply/1P, 2=1-ply/2P). This lets EITHER
     side be an engine (e.g. gnubg vs Open Sage), not just model2.
     """
+    _reject_legacy_gnubg(spec_type)
     if spec_type == "random":
         return RandomAgent()
-    if spec_type == "gnubg":
+    if spec_type == "gnubg-nn":
         return GnubgNNAgent(plies=plies, cubeless_money=cubeless_money)
     if spec_type == "gnubg-ext":
         # TRUE gnubg 1.08 via the external-player interface: production
@@ -179,14 +182,14 @@ def _build_side(spec, spec_type, *, plies, sage_plies, cubeless_money,
         # search of the historical gnubg-nn wrapper, ~4x slower).
         from gnubg_external import GnubgExternalAgent
         return GnubgExternalAgent(plies=plies, cubeless=cubeless_money,
-                                  full=True)
+                                  prune=False, movefilter="all")
     if spec_type == "gnubg-ext-rootfull":
         # Every legal move deep-evaluated at the root, gnubg's default
         # pruning for the opponent's replies (pruning nets stay ON) --
         # the paper's stated protocol for matched 2-ply comparisons.
         from gnubg_external import GnubgExternalAgent
         return GnubgExternalAgent(plies=plies, cubeless=cubeless_money,
-                                  root_full=True)
+                                  prune=True, movefilter="all")
     if spec_type == "opensage":
         if cubeful:
             raise ValueError(
@@ -210,6 +213,25 @@ def _build_side(spec, spec_type, *, plies, sage_plies, cubeless_money,
     return _load_agent(spec, oneply=oneply, twoply_k=twoply_k, bf16=bf16)
 
 
+def _die_with_parent():
+    """Ask the kernel to SIGKILL this worker when its parent dies.
+
+    Pool workers use the 'spawn' start method, so they land in their own
+    process group and a `kill -- -PGID` on the parent never reaches them.
+    Pool.terminate() would, but it does not run when the parent is killed --
+    so an interrupted H-H leaves one worker per core running forever, each
+    pinning a core on a shared box. Same fix and same reason as the gnubg
+    subprocess reaper in gnubg_external.py.
+    """
+    if not sys.platform.startswith("linux"):
+        return                      # no pdeathsig elsewhere; nothing to do
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)
+    except Exception:
+        pass                        # best-effort: never break a run over this
+
+
 def _seed_worker_rng():
     """Pool initializer: explicitly seed this worker's RNG from OS entropy.
 
@@ -221,6 +243,7 @@ def _seed_worker_rng():
     Independent streams are what makes pooling runs from several
     machines (combine_head_to_head) statistically valid.
     """
+    _die_with_parent()
     random.seed(int.from_bytes(os.urandom(16), "little"))
 
 
@@ -366,6 +389,11 @@ def play_matches_parallel(
     start_time = time.time()
     with ctx.Pool(workers, initializer=_seed_worker_rng) as pool:
         results = pool.map(_play_matches_worker, args_list)
+        # close+join so workers exit normally and their atexit runs (gnubg
+        # close). The with-block alone would terminate() -> SIGTERM ->
+        # atexit skipped -> orphaned gnubg; pdeathsig is the backstop.
+        pool.close()
+        pool.join()
 
     elapsed = time.time() - start_time
     total_a1 = sum(r[0] for r in results)
@@ -396,12 +424,10 @@ def compute_binomial_pvalue(wins: int, trials: int) -> float:
         result = binomtest(wins, trials, 0.5, alternative='two-sided')
         return result.pvalue
     except (ImportError, AttributeError):
-        # Fallback to normal approximation
         # z = (wins/n - 0.5) / sqrt(0.25/n)
         p_hat = wins / trials
         z = (p_hat - 0.5) / math.sqrt(0.25 / trials)
 
-        # Two-sided p-value from standard normal
         from math import erfc
         pvalue = erfc(abs(z) / math.sqrt(2))
         return pvalue
@@ -442,11 +468,9 @@ def get_verdict(wins: int, total: int) -> str:
     lower, upper = wilson_ci(wins, total, z=1.96)
     ci_width = upper - lower
 
-    # Check if CI is entirely above 50%
     if lower > 0.50:
         return "Model1 is significantly stronger (p<0.05)"
 
-    # Check if CI is entirely below 50%
     if upper < 0.50:
         return "Model2 is significantly stronger (p<0.05)"
 
@@ -587,19 +611,59 @@ def report_head_to_head(
     return result
 
 
+def _reject_legacy_gnubg(spec):
+    """The bare spec 'gnubg' is retired: it silently selected gnubg-nn,
+    the fast CUBE-BLIND approximation of gnubg (21pt-match cube
+    heuristic, no native Jacoby) — and its results must never be
+    labeled 'gnubg'. Force the caller to say which engine they mean."""
+    if spec == "gnubg":
+        raise ValueError(
+            "spec 'gnubg' is retired: it silently selected gnubg-nn, the "
+            "fast CUBE-BLIND approximation of gnubg. Say which one you "
+            "mean:\n"
+            "  'gnubg-nn'  -- the gnubg-nn approximation (H-H sanity "
+            "checks ONLY; never label its results 'gnubg')\n"
+            "  'gnubg-ext' / 'gnubg-ext-full' / 'gnubg-ext-rootfull' -- "
+            "real gnubg 1.08 (native money cube, Jacoby)")
+
+
 def _detect_side_type(spec):
     """Map a side spec to its type. Engine keywords resolve to engines;
     anything else is treated as a checkpoint path ("model"). An existing
-    file always wins over a keyword (a checkpoint literally named "gnubg"
-    is a model, not the engine); pass model*_type explicitly to override."""
+    file always wins over a keyword (a checkpoint literally named like an
+    engine is a model, not the engine); pass model*_type explicitly to
+    override. The bare 'gnubg' keyword is rejected (see
+    _reject_legacy_gnubg); the NN approximation answers only to
+    'gnubg-nn'."""
     if os.path.exists(spec):
         return "model"
+    _reject_legacy_gnubg(spec)
     return {
-        "random": "random", "gnubg": "gnubg", "opensage": "opensage",
+        "random": "random", "gnubg-nn": "gnubg-nn", "opensage": "opensage",
         "gnubg-ext": "gnubg-ext", "gnubg-ext-full": "gnubg-ext-full",
         "gnubg-ext-rootfull": "gnubg-ext-rootfull",
         "opensage-analyzer": "opensage-analyzer",
     }.get(spec, "model")
+
+
+def side_model_md5(spec) -> str:
+    """md5 of the checkpoint behind a side spec, or ``""`` for non-file
+    sides (engine keywords, vanished paths). Promotions overwrite
+    best_models/*.pt in place, so this is the only per-generation marker.
+    ``<kind>:<path>`` specs resolve to the path after the colon."""
+    import hashlib
+    if not isinstance(spec, str):
+        return ""
+    path = spec
+    if not os.path.isfile(path) and ":" in path:
+        path = path.split(":", 1)[1]
+    if not os.path.isfile(path):
+        return ""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def save_head_to_head(out_dir, per_game, *, game_mode, side1, side2, n_games):
@@ -621,14 +685,29 @@ def save_head_to_head(out_dir, per_game, *, game_mode, side1, side2, n_games):
         per_game=np.asarray(per_game, dtype=np.float64),
         game_mode=str(game_mode), side1=str(side1), side2=str(side2),
         n_games=int(n_games),
-        # Provenance: enough to reconstruct the exact configuration later
-        # (added after a replication audit where a published run's Sage
-        # filter config could not be confirmed from its raws).
+        # Provenance: enough to reconstruct the exact configuration later.
         argv=" ".join(sys.argv),
         sage_unpruned=os.environ.get("SAGE_UNPRUNED", "0"),
+        # Model identity, not just path (promotions overwrite in place);
+        # combine_head_to_head refuses to pool mismatched md5s.
+        side1_md5=side_model_md5(side1),
+        side2_md5=side_model_md5(side2),
         hostname=platform.node(),
     )
     return path
+
+
+def _matchup_key(spec):
+    """Matchup identity: engine prefix + checkpoint FILENAME, not its path.
+
+    Legs pooled from several hosts carry the same model under different
+    absolute paths. The md5 guard below is what actually catches a wrong
+    checkpoint, so comparing paths here only rejects valid cross-host pools.
+    """
+    prefix, sep, rest = spec.partition(":")
+    if sep and "/" in rest:
+        return f"{prefix}:{os.path.basename(rest)}"
+    return os.path.basename(spec) if "/" in spec else spec
 
 
 def combine_head_to_head(out_dir, *, n_bootstrap=10000, do_print=True):
@@ -636,9 +715,12 @@ def combine_head_to_head(out_dir, *, n_bootstrap=10000, do_print=True):
     and report the combined head-to-head over the union of games — i.e. extend a
     run, or merge runs from several machines, into one larger exact bootstrap CI.
 
-    All runs in the directory must share the same game mode and matchup (side1,
-    side2); mixing them is an error. Returns the same result dict as
-    :func:`report_head_to_head`.
+    All runs in the directory must share the same game mode, matchup (side1,
+    side2) AND model md5 per side; mixing them is an error. Returns the same
+    result dict as :func:`report_head_to_head`.
+
+    The md5 check catches in-place promotions (identical side strings,
+    different models). Pre-md5 runs have an empty md5 and pool freely.
     """
     import glob
     import numpy as np
@@ -646,13 +728,19 @@ def combine_head_to_head(out_dir, *, n_bootstrap=10000, do_print=True):
     if not files:
         raise FileNotFoundError(f"no saved H-H runs (*.npz) in {out_dir!r}")
     parts, modes, s1s, s2s = [], set(), set(), set()
+    md5s = {"side1": {}, "side2": {}}  # md5 -> first file that carried it
     seen_hashes = {}
     for f in files:
         d = np.load(f, allow_pickle=False)
         parts.append(d["per_game"])
         modes.add(str(d["game_mode"]))
-        s1s.add(str(d["side1"]))
-        s2s.add(str(d["side2"]))
+        s1s.add(_matchup_key(str(d["side1"])))
+        s2s.add(_matchup_key(str(d["side2"])))
+        for side in ("side1", "side2"):
+            key = f"{side}_md5"
+            m = str(d[key]) if key in d else ""
+            if m:
+                md5s[side].setdefault(m, f)
         # Duplicate-stream guard: two runs with identical per-game
         # sequences means a shared RNG seed (e.g. a replayed command with
         # deterministic seeding) — pooling them would double-count games
@@ -671,6 +759,17 @@ def combine_head_to_head(out_dir, *, n_bootstrap=10000, do_print=True):
     if len(s1s) > 1 or len(s2s) > 1:
         raise ValueError(
             f"mixed matchups in {out_dir}: side1={sorted(s1s)} side2={sorted(s2s)}")
+    for side in ("side1", "side2"):
+        if len(md5s[side]) > 1:
+            detail = "; ".join(
+                f"{m[:8]} ({os.path.basename(src)})"
+                for m, src in sorted(md5s[side].items())
+            )
+            raise ValueError(
+                f"mixed {side} MODELS in {out_dir}: same path, different "
+                f"checkpoints — {detail}. A promotion overwrote the model "
+                f"in place; pool these separately (move one generation's "
+                f".npz files to their own directory).")
     game_mode = modes.pop()
     pooled = np.concatenate(parts)
     cubeless_money = game_mode == "cubeless-money"
@@ -700,7 +799,7 @@ def run_head_to_head(
     Thin orchestration over :func:`play_matches_parallel` +
     :func:`report_head_to_head`; agents are built by the same code path as the
     CLI. EITHER side may be a checkpoint path or an engine keyword
-    (``"gnubg"``/``"gnubg-ext"``/``"opensage"``/``"random"``), auto-detected
+    (``"gnubg-nn"``/``"gnubg-ext"``/``"opensage"``/``"random"``), auto-detected
     unless ``model1_type``/``model2_type`` are given. ``plies`` is gnubg's
     depth; ``sage_plies`` is Open Sage's ply (1=0-ply, 2=1-ply).
     ``game_mode`` is one of ``"dmp"``, ``"cubeless-money"``, ``"cubeful-money"``.
@@ -781,16 +880,23 @@ def main():
         help="Replace model2 with RandomAgent (shorthand for --model2 random)",
     )
     parser.add_argument(
+        "--gnubg-nn",
+        action="store_true",
+        help="Replace model2 with GnubgNNAgent, the CUBE-BLIND approximation "
+             "of gnubg (H-H sanity checks only; for real gnubg use a "
+             "gnubg-ext side). Shorthand for --model2 gnubg-nn.",
+    )
+    parser.add_argument(
         "--gnubg",
         action="store_true",
-        help="Replace model2 with GnubgNNAgent (shorthand for --model2 gnubg)",
+        help=argparse.SUPPRESS,  # retired; errors with guidance below
     )
     parser.add_argument(
         "--plies",
         type=int,
         default=0,
-        help="Gnubg evaluation depth when using --gnubg or a gnubg-ext side "
-             "(0=fastest, 2=strongest, default 0)",
+        help="Gnubg evaluation depth when using --gnubg-nn or a gnubg-ext "
+             "side (0=fastest, 2=strongest, default 0)",
     )
     parser.add_argument(
         "--workers",
@@ -899,12 +1005,18 @@ def main():
     cubeful = (args.game_mode == "cubeful-money")
 
     # Override model2 if shorthand flags are set
+    if args.gnubg:
+        parser.error(
+            "--gnubg is retired (it silently selected gnubg-nn, the "
+            "cube-blind approximation). Use --gnubg-nn for the "
+            "approximation, or --model2 gnubg-ext for real gnubg.")
     if args.random:
         args.model2 = "random"
-    elif args.gnubg:
-        args.model2 = "gnubg"
+    elif args.gnubg_nn:
+        args.model2 = "gnubg-nn"
     elif args.model2 is None:
-        parser.error("--model2 is required unless --random or --gnubg is specified")
+        parser.error("--model2 is required unless --random or --gnubg-nn "
+                     "is specified")
     if args.model2 == "opensage" and args.sage_plies < 1:
         parser.error("--sage-plies must be >= 1 (1 = 0-ply/1P convention)")
 
@@ -933,7 +1045,7 @@ def main():
     mode_tag = ", cubeless-money" if cubeless_money else ""
     model2_label = {
         "random": "RandomAgent",
-        "gnubg": f"GnubgNN ({args.plies}-ply{mode_tag})",
+        "gnubg-nn": f"gnubg-nn ({args.plies}-ply{mode_tag}, cube-blind approx)",
         "gnubg-ext": f"gnubg-ext ({args.plies}-ply, real gnubg 1.08)",
         "gnubg-ext-full": f"gnubg-ext-full ({args.plies}-ply, unpruned)",
         "gnubg-ext-rootfull": (f"gnubg-ext-rootfull ({args.plies}-ply, "

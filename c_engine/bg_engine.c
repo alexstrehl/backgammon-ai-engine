@@ -332,9 +332,9 @@ static void generate_plays(
 ) {
     /* Invariants: callers always pass num_current_moves + num_remaining
      * ≤ initial dice count (≤4 for doubles, 2 otherwise), so neither
-     * exceeds MAX_MOVES_PER_PLAY. Asserting loudly is much safer than
-     * a silent early-return guard — see commit 72a964b for the bug
-     * that pattern caused (dropped every full-depth doubles play). */
+     * exceeds MAX_MOVES_PER_PLAY. Assert loudly rather than guard with
+     * a silent early return — a past silent guard dropped every
+     * full-depth doubles play. */
     assert(num_current_moves >= 0);
     assert(num_remaining >= 0);
     assert(num_current_moves <= MAX_MOVES_PER_PLAY);
@@ -452,9 +452,9 @@ static int play_uses_die(const Play *play, const BoardState *original, int die) 
 
 /* ── Public: get_legal_plays ───────────────────────────────────── *
  *
- * NOTE (v2 wart-free convention): unlike the v1 c_engine, this
- * version switches the turn on every resulting_state before
- * returning. After this call, plays[i].resulting_state.turn is the
+ * NOTE (turn convention): the turn is switched on every
+ * resulting_state before returning. After this call,
+ * plays[i].resulting_state.turn is the
  * OPPONENT of state.turn — i.e. "the next player to act," which
  * preserves the BoardState invariant that .turn always means "the
  * player whose turn it is to act next".
@@ -531,7 +531,7 @@ int get_legal_plays(const BoardState *state, int d1, int d2,
         }
     }
 
-    /* v2 wart-free convention: switch the turn on every resulting
+    /* Turn convention: switch the turn on every resulting
      * state before returning. After this loop the on-roll player at
      * resulting_state[i] is the OPPONENT of the original mover. */
     for (i = 0; i < out_count; i++) {
@@ -548,7 +548,7 @@ int get_legal_plays_encoded(const BoardState *state, int d1, int d2,
                             float *encoded_features) {
     int count = get_legal_plays(state, d1, d2, plays, max_plays);
 
-    /* v2: get_legal_plays already switched the turn on resulting_state,
+    /* get_legal_plays already switched the turn on resulting_state,
      * so we can encode each one directly — no temporary switch needed. */
     for (int i = 0; i < count; i++) {
         encode_state(&plays[i].resulting_state,

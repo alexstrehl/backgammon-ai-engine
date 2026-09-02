@@ -210,7 +210,7 @@ class TestEncoderAbstraction:
             path = os.path.join(tmpdir, "model.pt")
             net.save(path)
 
-            checkpoint = torch.load(path, weights_only=False)
+            checkpoint = torch.load(path, weights_only=True)
             assert "encoder_name" in checkpoint
             assert checkpoint["encoder_name"] == "perspective196"
 

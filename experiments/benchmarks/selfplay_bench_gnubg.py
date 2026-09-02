@@ -144,8 +144,7 @@ for plies in PLIES:
         ngames = NGAMES[plies]
         gnubg.command("new session")
         # 'new session' auto-plays one game (both players computer, auto
-        # roll) — untimed, so exclude it from the counts as well. The old
-        # aggregate counter included it: a ~1/N dec/s inflation.
+        # roll) — untimed, so exclude it from the counts as well.
         n0 = len(count_record())
         # Ramp the pinned core before timing (cannot import bench_common:
         # gnubg's embedded Python has no torch). These are the shortest timed

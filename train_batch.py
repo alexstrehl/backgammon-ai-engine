@@ -60,8 +60,10 @@ def resolve_cuda_oneply_collector(args):
         hard-refuses it; auto-routing must not manufacture that error).
         Callers must normalize "--oneply-acting implies --oneply" BEFORE
         calling this;
-      * every published 1-ply recipe of record runs --device cpu, so
-        this default changes no historical command.
+      * the default is NOT a no-op: an existing `--oneply --device
+        cuda` command is auto-routed onto the vectorized collector
+        (bit-exact, so a speed choice, not a results change); a run
+        that must keep the CPU collector says --no-vectorized-collect.
     The CUDA/workers availability checks stay in Trainer.train (which
     also runs the VRAM preflight and can fall back loudly).
     """
@@ -148,8 +150,8 @@ def main():
                               "Higher = more exploration.")
     g_batch.add_argument("--warmup-cycles", type=int, default=0,
                          help="Ramp LR from lr*0.1 up to scheduled lr over the "
-                              "first N rounds. Useful when starting from a "
-                              "depth-expanded model.")
+                              "first N rounds. For task transfers, where a "
+                              "fresh head sits on a trained trunk.")
     g_batch.add_argument("--c-engine", action="store_true",
                          help="compute the 1-ply cubeful target's net-forward "
                               "in C via libbg_nply (OpenBLAS sgemm) instead of "

@@ -45,6 +45,7 @@ mEMG with bootstrap 95% CIs. Both sides are scored, then averaged to one
 per-game mean; the bootstrap resamples games (n = games).
 
 ```bash
+cd /path/to/backgammon-ai/experiments/offline_analysis   # back in THIS repo (stage 1 left you in bgsage)
 python sage_money_memg.py \
     --src /path/to/bgsage/logs/sage_money_1P_fresh \
     --plies 4 --workers 30 \
@@ -52,8 +53,10 @@ python sage_money_memg.py \
 ```
 
 Output (and raw per-game means) are saved under `--work`
-(default `/tmp/sage_money_ana`). Override the gnubg binary with the
-`GNUBG_CMD` env var (default `/usr/games/gnubg`).
+(default `/tmp/sage_money_ana`). Set the gnubg binary with the
+`GNUBG_CMD` env var — a **1.08.003** build is required (recent Debian/Ubuntu
+apt ships it; older releases ship 1.06/1.07, a different judge — the runtime
+preflight verifies version + weights md5).
 
 ## Notes
 

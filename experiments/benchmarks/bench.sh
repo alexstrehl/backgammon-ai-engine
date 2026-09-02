@@ -56,13 +56,27 @@ OUTDIR="${OUTDIR:-$HOME/bench_results}"
 mkdir -p "$OUTDIR"
 OUT="${OUT:-$OUTDIR/bench_$(hostname -s)${SWEEP:+_sweep$SWEEP}.txt}"
 
-# LD_PRELOAD only the native (torch/MKL) runs, and only if the shim exists.
-LDP=""; [ -f "$FAKEINTEL" ] && LDP="$FAKEINTEL"
+# LD_PRELOAD the native (torch/MKL) runs. One shim protocol across boxes; a
+# missing shim silently changes it and makes the sweep non-comparable, so stop.
+LDP=""
+if [ -f "$FAKEINTEL" ]; then
+  LDP="$FAKEINTEL"; SHIM_STATE="ON ($FAKEINTEL)"
+elif [ "${ALLOW_NO_FAKEINTEL:-0}" = 1 ]; then
+  SHIM_STATE="OFF (ALLOW_NO_FAKEINTEL=1) -- not comparable with shim-on rows"
+else
+  echo "FATAL: $FAKEINTEL not found. Build it (bash c_engine/build_fakeintel.sh)," >&2
+  echo "or set ALLOW_NO_FAKEINTEL=1 for a deliberately shim-free sweep." >&2
+  exit 1
+fi
 
 B="experiments/benchmarks"
 export BENCH_CORE OUTDIR   # OUTDIR must reach the per-sweep child processes
 
 banner() { printf '\n########## %s ##########\n' "$*" | tee -a "$OUT"; }
+
+# Stamp the protocol so a result file says which one produced it.
+printf '# MKL shim: %s\n# core: %s  host: %s  date: %s\n' \
+  "$SHIM_STATE" "$BENCH_CORE" "$(hostname -s)" "$(date -u +%FT%TZ)" | tee -a "$OUT"
 
 # Repeat the whole suite SWEEPS times, each a fresh process, then stop. The
 # per-sweep spread is the uncertainty that matters (see README); one long run

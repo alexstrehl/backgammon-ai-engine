@@ -37,9 +37,11 @@ cubeless-equity units the engines optimize) and `set analysis cube off` (gnubg s
 agents would accrue phantom cube errors that swamp "overall", making it ~85% artifact).
 With cube analysis off, overall == chequer — so for cubeless we report **chequer only**.
 
-**Prereqs:** gnubg 1.08.003 CLI (`/usr/games/gnubg` or `GNUBG_CMD`; it is both
-the judge and the `gnubg-ext` players), `pip install bgsage`, torch + this
-repo, and `best_models/cubeless_prob5_512_512_256_128.pt`.
+**Prereqs:** gnubg 1.08.003 CLI on `GNUBG_CMD` (it is both the judge and the
+`gnubg-ext` players; recent Debian/Ubuntu apt ships 1.08.003, older releases
+ship 1.06 — the runtime preflight verifies version + weights md5),
+`pip install bgsage`, torch + this repo, and
+`best_models/cubeless_prob5_512_512_256_256.pt`.
 
 **Run:**
 ```bash

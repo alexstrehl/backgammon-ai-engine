@@ -268,8 +268,7 @@ class TestTrainerWiring:
         assert len(captured) == 2, "one args tuple per worker"
         for args in captured:
             # Same arity the worker unpacks, and the ply bound is last.
-            # 16 fields since 2026-08-05: `activation` joined the spec
-            # block (index 5) -- the silent-relu-rebuild fix.
+            # `activation` sits at index 5 (silent-relu-rebuild guard).
             assert len(args) == 16, f"arity drifted: {len(args)}"
             assert args[-1] == 60, "max_episode_plies is not the last field"
             assert args[-3] == 2, "vectorized_batch field moved"

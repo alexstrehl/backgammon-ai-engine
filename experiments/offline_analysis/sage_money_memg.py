@@ -71,8 +71,8 @@ def analyze_worker(args):
 
 def chunks(lst, k):
     """Split lst into min(k, len) contiguous chunks of near-equal size.
-    (ceil-based slicing under-fills workers: 31 files / k=30 gave 16 chunks
-    of 2, doubling wall time; this yields 30 chunks of 1-2.)"""
+    Near-equal so all k workers get work -- ceil-based slicing can halve
+    parallelism."""
     n = min(k, len(lst))
     if n == 0:
         return []
