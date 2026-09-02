@@ -3,8 +3,7 @@
 This branch contains work in progress: applying the PureTD approach to
 match play. The network takes the match score and cube ownership as
 inputs and outputs a single number — the match-winning chance for the
-player on roll. Money play is documented in README.md; this file covers
-only the match-play additions.
+player on roll.
 
 Against a baseline built the standard way (**p5jan**: our cubeless
 prob5 model with Janowski's formulae for the cubeful adjustment), our
@@ -18,15 +17,24 @@ champion continues.
 A couple of important details on our approach follow. **First**, we hand
 the network MET-derived features (Kazaross-XG2): the match equity for
 winning or losing a single, gammon or backgammon at the current score,
-at both the current cube value and twice it. We also supply the exact match equity of the
-resulting score at terminal states, in four places:
+at both the current cube value and twice it, plus the value of the
+opponent dropping (13 new features). We also incorporate, in the
+learning procedure itself, the exact match equity of the resulting score
+at terminal states, in four places:
 
-1. deciding to take or drop — the value of dropping;
-2. deciding whether to offer — the opponent's take/drop, via (1);
-3. when a game ends — the true match equity at the new score, used in
-   the TD update;
-4. assessing a game-winning checker play — the true match equity at the
-   resulting score.
+1. When deciding whether to take or drop a cube, the agent compares its
+   network's evaluation of *taking* against the exact match equity for
+   *dropping*.
+2. When deciding whether to offer a cube, it compares its network's
+   evaluation of *not* doubling against the value of doubling, which is
+   the opponent's best reply from (1). Thus, the exact match equity
+   enters this decision too.
+3. When a game ends, the TD target for that state is the exact match
+   equity at the new score, rather than a bootstrap from the network's
+   own estimate.
+4. When assessing a checker play that ends the game, the resulting
+   position is priced by the exact match equity at the score that play
+   produces.
 
 **Second**, training hit apparent plateaus, and breaking through seemed
 to require some *oracle* rounds that regress the model directly toward
@@ -66,11 +74,22 @@ via `--met`, else the net's own).
 | `best_models/matchplay_1h64met_512_512_256_256.pt` | `aee85bd4` | 2.44 MB, 639,745 params, 350 inputs, hidden 512/512/256/256 | trained match-play champion (1h64 encoder + MET features) |
 | `best_models/cubeless_prob5_512_512_256_128.pt` | `c8b2b265` | 2.02 MB, 528,389 params, 196 inputs, hidden 512/512/256/128 | money prob5 net; with `janowski_match.py` on top = **p5jan**, the strongest match player here and the oracle/teacher |
 
-The champion's extra inputs are the match state: one-hot away scores
-(64 slots per side), one-hot cube, `post_crawford`, and the 13 MET
-outcome prices.
+The match-play agent's extra inputs, on top of the 196-feature money
+encoding:
 
-## Results (measured, current)
+| feature | slots | |
+|---|---|---|
+| cube perspective | 3 | one-hot: centred / mine / theirs — inherited from the money cubeful encoder |
+| `is_cube_action` | 1 | set at a cube decision — inherited |
+| cube value | 7 | one-hot: 1, 2, 4, 8, 16, 32, >=64 |
+| `my_away` | 64 | one-hot, thus supporting match lengths up to 64 |
+| `opp_away` | 64 | one-hot |
+| `crawford` | 1 | binary flag |
+| `post_crawford` | 1 | binary flag |
+| MET outcome prices | 13 | 6 at the current cube, 6 at twice it, 1 for the opponent dropping |
+| **total** | **154** | 196 + 154 = 350 inputs |
+
+## Results
 
 - **Trained champion vs p5jan**: **49.91% [49.84, 49.98]** of 11-point
   matches (n = 1.9M).
@@ -86,16 +105,14 @@ outcome prices.
   mMWC/decision, n=793).
 - A p5jan-1-ply **oracle-distillation leg, in isolation, degrades**
   the model: −0.310pp [−0.465, −0.155], p = 0.0001 (400k matches). A
-  following TD leg recovers it by ~200k episodes but does not overtake
-  plain TD.
+  following TD leg recovers it by ~200k episodes, and this combined
+  training (oracle + TD) may help escape plateaus.
 - **Speed** (single-threaded, 0-ply acting, identical positions):
   checker decisions are a wash — champion 1816/s vs p5jan 1773/s. On
   cube decisions p5jan is ~33% faster (8279/s vs 6214/s): the champion
   needs two network forwards (`v_nd`, `v_dt`) plus a MET lookup, where
   p5jan takes one cubeless forward and derives all three branches
-  analytically. So the two are near-equivalent in cost and the standing
-  above is not bought with compute. Full 11-point matches run at ~66/s
-  on 16 workers.
+  analytically. Full 11-point matches run at ~66/s on 16 workers.
 
 ## Reproduce
 
@@ -140,12 +157,12 @@ python train_batch.py --game-mode matchplay --match-length 11 \
 | flag | effect |
 |---|---|
 | `--oneply` | exact-Bellman targets (21-dice enumeration). Drop it for sampled backups: ~10x faster per episode, noisier targets. |
-| `--oracle-targets NET` (with `--oracle-move-eps EPS`, `--oracle-plies`) | supervised distillation from the p5jan teacher, DAgger-style (Ross, Gordon & Bagnell 2011): states come from the student's own self-play trajectory and the student's value function still picks the moves — only the *targets* come from the teacher. `--oracle-move-eps` additionally supervises every action that **either** the teacher or the student rates within EPS of its own best, so moves the two disagree about still train even though greedy play never visits them. `--oracle-plies 1` prices targets by the teacher's 1-ply value; `--oracle-1ply-eps` gates which successors get that deeper pricing. Degrades the model on its own — see Results. |
+| `--oracle-targets NET` (with `--oracle-move-eps EPS`, `--oracle-plies`) | supervised distillation from the p5jan teacher, DAgger-style (Ross, Gordon & Bagnell 2011): states come from the student's own self-play trajectory and the student's value function still picks the moves — only the *targets* come from the teacher. `--oracle-move-eps` additionally supervises every action that **either** the teacher or the student rates within EPS of its own best, so moves the two disagree about still train even though greedy play never visits them. `--oracle-plies 1` prices targets by the teacher's 1-ply value; `--oracle-1ply-eps` gates which successors get that deeper pricing. For mature models, it tends to degrade the model on its own — see Results. |
 | `--td-move-eps EPS` | also emit a training row for every legal successor within EPS (MWC) of the best 0-ply value, each targeted at its own 1-ply value. Does not change which move is played, so the state distribution is untouched. Used in the champion's lineage; never validated head-to-head. |
-| `--met-scope cube,terminal,boundary` | which consumers read the real MET. `cube`: the value of being dropped, in offer/take decisions. `terminal`: what a win/gammon/backgammon is worth at this score, when pricing game-ending moves. `boundary`: the TD target when a game ends. Any scope left out falls back to the network's own estimate. |
+| `--met-scope cube,terminal,boundary,all` | which consumers read the real MET. `cube`: the value of being dropped, in offer/take decisions. `terminal`: what a win/gammon/backgammon is worth at this score, when pricing game-ending moves. `boundary`: the TD target when a game ends. `all` enables all three. Any scope left out falls back to the network's own estimate. |
 | `--score-curriculum P` | fraction of episodes starting at a random away-away score rather than 0-0. |
-| `--vectorized-collect --vectorized-batch B` | lockstep batched self-play. Keep `--episodes-per-round >= workers x B` or the fused batches stay under-filled. |
-| `--gpu-eval-server --gpu-eval-route-moves` | one CUDA context shared by all workers (~2-3x; see `benchmarks/matchplay_gpu_eval_server_ab.md` for the noise floor). Not bitwise reproducible. |
+| `--vectorized-collect --vectorized-batch B` | An optimization: lockstep batched self-play. Keep `--episodes-per-round >= workers x B` or the fused batches stay under-filled. |
+| `--gpu-eval-server --gpu-eval-route-moves` | one CUDA context shared by all workers (~2-3x faster than the CPU collector; see `benchmarks/matchplay_gpu_eval_server_ab.md` for the noise floor). Not bitwise reproducible. |
 | `--lr` / `--end-lr` | set equal for a flat rate. The champion's legs used flat 2.5e-6. |
 
 **Oracle round, then pure TD** — the two legs that produced the current
