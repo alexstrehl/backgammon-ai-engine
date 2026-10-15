@@ -1,0 +1,24 @@
+# Experimental and small models vs the production net of their family.
+# Mean mEq/game for side1, the variant, over side2, both sides 0-ply, 10M
+# games per row. Cubeful rows: cubeful money, Jacoby on, capped +/-128.
+# Chunks pooled with run.py --combine; pooled_output = committed pooled output.
+# Per-game raws available on request; CIs recreatable via run.py --combine.
+# PureTD_4L = best_models/cubeful_money_512_512_256_256.pt (6afda0f8).
+# prob5_4L = best_models/cubeless_prob5_512_512_256_256.pt (ac95a983).
+# Model files: best_models/experimental/, its small_models/ (1-3 hidden
+# layers), and best_models/cubeless_prob5_768_512_256_256_256.pt (bd1a7931).
+side1,side1_md5,params,side2,side2_md5,mode,games,edge_mEq,ci_lo,ci_hi,pooled_output
+cubeful_money_512,39d75783,103425,PureTD_4L,6afda0f8,cubeful-money,10000000,-157.5,-159.6,-155.3,
+cubeful_money_512_512,1ddbb775,366081,PureTD_4L,6afda0f8,cubeful-money,10000000,-25.1,-26.9,-23.3,
+cubeful_money_512_512_256,27a728cf,497153,PureTD_4L,6afda0f8,cubeful-money,10000000,-4.5,-6.3,-2.7,cf3L_27a728cf_vs_prod_10M.txt
+cubeful_money_512_512_256_256_256,37e41475,628737,PureTD_4L,6afda0f8,cubeful-money,10000000,5.0,3.3,6.8,
+cubeful_money_768_512_256_256_256,f65c49fe,811265,PureTD_4L,6afda0f8,cubeful-money,10000000,8.4,6.6,10.2,
+cubeful_money_768_512_256_256_256_256,4f86345a,877057,PureTD_4L,6afda0f8,cubeful-money,10000000,11.1,9.3,12.9,
+cubeful_money_768_768_256_256_256,de9e6e84,1073665,PureTD_4L,6afda0f8,cubeful-money,10000000,16.4,14.7,18.2,cf5Lww_de9e6e84_vs_prod_10M.txt
+cubeless_prob5_512,fa2c6935,103429,prob5_4L,ac95a983,cubeless-money,10000000,-82.6,-83.5,-81.8,
+cubeless_prob5_512_512,e8c0c760,366085,prob5_4L,ac95a983,cubeless-money,10000000,-12.1,-13.0,-11.3,
+cubeless_prob5_512_512_256,3da8e498,496133,prob5_4L,ac95a983,cubeless-money,10000000,-3.7,-4.5,-2.8,
+cubeless_prob5_512_512_256_256_256,bade7d51,627717,prob5_4L,ac95a983,cubeless-money,10000000,1.9,1.1,2.8,
+cubeless_prob5_768_512_256_256_256,bd1a7931,809221,prob5_4L,ac95a983,cubeless-money,10000000,5.2,4.3,6.0,p5_5Lw_bd1a7931_vs_prod_10M.txt
+cubeless_prob5_768_512_256_256_256_256,a9df2ffc,875013,prob5_4L,ac95a983,cubeless-money,10000000,6.7,5.8,7.6,
+cubeless_prob5_768_768_256_256_256,b3fad4eb,1071621,prob5_4L,ac95a983,cubeless-money,10000000,9.7,8.9,10.6,p5_5Lww_b3fad4eb_vs_prod_10M.txt

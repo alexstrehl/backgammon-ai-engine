@@ -1,0 +1,209 @@
+This patch modifies GNU Backgammon 1.08.003 (gnubgmodule.c), adding a per-item
+timing loop used only for benchmarking.
+Copyright (C) 2026 Alex Strehl
+License: GPL-3.0-or-later (https://www.gnu.org/licenses/gpl-3.0.html), as GNU
+Backgammon. The rest of this repository is MIT (see LICENSE).
+
+--- a/gnubgmodule.c
++++ b/gnubgmodule.c
+@@ -25,6 +25,7 @@
+ #endif
+ 
+ #include <signal.h>
++#include <time.h>
+ #include <glib.h>
+ #include <glib/gstdio.h>
+ 
+@@ -3160,8 +3161,192 @@
+ }
+ 
+ 
++/*
++ * gnubg.benchpool(kind, items, evalcontext[, movefilters])
++ *
++ * Native per-item timing of gnubg's decision code over a fixed pool.
++ * All Python -> C conversion happens before the loop; result objects are
++ * built after it. Each item is timed with CLOCK_MONOTONIC around exactly
++ * the engine calls findbestmove / cfevaluate make:
++ *   "move": FindnSaveBestMoves (move filters + prune nets) + RefreshMoveList
++ *           + g_free of the move list;   items = [(board, cubeinfo, dice)]
++ *   "cube": GeneralCubeDecisionE + FindCubeDecision;
++ *                                         items = [(board, cubeinfo)]
++ * Eval cache and filters are left at their session state (nothing cleared
++ * per item). Defaults follow findbestmove/cfevaluate: evalcontext overrides
++ * the session chequer/cube context, movefilters default to the session's.
++ * Returns (seconds, results): per-item float seconds, and per-item results
++ * in findbestmove's move-tuple format, or cfevaluate's
++ * (optimal, nodouble, take, drop, decision) for "cube".
++ */
++typedef struct {
++    TanBoard anBoard;
++    cubeinfo ci;
++    int anDice[2];
++} benchitem;
++
++SIMD_STACKALIGN static PyObject *
++PythonBenchPool(PyObject * UNUSED(self), PyObject * args)
++{
++    const char *szKind;
++    PyObject *pyItems, *pyEvalContext, *pyMoveFilters = NULL;
++    PyObject *pySeq = NULL, *pyTimes = NULL, *pyResults = NULL;
++    TmoveFilter aamfLocal;
++    movefilter(*aamf)[MAX_FILTER_PLIES];
++    evalcontext ec;
++    benchitem *abi = NULL;
++    double *arSec = NULL;
++    int (*aanMove)[8] = NULL;
++    float (*aarCube)[NUM_CUBEFUL_OUTPUTS] = NULL;
++    int *acd = NULL;
++    Py_ssize_t n, i;
++    int fCube, rc = 0;
++
++#if defined(USE_MULTITHREAD)
++    PyErr_SetString(PyExc_StandardError, "benchpool needs a --disable-threads build");
++    return NULL;
++#endif
++
++    if (!PyArg_ParseTuple(args, "sOO|O", &szKind, &pyItems, &pyEvalContext, &pyMoveFilters))
++        return NULL;
++    if (!strcmp(szKind, "move"))
++        fCube = FALSE;
++    else if (!strcmp(szKind, "cube"))
++        fCube = TRUE;
++    else {
++        PyErr_SetString(PyExc_ValueError, "kind must be \"move\" or \"cube\"");
++        return NULL;
++    }
++
++    memcpy(&ec, fCube ? &GetEvalCube()->ec : &GetEvalChequer()->ec, sizeof(evalcontext));
++    if (PyToEvalContext(pyEvalContext, &ec))
++        return NULL;
++    aamf = *GetEvalMoveFilter();
++    if (pyMoveFilters) {
++        memcpy(aamfLocal, *GetEvalMoveFilter(), sizeof(TmoveFilter));
++        if (PyToMoveFilters(pyMoveFilters, aamfLocal))
++            return NULL;
++        aamf = aamfLocal;
++    }
++
++    if (!(pySeq = PySequence_Fast(pyItems, "items must be a sequence")))
++        return NULL;
++    n = PySequence_Fast_GET_SIZE(pySeq);
++    abi = (benchitem *) g_malloc0(MAX(n, 1) * sizeof(benchitem));
++    arSec = (double *) g_malloc0(MAX(n, 1) * sizeof(double));
++    aanMove = g_malloc0(MAX(n, 1) * sizeof(*aanMove));
++    aarCube = g_malloc0(MAX(n, 1) * sizeof(*aarCube));
++    acd = (int *) g_malloc0(MAX(n, 1) * sizeof(int));
++
++    for (i = 0; i < n; ++i) {
++        PyObject *pyIt = PySequence_Fast_GET_ITEM(pySeq, i);
++        Py_ssize_t want = fCube ? 2 : 3;
++
++        if (!PyTuple_Check(pyIt) || PyTuple_GET_SIZE(pyIt) != want) {
++            PyErr_SetString(PyExc_ValueError, fCube ? "cube item must be (board, cubeinfo)"
++                            : "move item must be (board, cubeinfo, dice)");
++            goto fail;
++        }
++        GetMatchStateCubeInfo(&abi[i].ci, &ms);
++        if (!PyToBoard(PyTuple_GET_ITEM(pyIt, 0), abi[i].anBoard)) {
++            PyErr_SetString(PyExc_ValueError, "invalid board");
++            goto fail;
++        }
++        if (PyToCubeInfo(PyTuple_GET_ITEM(pyIt, 1), &abi[i].ci))
++            goto fail;
++        if (!fCube && (!PyToDice(PyTuple_GET_ITEM(pyIt, 2), abi[i].anDice) || abi[i].anDice[0] == 0)) {
++            PyErr_SetString(PyExc_ValueError, "invalid dice");
++            goto fail;
++        }
++    }
++
++    for (i = 0; i < n && rc == 0; ++i) {
++        struct timespec t0, t1;
++        benchitem *pbi = abi + i;
++
++        clock_gettime(CLOCK_MONOTONIC, &t0);
++        if (fCube) {
++            float aarOutput[2][NUM_ROLLOUT_OUTPUTS];
++
++            rc = GeneralCubeDecisionE(aarOutput, (ConstTanBoard) pbi->anBoard, &pbi->ci, &ec, NULL);
++            if (rc == 0)
++                acd[i] = FindCubeDecision(aarCube[i], aarOutput, &pbi->ci);
++        } else {
++            movelist ml;
++
++            rc = FindnSaveBestMoves(&ml, pbi->anDice[0], pbi->anDice[1], (ConstTanBoard) pbi->anBoard,
++                                    NULL, 0.0f, &pbi->ci, &ec, aamf);
++            if (rc == 0) {
++                RefreshMoveList(&ml, NULL);
++                if (ml.cMoves)
++                    memcpy(aanMove[i], ml.amMoves[0].anMove, sizeof(aanMove[i]));
++                else
++                    aanMove[i][0] = -1;
++            }
++            g_free(ml.amMoves);
++        }
++        clock_gettime(CLOCK_MONOTONIC, &t1);
++        arSec[i] = (double) (t1.tv_sec - t0.tv_sec) + 1e-9 * (double) (t1.tv_nsec - t0.tv_nsec);
++        if (fInterrupt)
++            rc = -1;
++    }
++    if (rc != 0) {
++        ResetInterrupt();
++        PyErr_SetString(PyExc_StandardError, "interrupted/error in benchpool");
++        goto fail;
++    }
++
++    pyTimes = PyList_New(n);
++    pyResults = PyList_New(n);
++    for (i = 0; i < n; ++i) {
++        PyObject *p;
++
++        PyList_SET_ITEM(pyTimes, i, PyFloat_FromDouble(arSec[i]));
++        if (fCube) {
++            p = Py_BuildValue("(ffffi)", aarCube[i][0], aarCube[i][1], aarCube[i][2], aarCube[i][3], acd[i]);
++        } else {
++            Py_ssize_t k;
++
++            p = PyTuple_New(8);
++            for (k = 0; k < 8; ++k) {
++                int nMove = aanMove[i][k];
++                if ((nMove == -1) && ((k % 2) == 0))
++                    break;
++                PyTuple_SET_ITEM(p, k, PyInt_FromLong(nMove + 1));
++            }
++            if (k < 8)
++                _PyTuple_Resize(&p, k);
++        }
++        PyList_SET_ITEM(pyResults, i, p);
++    }
++
++    Py_DECREF(pySeq);
++    g_free(abi);
++    g_free(arSec);
++    g_free(aanMove);
++    g_free(aarCube);
++    g_free(acd);
++    return Py_BuildValue("(NN)", pyTimes, pyResults);
++
++  fail:
++    Py_XDECREF(pySeq);
++    g_free(abi);
++    g_free(arSec);
++    g_free(aanMove);
++    g_free(aarCube);
++    g_free(acd);
++    return NULL;
++}
++
+ static PyMethodDef gnubgMethods[] = {
+ 
++    {"benchpool", PythonBenchPool, METH_VARARGS,
++     "Time gnubg's checker/cube decision natively over a pool\n"
++     "    arguments: kind ('move' or 'cube'), items, eval-context [, movefilters]\n"
++     "        move items = [(board, cube-info, dice)], cube items = [(board, cube-info)]\n"
++     "    returns: (list of per-item seconds, list of results as findbestmove\n"
++     "        returns them, or (optimal, nodouble, take, drop, decision) for cube)"}
++    ,
+     {"board", PythonBoard, METH_VARARGS,
+      "Get the current board\n"
+      "    arguments: none\n"

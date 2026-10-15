@@ -1,0 +1,5 @@
+# HH_LIB=third_party_opponents/hedgehog/libhhagent.so, engine e8847f498f7be8798c0b71314e83c8b4075f2043, shim md5 2e09bf7c, Zen 3 EPYC 7713P, 2026-10-10
+fox CUBELESS n=8000: move mismatches=0 | successor-count mismatches=0 (agent-dedup vs HH explore_delta)
+fox CUBEFUL  n=8994: move mismatches=0 | successor-count mismatches=0
+aureus CUBELESS n=8000: move mismatches=0 | successor-count mismatches=0 (agent-dedup vs HH explore_delta)
+aureus CUBEFUL  n=8994: move mismatches=0 | successor-count mismatches=0

@@ -1,20 +1,25 @@
 """Tests for the gnubg 1.08 external-player agent (gnubg-ext).
 
 Two tiers:
-* pure-Python tests of the board encoding and move-string handling —
-  always run;
-* behavioral tests against a live gnubg 1.08 binary — skipped when the
-  binary (GNUBG_CMD, default /usr/games/gnubg) is not installed.
+* pure-Python tests of the board encoding and move-string handling.
+  They always run.
+* behavioral tests against a live gnubg binary (GNUBG_CMD, default
+  /usr/games/gnubg). The pinned judge is gnubg 1.08.003 with gnubg.wd
+  md5 14184acc9c60ef67be0fad88548fd51a.
 
-The behavioral tier pins the two bugs that were found the hard way:
+What the behavioral tests do:
+* no runnable binary: skip.
+* wrong version or weights md5: fail, naming what was found.
+* the same with GNUBG_ALLOW_VERSION_MISMATCH=1: skip.
+
+The behavioral tier pins:
 * cubeless move criterion: gnubg's "Cubeful evaluations" flag survives
-  `set cube use off`, so without an explicit `cubeful off` the cubeless
-  opponent ranks moves by cubeful money equity (~11 mEq/game
-  mis-specification);
+  `set cube use off`, so the cubeless opponent needs an explicit
+  `cubeful off`;
 * FIBS turn field on double responses: it must be -1 (the doubler is on
-  turn), otherwise gnubg evaluates every take from the wrong side and
-  never drops (0 drops in 400 games historically).
+  turn).
 """
+import functools
 import hashlib
 import os
 import re
@@ -24,19 +29,14 @@ import pytest
 
 from backgammon_engine import BoardState, get_legal_plays, WHITE, BLACK
 from modes import MatchState, CubeOwner
-from gnubg_external import (
+from third_party_opponents.gnubg.gnubg_external import (
     GnubgExternalAgent, GNUBG_CMD, fibs_board_ints,
 )
 
 def _gnubg_version(cmd):
     """Version string of the binary at `cmd`, or None if it will not run.
-
-    Existence is not enough. Every equity in this file is pinned to 1.08.003,
-    so a DIFFERENT gnubg on GNUBG_CMD makes the whole behavioural tier fail
-    with equity mismatches that read like a code regression. Debian ships
-    1.06 at /usr/games/gnubg -- the default here -- which is exactly the
-    trap: the path exists, the tests run, and eight of them fail for a
-    reason nothing in the output names.
+    Existence is not enough: every equity in this file is pinned to
+    1.08.003.
     """
     if not os.path.exists(cmd):
         return None
@@ -50,18 +50,11 @@ def _gnubg_version(cmd):
 
 
 def _gnubg_weights_md5(cmd):
-    """md5 of the gnubg.wd the binary at `cmd` will load, or None.
+    """md5 of the gnubg.wd the binary at `cmd` will load, or None if the
+    file is absent (the guard then falls back to the version check).
 
-    The version string alone is not enough: gnubg >= 1.08 ships RETRAINED
-    nets, so the equities pinned below belong to a specific weights file,
-    not merely to a version number. gnubg will not report its pkgdatadir,
-    so derive it from the install prefix the standard autotools way
-    (<prefix>/bin/gnubg -> <prefix>/share/gnubg/gnubg.wd). Both layouts are
-    live on this box and they carry DIFFERENT nets:
-        /usr/local/bin/gnubg -> /usr/local/share/gnubg/gnubg.wd  14184acc (1.08.003)
-        /usr/games/gnubg     -> /usr/share/gnubg/gnubg.wd        5a671589 (Debian 1.06)
-    Returns None if the derived file is absent, in which case the guard
-    falls back to the version check alone rather than refusing to run.
+    The path is derived from the install prefix:
+    <prefix>/bin/gnubg -> <prefix>/share/gnubg/gnubg.wd.
     """
     prefix = os.path.dirname(os.path.dirname(os.path.realpath(cmd)))
     wd = os.path.join(prefix, "share", "gnubg", "gnubg.wd")
@@ -79,21 +72,33 @@ GNUBG_WEIGHTS_MD5 = "14184acc9c60ef67be0fad88548fd51a"
 GNUBG_VERSION = _gnubg_version(GNUBG_CMD)
 GNUBG_WEIGHTS = _gnubg_weights_md5(GNUBG_CMD) if GNUBG_VERSION else None
 
+# _MISSING: no runnable binary. _MISMATCH: a binary that is not the
+# pinned judge.
+_MISSING = _MISMATCH = None
 if GNUBG_VERSION is None:
-    _SKIP_WHY = f"no runnable gnubg at GNUBG_CMD={GNUBG_CMD}"
+    _MISSING = f"no runnable gnubg at GNUBG_CMD={GNUBG_CMD}"
 elif GNUBG_VERSION != GNUBG_REQUIRED:
-    # Exact, not startswith("1.08"): another 1.08.x build can ship different
-    # nets, and these fixtures are pinned to 1.08.003's to 3 decimals.
-    _SKIP_WHY = (f"needs gnubg {GNUBG_REQUIRED} at GNUBG_CMD={GNUBG_CMD} "
-                 f"(found {GNUBG_VERSION})")
+    # Exact match: another 1.08.x build can ship different nets.
+    _MISMATCH = (f"found gnubg {GNUBG_VERSION} at GNUBG_CMD={GNUBG_CMD}, "
+                 f"required {GNUBG_REQUIRED}")
 elif GNUBG_WEIGHTS is not None and GNUBG_WEIGHTS != GNUBG_WEIGHTS_MD5:
-    _SKIP_WHY = (f"gnubg.wd md5 {GNUBG_WEIGHTS} != documented "
-                 f"{GNUBG_WEIGHTS_MD5}; the equities here are pinned to "
-                 f"those nets")
-else:
-    _SKIP_WHY = None
+    _MISMATCH = (f"found gnubg.wd md5 {GNUBG_WEIGHTS} for "
+                 f"GNUBG_CMD={GNUBG_CMD}, required {GNUBG_WEIGHTS_MD5}")
 
-needs_gnubg = pytest.mark.skipif(_SKIP_WHY is not None, reason=_SKIP_WHY or "")
+_ALLOW_MISMATCH = os.environ.get("GNUBG_ALLOW_VERSION_MISMATCH") == "1"
+_SKIP_WHY = _MISSING or (_MISMATCH if _ALLOW_MISMATCH else None)
+_FAIL_WHY = None if _ALLOW_MISMATCH else _MISMATCH
+
+
+def needs_gnubg(test):
+    """Live test: skip on _SKIP_WHY, fail on _FAIL_WHY."""
+    @functools.wraps(test)
+    def guarded(*args, **kwargs):
+        if _FAIL_WHY is not None:
+            pytest.fail(_FAIL_WHY, pytrace=False)
+        return test(*args, **kwargs)
+    return pytest.mark.skipif(
+        _SKIP_WHY is not None, reason=_SKIP_WHY or "")(guarded)
 
 
 # ── pure-Python: FIBS board encoding ─────────────────────────────────
@@ -187,39 +192,39 @@ def test_checker_move_is_legal_successor(full):
             agent._server.close()
 
 
-# ── live gnubg: cubeless move criterion (regression, 2026-07-20) ─────
+# ── live gnubg: cubeless move criterion ──────────────────────────────
 # Three rollout-verified positions where the cubeful and cubeless
 # criteria pick different moves. The agent must produce the
-# cubeless-criterion successor, not the old cubeful-criterion one.
+# cubeless-criterion successor.
 # Boards are (opponent, mover) in gnubg layout: idx 0..23 = that side's
 # points 1..24, idx 24 = bar.
 
 CRITERION_POSITIONS = [
-    {   # gnubg ID trkPAEBbbQYBMA, 64: cubeless 13/3, cubeful(old) 13/7 8/4
+    {   # gnubg ID trkPAEBbbQYBMA, 64: cubeless 13/3, cubeful 13/7 8/4
         "posid": "trkPAEBbbQYBMA", "dice": (6, 4),
         "pre": [[0, 2, 2, 2, 0, 3, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
                 [2, 2, 1, 1, 2, 2, 0, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0]],
         "succ_cubeless": [[2, 2, 2, 1, 2, 2, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0],
                           [0, 2, 2, 2, 0, 3, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]],
-        "succ_cubeful_old": [[2, 2, 1, 2, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0],
+        "succ_cubeful": [[2, 2, 1, 2, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0],
                              [0, 2, 2, 2, 0, 3, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]],
     },
-    {   # gnubg ID vjsHAEBbtwETAA, 35: cubeless 13/5, cubeful(old) 6/3 6/1
+    {   # gnubg ID vjsHAEBbtwETAA, 35: cubeless 13/5, cubeful 6/3 6/1
         "posid": "vjsHAEBbtwETAA", "dice": (3, 5),
         "pre": [[0, 5, 3, 3, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
                 [2, 2, 1, 3, 2, 2, 0, 0, 0, 0, 0, 0, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],
         "succ_cubeless": [[2, 2, 1, 3, 3, 2, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                           [0, 5, 3, 3, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]],
-        "succ_cubeful_old": [[3, 2, 2, 3, 2, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        "succ_cubeful": [[3, 2, 2, 3, 2, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                              [0, 5, 3, 3, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]],
     },
-    {   # gnubg ID aLeJA0CGdxMHAA, 12: cubeless 7/5 6/5, cubeful(old) 13/10
+    {   # gnubg ID aLeJA0CGdxMHAA, 12: cubeless 7/5 6/5, cubeful 13/10
         "posid": "aLeJA0CGdxMHAA", "dice": (1, 2),
         "pre": [[0, 0, 0, 1, 2, 3, 2, 2, 0, 1, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
                 [0, 2, 0, 0, 0, 4, 3, 2, 0, 1, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],
         "succ_cubeless": [[0, 2, 0, 0, 2, 3, 2, 2, 0, 1, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                           [0, 0, 0, 1, 2, 3, 2, 2, 0, 1, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]],
-        "succ_cubeful_old": [[0, 2, 0, 0, 0, 4, 3, 2, 0, 2, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        "succ_cubeful": [[0, 2, 0, 0, 0, 4, 3, 2, 0, 2, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                              [0, 0, 0, 1, 2, 3, 2, 2, 0, 1, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]],
     },
 ]
@@ -270,8 +275,8 @@ def test_cubeless_uses_cubeless_move_criterion():
             assert got == pos["succ_cubeless"], (
                 "position %s dice %s: expected the cubeless-criterion "
                 "move, got a different successor" % (pos["posid"], pos["dice"]))
-            assert got != pos["succ_cubeful_old"], (
-                "position %s: agent picked the old cubeful-criterion move "
+            assert got != pos["succ_cubeful"], (
+                "position %s: agent picked the cubeful-criterion move "
                 "— `set evaluation chequer evaluation cubeful off` "
                 "regressed" % pos["posid"])
     finally:
@@ -279,10 +284,10 @@ def test_cubeless_uses_cubeless_move_criterion():
             agent._server.close()
 
 
-# ── live gnubg: cube responses (turn-field regression) ───────────────
+# ── live gnubg: cube responses (FIBS turn field) ─────────────────────
 
 def _closed_out_position():
-    """White has a closed home board; Black has 2 on the bar. A double
+    """White has a closed home board. Black has 2 on the bar. A double
     from White is a trivial drop for Black."""
     pts = [0] * 24
     for i in range(6):
@@ -317,11 +322,9 @@ def test_double_response_drop_and_take():
 
 # ── live gnubg: desktop-verified move & equity reproduction ──────────
 # Positions where gnubg-ext's 0-ply and 1-ply CHECKER choices differ,
-# each verified move-for-move against a desktop gnubg 1.08 (mingw
-# build, same weights). Boards are engine
-# points/bar/off with `turn` on roll; move0/move1 are the desktop top
-# moves at 0/1-ply, raw0/raw1 the agent's own reply strings (same
-# resulting positions).
+# verified against desktop gnubg 1.08. Boards are engine points/bar/off
+# with `turn` on roll; move0/move1 are the desktop top moves at 0/1-ply,
+# raw0/raw1 the agent's own reply strings (same resulting positions).
 DESKTOP_CHECKER = [
     dict(gid='hmfwATDg8+ABJA:MAESAAAAAAAA',
          points=[-2, 0, 0, 0, 0, 5, 0, 4, 0, 0, 0, -5, 4, 0, 0, 0, -2, 0, -4, 0, 0, 1, -2, 1],
@@ -412,9 +415,7 @@ DESKTOP_POS5 = {
 }
 
 # gnubg echoes its "(gnubg)" prompt onto the FIRST hint row, so an
-# anchored ^\s*\d+ silently drops rank 1 -- the best move -- and every
-# comparison then starts from the second-best. 1.06 did not do this;
-# 1.08.003 does.
+# anchored ^\s*\d+ silently drops rank 1.
 _PROMPT = r"^(?:\(gnubg\)\s*)*\s*"
 _HINT_RE = re.compile(_PROMPT + r"\d+\.\s+Cubeful\s+\d-ply\s+(.+?)\s+Eq\.:\s+([+-][\d.]+)")
 
@@ -456,7 +457,7 @@ def test_position5_equities_match_desktop(config):
 
 # ── live gnubg: cube-decision analysis vs desktop ────────────────────
 # Cube (double) decisions where the proper action flips between 0-ply and
-# 1-ply, verified against desktop gnubg 1.08 — cubeless equity, every
+# 1-ply, verified against desktop gnubg 1.08: cubeless equity, every
 # cubeful equity, and the proper cube action. 1-ply uses the
 # "pruning off" config, matching the desktop analysis setting.
 DESKTOP_CUBE = [
@@ -526,21 +527,16 @@ def test_cube_action_matches_desktop(pos, plies):
 
 
 # ── cross-engine: gnubg-nn bindings vs gnubg 1.08 binary ────────────
-# Two decisions sampled from cubeless-money self-play: the 148-candidate
-# double-1s (max move-gen/dedup stress) and a hit position carrying the
-# one known outlier. The engines agree on candidate counts, full
-# rankings and picks; equities agree within 2.8e-4 (float32 path noise)
-# except one deep candidate (rank 13/20 of CROSS_POS[1], gnubg
-# "7/1 5/2") differing by 2.34e-3 — both engines classify that successor
-# CONTACT and agree on gammon outputs to ~1e-5, so this is a small
-# contact-net input-feature difference, decision-irrelevant at equity
-# -0.31. The engines are NOT bit-identical; the contract asserted here
-# is decision-identity + tight numeric agreement.
+# Two decisions from cubeless-money self-play: the 148-candidate
+# double-1s and a hit position carrying the one known outlier (rank 13/20
+# of CROSS_POS[1], gnubg "7/1 5/2"). The engines are NOT bit-identical.
+# The contract asserted here is decision-identity + tight numeric
+# agreement.
 CROSS_TOL_TYPICAL = 5e-4    # float32-path agreement for normal moves
 CROSS_TOL_MAX = 3e-3        # single known classification-boundary outlier
 
 CROSS_POS = [
-    dict(  # 148-candidate double 1s (game 5)
+    dict(  # 148-candidate double 1s
         points=[2, 2, -1, 2, 2, 2, 0, 0, 0, 0, 1, -3, 2, 0, 0, 0, 0, 2, -3, -3, -2, -3, 0, 0],
         bar=[0, 0], off=[0, 0], turn=0, dice=(1, 1),
         gnubgid="3O6AAwibbZDBAA:MIEEAAAAAAAE",
@@ -566,8 +562,7 @@ CROSS_POS = [
 def _gnubg_hint_cubeless(gid, n):
     """Full 0-ply cubeless-money hint list for a gnubgid at FULL float
     precision, via the binary's embedded Python (stdout hint prints only
-    3 decimals; the python API exposes the raw floats). Criterion fix
-    applied: chequer eval cubeful off."""
+    3 decimals). Chequer eval is set cubeful off."""
     import tempfile
     script = (
         "import gnubg\n"
@@ -608,7 +603,7 @@ def test_cross_engine_nn_vs_binary_cubeless_0ply(pos):
     0-ply analysis: same candidate count, same ranking, equities within
     CROSS_TOL_MAX everywhere (typically CROSS_TOL_TYPICAL)."""
     gnubg_nn = pytest.importorskip("gnubg_nn")
-    from agents import GnubgNNAgent
+    from third_party_opponents.gnubg.gnubg_nn_agent import GnubgNNAgent
     from backgammon_engine import play_label
 
     state = _cross_state(pos)
@@ -642,15 +637,14 @@ def test_cross_engine_nn_vs_binary_cubeless_0ply(pos):
 
 
 def test_bare_gnubg_spec_is_retired():
-    """'gnubg' silently selected the cube-blind NN approximation; it must
-    now hard-error with disambiguation, and the approximation answers
-    only to 'gnubg-nn'."""
+    """Bare 'gnubg' must hard-error with disambiguation. The NN
+    approximation answers only to 'gnubg-nn'."""
     from play_models import _detect_side_type
     with pytest.raises(ValueError, match="(?s)gnubg-nn.*gnubg-ext"):
         _detect_side_type("gnubg")
     assert _detect_side_type("gnubg-nn") == "gnubg-nn"
 
-# ── orphan-leak regression (2026-08-19): gnubg must die with its worker ─
+# ── orphan leak: gnubg must die with its worker ────────────────────────
 
 def _orphan_probe_child(q):
     """Runs in a spawned child playing the role of an H-H worker: start
@@ -664,11 +658,8 @@ def _orphan_probe_child(q):
 
 @needs_gnubg
 def test_gnubg_dies_with_killed_worker():
-    """Pool.terminate() SIGTERMs workers and atexit never runs, which
-    orphaned one gnubg per worker per finished eval (126 accumulated on
-    a 32GB box on 2026-08-19). The pdeathsig set in _ExtServer must make
-    the kernel reap gnubg even when the worker is SIGKILLed — the
-    harshest exit path, where no userspace cleanup can run."""
+    """The pdeathsig set in _ExtServer must make the kernel reap gnubg
+    when its worker is SIGKILLed (no userspace cleanup can run)."""
     import multiprocessing as mp
     import signal as sg
     import time as _t
@@ -691,18 +682,22 @@ def test_gnubg_dies_with_killed_worker():
         try:
             os.kill(gnubg_pid, 0)
         except ProcessLookupError:
-            return  # gnubg followed its worker into the grave — fixed
+            return  # gnubg died with its worker
         _t.sleep(0.2)
     os.kill(gnubg_pid, sg.SIGKILL)  # don't leak from the test itself
     pytest.fail(f"gnubg {gnubg_pid} survived its worker's SIGKILL (orphan leak)")
 
 
 @needs_gnubg
+@pytest.mark.slow
+@pytest.mark.skipif(os.environ.get("BG_TESTS_ALLOW_KILL") != "1",
+                    reason="SIGKILLs every orphaned gnubg -t -q of this user, other "
+                           "sessions' included: BG_TESTS_ALLOW_KILL=1")
 def test_reaper_kills_true_orphans_only():
-    """A gnubg -t -q whose parent died (ppid==1) must be reaped; the
+    """A gnubg -t -q whose parent died (ppid==1) must be reaped. The
     once-per-process guard is reset for the test. Uses min_age_s=0 so
     the freshly made orphan qualifies."""
-    import gnubg_external as gx
+    from third_party_opponents.gnubg import gnubg_external as gx
     import time as _t
 
     # Double-fork: bash spawns gnubg detached and exits -> gnubg

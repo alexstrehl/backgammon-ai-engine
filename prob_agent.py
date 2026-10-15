@@ -1,10 +1,8 @@
-"""prob_agent.py -- Agent wrapper for a :class:`model.ProbNetwork`.
+"""Agent wrapper for a :class:`model.ProbNetwork` (5-output prob5 net).
 
-Exposes the minimal :class:`agents.Agent` surface ``play_models.play_game``
-needs so a 5-output prob5 model can play H2H. Cubeless-money only — prob5
-nets have no cube policy, so cube calls raise. Supports 0/1/2-ply action
-selection; 2-ply pre-screens candidates within ``prune_threshold`` equity
-(gnubg-style move filter, default 0.16) before the expensive re-evaluation.
+Exposes the :class:`agents.Agent` surface ``play_models.play_game``
+needs. Cubeless-money only: prob5 nets have no cube policy, so cube
+calls raise. 0-ply and 1-ply move selection only.
 """
 
 import os
@@ -33,30 +31,123 @@ except Exception:
     _BG_FAST_AVAILABLE = False
 
 
-# All 21 distinct dice outcomes with implicit probabilities (1/36 for
-# doubles, 2/36 for non-doubles).
+PROB5_DEPTH_ERROR = "prob5 nets support 0-ply and 1-ply only (no 2-ply)"
+
+# The 21 distinct dice outcomes (1/36 for doubles, 2/36 otherwise).
 _DICE_OUTCOMES = [(d1, d2) for d1 in range(1, 7) for d2 in range(d1, 7)]
+
+
+def _sanity_matrix() -> np.ndarray:
+    """(196, 8) map from perspective196 features to gnubg SanityCheck's
+    per-side counts: (ac, anCross, anGammonCross - 1) for my side, the
+    same for the opponent, then my and the opponent's occupancy bitmask
+    (bit i = gnubg point i >= 1 occupied, bar adds >= 2^24; exact in
+    float32).
+    gnubg side 1 (on roll) = our "my" block, side 0 = the opp block;
+    gnubg point i (owner's point - 1, 24 = bar) is my block i, opp
+    block 23 - i."""
+    m = np.zeros((196, 8), dtype=np.float32)
+    thermo = np.array([1.0, 1.0, 1.0, 2.0], dtype=np.float32)
+    for side, base, bar in ((0, 0, 96), (1, 98, 194)):
+        for k in range(24):
+            i = k if side == 0 else 23 - k
+            rows = slice(base + 4 * k, base + 4 * k + 4)
+            m[rows, 3 * side] = thermo
+            m[rows, 3 * side + 1] = thermo * (1 + i // 6)
+            m[rows, 3 * side + 2] = thermo * (i // 6)
+            if i:
+                m[base + 4 * k, 6 + side] = 2.0 ** i   # first unit: 1 iff >= 1
+        m[bar, 3 * side: 3 * side + 3] = (2.0, 10.0, 8.0)   # bar/2 * (1, 5, 4)
+        m[bar, 6 + side] = 2.0 ** 25
+    return m
+
+
+_SANITY_M = _sanity_matrix()
+
+
+def _prob5_impossible_np(x: np.ndarray):
+    """gnubg 1.08 SanityCheck's "impossible" rules (eval.c) on (N, 196)
+    perspective196 features, outputs from the on-roll player's view:
+      opp has borne off -> P(wg) = P(wbg) = 0; I have -> P(lg) = P(lbg) = 0;
+      else, no contact (anBack sum < 24): P(wbg) = 0 if opp anBack < 18,
+      P(lbg) = 0 if my anBack < 18, P(wg) = 0 if my anCross >
+      8 * opp anGammonCross, P(lg) = 0 if opp anCross > 8 * my
+      anGammonCross - 4.
+    Returns an (N, 4) bool mask over (wg, wbg, lg, lbg), or None when
+    nothing is impossible."""
+    s = x @ _SANITY_M
+    # anBack: highest occupied point, 0 if none; >= 24 if on the bar.
+    back = np.frexp(s[:, 6:] + 1.0)[1] - 1
+    race = back.sum(axis=1) < 24
+    off = s[:, 0:6:3] < 14.5
+    if not (race.any() or off.any()):
+        return None
+    off_my, off_opp = off[:, 0], off[:, 1]
+    return np.stack((
+        off_opp | (race & (s[:, 1] > 8 * (s[:, 5] + 1))),
+        off_opp | (race & (back[:, 1] < 18)),
+        off_my | (race & (s[:, 4] > 8 * (s[:, 2] + 1) - 4)),
+        off_my | (race & (back[:, 0] < 18)),
+    ), axis=1)
+
+
+def prob5_impossible(x: np.ndarray):
+    """:func:`_prob5_impossible_np`, in C (bg_fast) when available."""
+    if (_BG_FAST_AVAILABLE and x.dtype == np.float32
+            and x.flags.c_contiguous and x.shape[1:] == (196,)):
+        return _bg_fast.prob5_impossible(x)
+    return _prob5_impossible_np(x)
+
+
+def prob5_sanity(probs: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """:func:`prob5_impossible` zeroing, then the
+    :func:`model.prob5_postprocess` clamps (in numpy on CPU, same values).
+    Certain-win/gammon and the contact noise cut are not applied."""
+    mask = prob5_impossible(x.detach().cpu().numpy())
+    if probs.device.type != "cpu" or probs.dtype != torch.float32:
+        if mask is not None:
+            probs = probs.masked_fill(torch.nn.functional.pad(
+                torch.from_numpy(mask), (1, 0)).to(probs.device), 0.0)
+        return prob5_postprocess(probs)
+    p = probs.detach().numpy().copy()
+    if mask is not None:
+        p[:, 1:][mask] = 0.0
+    np.minimum(p[:, 0], p[:, 1], out=p[:, 1])
+    np.minimum(1.0 - p[:, 0], p[:, 3], out=p[:, 3])
+    np.minimum(p[:, 1], p[:, 2], out=p[:, 2])
+    np.minimum(p[:, 3], p[:, 4], out=p[:, 4])
+    return torch.from_numpy(p)
+
+
+def board_sanity_from_env(var: str, default: bool, environ=None) -> bool:
+    """board_sanity from env ``var``: "1" on, "0" off, unset/empty
+    ``default``. Raises ValueError on any other value."""
+    env = os.environ if environ is None else environ
+    v = env.get(var, "").strip()
+    if v not in ("", "0", "1"):
+        raise ValueError(f"{var} must be 0 or 1, got {v!r}")
+    return default if v == "" else v == "1"
+
+
+def require_cpu(name: str, network, device) -> None:
+    """Play-time prob5 / Prob5Jan / bo: agents run on CPU only."""
+    on_gpu = torch.device(device).type != "cpu" or any(
+        p.device.type != "cpu" for p in network.parameters())
+    if on_gpu:
+        raise ValueError(f"{name} runs on CPU only (got device={device!r}, "
+                         "or a network not on the CPU)")
 
 
 class ProbAgent(Agent):
     """Play-time wrapper for a trained :class:`ProbNetwork`.
 
-    Implements the pieces of the :class:`Agent` interface that
-    ``play_models.play_game`` actually calls at runtime:
-
-    * :meth:`evaluate`, :meth:`evaluate_batch` — scalar money equity
-      derived from the 5 probability outputs (postprocessed to satisfy
-      the nested-event inequalities).
-    * :meth:`choose_checker_action` — picks the action with minimum
-      *opponent-view* equity at 0-ply, or applies 1-ply / 2-ply
-      lookahead when ``plies > 0``. 2-ply uses a 0-ply pre-screen
-      with ``prune_threshold`` to limit the move set before the
-      expensive re-evaluation.
-
-    Training primitives (bootstrap_target, terminal_target, predict,
-    loss, stack_targets) are intentionally **not** implemented —
-    prob5 training lives in ``train_prob5.py`` and has its own targets /
-    loss outside the generic :class:`trainer.Trainer` path.
+    Values are money equity from the 5 outputs after the
+    :func:`model.prob5_postprocess` clamps, or, with ``board_sanity``,
+    after :func:`prob5_sanity` (gnubg's impossible-gammon zeroing +
+    clamps; on for Prob5Jan, off by default for plain prob5). Move
+    selection minimises opponent-view equity at ``plies`` 0 or 1.
+    Training primitives are not implemented: prob5 training lives in
+    ``train_prob5.py``.
     """
 
     def __init__(
@@ -65,15 +156,20 @@ class ProbAgent(Agent):
         device: str = "cpu",
         bf16_inference: bool = False,
         plies: int = 0,
-        prune_threshold: float = 0.16,
         use_fast_engine: bool = True,
+        board_sanity: bool = False,
     ):
         if not isinstance(network, ProbNetwork):
             raise TypeError(
                 f"ProbAgent expects a ProbNetwork, got {type(network).__name__}"
             )
-        if plies not in (0, 1, 2):
-            raise ValueError(f"plies must be 0, 1, or 2 (got {plies})")
+        require_cpu(type(self).__name__, network, device)
+        self.board_sanity = bool(board_sanity)
+        if self.board_sanity and network.encoder_name != "perspective196":
+            raise ValueError("board_sanity (prob5_sanity) reads perspective196 "
+                             f"features (got {network.encoder_name!r})")
+        if plies not in (0, 1):
+            raise ValueError(PROB5_DEPTH_ERROR + f" (got plies={plies})")
         self.network = network.to(device).eval()
         self.device = device
         self._device_is_cpu = (
@@ -85,8 +181,7 @@ class ProbAgent(Agent):
         self.output_mode = "prob5"
         self.is_cubeful = False
         self.plies = plies
-        self.prune_threshold = float(prune_threshold)
-        # Optional bf16 inference (~1.5-2x faster matmuls, ~3-digit precision).
+        # Optional bf16 inference (faster matmuls, ~3-digit precision).
         self.bf16_inference = bool(bf16_inference)
         if self.bf16_inference:
             import copy
@@ -96,9 +191,8 @@ class ProbAgent(Agent):
             self._infer_net = self.network
             self._infer_dtype = torch.float32
 
-        # C fast path (move-gen + perspective196 encode in one C call),
-        # mirroring TDAgent. Safe only for the perspective196 encoder on
-        # CPU. Used for 1-ply successor expansion in value_oneply_checker.
+        # C fast path (move-gen + encode in one call), as in TDAgent.
+        # perspective196 encoder on CPU only.
         self._fast_engine = (
             use_fast_engine
             and _BG_FAST_AVAILABLE
@@ -141,15 +235,17 @@ class ProbAgent(Agent):
                 p = self.network(x)
             if self.network.raw_logits:
                 p = torch.sigmoid(p)
+            if self.board_sanity:
+                return prob5_sanity(p, x)
         return prob5_postprocess(p)
 
     def _score(self, probs: torch.Tensor) -> torch.Tensor:
-        """State value from on-roll player's perspective: cubeless money
-        equity ``2*P(w) + P(wg) + P(wbg) - P(lg) - P(lbg) - 1``."""
+        """Cubeless money equity from the on-roll player's view:
+        ``2*P(w) + P(wg) + P(wbg) - P(lg) - P(lbg) - 1``."""
         return prob5_to_equity(probs)
 
     def _terminal_mag(self, state: BoardState) -> float:
-        """Magnitude of terminal-state result (1/2/3)."""
+        """Magnitude of a terminal result (1/2/3)."""
         return float(state.game_result())
 
     def evaluate(self, state: BoardState) -> float:
@@ -165,26 +261,19 @@ class ProbAgent(Agent):
     # ── 1-ply value primitive ────────────────────────────────────────
 
     def value_oneply_checker(self, state: BoardState) -> float:
-        """1-ply equity at ``state`` from the current player's view.
-
-        Enumerates all 21 dice outcomes; for each, finds the current
-        player's best 0-ply response (the move minimising *opponent*-view
-        equity at the resulting state), and averages. Mirrors
-        :meth:`td_agent.TDAgent.value_oneply_checker` for the equity
-        output mode, with terminal-state correction (a successor that
-        ends the game gets its exact game_result() rather than the
-        network's arbitrary output).
+        """1-ply equity at ``state`` from the current player's view: over
+        all 21 dice outcomes, the best 0-ply response (minimum
+        opponent-view equity), averaged; a game-ending successor gets
+        its exact game_result(). Mirrors
+        :meth:`td_agent.TDAgent.value_oneply_checker` (equity mode).
         """
         if state.is_game_over():
-            # Edge case: state is itself terminal. Current player just
-            # received the loss; their view is -result.
+            # The current player just lost. Their view is -result.
             return -self._terminal_mag(state)
 
         oneply_sum = 0.0
-        # Gather every dice outcome's successor encodings into one buffer and
-        # run a SINGLE batched forward (vs 21 small ones). Each play-dice chunk
-        # records (prob, start, end, features, next_states) into the buffer; the
-        # per-chunk min/terminal-correction is done in numpy afterwards.
+        # ONE batched forward over every dice outcome's successors;
+        # per-dice min and terminal correction in numpy afterwards.
         feat_chunks: List[np.ndarray] = []
         chunk_meta: List[tuple] = []   # (prob, start, end, term_overrides)
         pass_prob = 0.0
@@ -193,18 +282,14 @@ class ProbAgent(Agent):
             prob = (1.0 / 36.0) if d1 == d2 else (2.0 / 36.0)
             features, next_states = self._get_legal_plays_encoded(state, (d1, d2))
             if len(next_states) == 0:
-                # Forced pass: dice goes to opponent on the *same* board, so
-                # the resulting position is identical for every passing dice —
-                # accumulate the prob and evaluate it once below.
+                # Forced pass: the same position for every passing dice,
+                # evaluated once below.
                 pass_prob += prob
                 continue
             n = len(next_states)
             feat_chunks.append(features)
-            # Terminal correction (a successor that ends the game gets its exact
-            # result) reads `next_states`, but the C fast path reuses its
-            # successor objects on the *next* `get_legal_plays_encoded` call --
-            # so capture terminal magnitudes NOW, while `next_states` is valid.
-            # (`features` arrays each get their own buffer and stay valid.)
+            # Capture terminal magnitudes NOW: the C fast path reuses its
+            # successor objects on the next call. (`features` is a copy.)
             term = {
                 int(j): -self._terminal_mag(next_states[int(j)])
                 for j in np.flatnonzero(
@@ -214,8 +299,7 @@ class ProbAgent(Agent):
             chunk_meta.append((prob, offset, offset + n, term))
             offset += n
 
-        # Forced-pass dice (deduped): opponent's 0-ply view at switch_turn(state);
-        # my view = -that.
+        # Forced-pass dice: opponent's 0-ply view at switch_turn(state), negated.
         if pass_prob > 0.0:
             oneply_sum += pass_prob * (-self.evaluate(switch_turn(state)))
 
@@ -230,12 +314,9 @@ class ProbAgent(Agent):
             opp_views_all = self._score(self._probs(t)).detach().cpu().numpy()
             for prob, s, e, term in chunk_meta:
                 opp_views = opp_views_all[s:e]
-                # Apply the terminal corrections captured during the loop
-                # (OPP_OFF feature ~1 means the mover just bore off all 15 →
-                # opp, on roll here, lost; opp view = -result).
                 for j, tv in term.items():
                     opp_views[j] = tv
-                # Current player picks the move minimising opp view.
+                # The current player picks the move minimising opp view.
                 oneply_sum += prob * (-float(np.min(opp_views)))
         return oneply_sum
 
@@ -248,28 +329,20 @@ class ProbAgent(Agent):
         actions: List[Tuple[Play, BoardState]],
     ) -> Tuple[Play, BoardState]:
         """Pick the action whose resulting state minimises opponent
-        equity (equivalently: maximises mover equity).
-
-        Dispatches on ``self.plies``:
-          * 0 (default): 0-ply, direct argmin over network evaluations.
-          * 1: 1-ply lookahead at each candidate's resulting state.
-          * 2: 0-ply pre-screen of candidates with ``prune_threshold``,
-            then 2-ply (= 1-ply for opponent) evaluation of survivors.
+        equity: 0-ply argmin over network evaluations, or 1-ply
+        lookahead at each candidate's resulting state.
         """
         if self.plies == 0:
             return self._choose_0ply(actions)
-        if self.plies == 1:
-            return self._choose_1ply(actions)
-        return self._choose_2ply(actions)
+        return self._choose_1ply(actions)
 
     def _choose_0ply(
         self, actions: List[Tuple[Play, BoardState]],
     ) -> Tuple[Play, BoardState]:
         next_states = [s for _, s in actions]
         opp_values = self.evaluate_batch(next_states)
-        # Terminal correction: a move that ends the game (mover won) gets
-        # its exact result, not the network's arbitrary output on the
-        # terminal encoding — otherwise a winning move can be skipped.
+        # Terminal correction: a game-ending move gets its exact result,
+        # else a winning move can be skipped.
         for j, ns in enumerate(next_states):
             if ns.is_game_over():
                 opp_values[j] = -self._terminal_mag(ns)
@@ -277,16 +350,10 @@ class ProbAgent(Agent):
         return actions[idx]
 
     def choose_next_state(self, state: BoardState, dice: Tuple[int, int]):
-        """Record-free chooser: return the successor BoardState of the
-        selected move, or None when there is no legal play (caller applies
-        ``switch_turn``).
-
-        At 0-ply with the C fast path this is FUSED — move generation +
-        perspective196 encoding in ONE C call, one batched forward — skipping
-        the actions-list path's per-candidate Python materialisation and
-        re-encoding (~2x per decision). Selection is identical: same C
-        candidate order, same terminal correction, same argmin. Other
-        configs fall back to the standard ``choose_checker_action`` path.
+        """Return the successor BoardState of the selected move, or None
+        when there is no legal play (caller applies ``switch_turn``).
+        Selection is identical to ``choose_checker_action``. At 0-ply
+        the C fast path fuses move generation + encoding into one call.
         """
         if self.plies != 0 or not self._fast_engine:
             plays = get_legal_plays(state, dice)
@@ -300,9 +367,8 @@ class ProbAgent(Agent):
             self._score(self._probs(torch.from_numpy(features)))
             .detach().cpu().numpy()
         )
-        # Terminal correction, mask read from the encoding (same convention
-        # as value_oneply_checker); next_states view is still valid here —
-        # no _bg_fast call happens between the fused call and this point.
+        # Terminal correction from the encoding's mask; next_states is
+        # still valid (no _bg_fast call since the fused call).
         for j in np.flatnonzero(
             features[:, OPP_OFF_INDEX] >= TERMINAL_OFF_THRESHOLD
         ):
@@ -313,59 +379,17 @@ class ProbAgent(Agent):
     def _choose_1ply(
         self, actions: List[Tuple[Play, BoardState]],
     ) -> Tuple[Play, BoardState]:
-        """1-ply: for each candidate, evaluate the resulting state at
-        1-ply (opp's view) and pick the move minimising it."""
+        """1-ply: evaluate each candidate's resulting state at 1-ply
+        (opp's view) and pick the minimum."""
         scores = np.empty(len(actions), dtype=np.float64)
         for i, (_, s) in enumerate(actions):
             if s.is_game_over():
-                # Game over after my move = I just won. Opp view = -result.
+                # I just won. Opp view = -result.
                 scores[i] = -self._terminal_mag(s)
             else:
                 scores[i] = self.value_oneply_checker(s)  # opp on roll, opp's view
         idx = int(np.argmin(scores))
         return actions[idx]
-
-    def _choose_2ply(
-        self, actions: List[Tuple[Play, BoardState]],
-    ) -> Tuple[Play, BoardState]:
-        """2-ply with 0-ply pre-screen.
-
-        Mirrors gnubg's move-filter approach: at the top level, screen
-        all candidates at 0-ply and keep only those within
-        ``prune_threshold`` (in equity units, default 0.16) of the best
-        0-ply candidate. Then re-evaluate survivors at 2-ply (= 1-ply
-        for opponent at next state) and pick the best.
-
-        Pruning is only applied at this outer level: the 1-ply sub-call
-        leaves are already at 0-ply (the network), so no deeper pruning
-        is meaningful at depth 2.
-        """
-        next_states = [s for _, s in actions]
-        opp_views_0ply = self.evaluate_batch(next_states)
-        # Apply terminal correction at depth 1 too, so a winning move
-        # never gets pruned by a noisy network output.
-        for j, ns in enumerate(next_states):
-            if ns.is_game_over():
-                opp_views_0ply[j] = -self._terminal_mag(ns)
-        # Move-filter: keep only candidates within prune_threshold of best
-        # (best = lowest opp view = highest current-player view).
-        best_opp = float(np.min(opp_views_0ply))
-        keep_mask = opp_views_0ply <= best_opp + self.prune_threshold
-        kept_idx = np.flatnonzero(keep_mask)
-
-        if kept_idx.size == 1:
-            return actions[int(kept_idx[0])]
-
-        # Re-evaluate survivors at 2-ply.
-        scores_2ply = np.empty(kept_idx.size, dtype=np.float64)
-        for k, i in enumerate(kept_idx):
-            s = next_states[int(i)]
-            if s.is_game_over():
-                scores_2ply[k] = -self._terminal_mag(s)
-            else:
-                scores_2ply[k] = self.value_oneply_checker(s)
-        best_in_kept = int(np.argmin(scores_2ply))
-        return actions[int(kept_idx[best_in_kept])]
 
     # ── cube primitives (unsupported) ────────────────────────────────
 

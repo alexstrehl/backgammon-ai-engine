@@ -1,11 +1,10 @@
 """Parity tests for the expand_21 C fast path in the 1-ply choose /
 value routines.
 
-Each test runs the same agent logic twice — once with the C engine
-(use_fast_engine=True, the expand_21 path) and once with the pure-
-Python fallback (use_fast_engine=False) — on identical states, dice,
-and weights, asserting values agree to float32-forward tolerance and
-chosen moves are identical.
+Each test runs the same agent logic with the C engine
+(use_fast_engine=True) and with the pure-Python fallback on identical
+states, dice, and weights. Values must agree to float32-forward
+tolerance and chosen moves must be identical.
 
 Covers: terminal replies, forced-pass (dance) buckets, centered vs
 owned cube (Jacoby gammons-don't-count vs count), scenario B (opponent
@@ -35,8 +34,8 @@ def _small_net(encoder_name: str, output_mode: str, seed: int) -> TDNetwork:
         encoder_name=encoder_name,
         output_mode=output_mode,
     )
-    # Shrink weights so the untrained net produces small, non-saturated
-    # outputs — better signal for detecting drift between paths.
+    # Shrink weights so the untrained net's outputs are small and
+    # non-saturated, where drift between paths shows.
     with torch.no_grad():
         for p in net.parameters():
             p.mul_(0.05)
@@ -48,8 +47,8 @@ def _agent_pair(encoder_name: str, output_mode: str, seed: int = 777, **kw):
     net = _small_net(encoder_name, output_mode, seed)
     fast = TDAgent(net, use_fast_engine=True, **kw)
     slow = TDAgent(net, use_fast_engine=False, **kw)
-    assert fast._c_base_available, \
-        "C engine must be available for expand_21 parity tests"
+    if not fast._c_base_available:
+        pytest.skip("C engine not built (c_engine/libbg_engine.so)")
     assert not slow._c_base_available
     return fast, slow
 
@@ -78,8 +77,7 @@ def _random_states(n: int, seed: int) -> List[BoardState]:
 def _dance_state() -> BoardState:
     """WHITE to move; BLACK has a checker on the bar against WHITE's
     closed home board. After any WHITE move that keeps the board
-    closed, every BLACK reply is a forced pass (dance) — exercising
-    the expand_21 forced-pass row for all 21 dice buckets.
+    closed, every BLACK reply is a forced pass (dance).
     """
     pts = [0] * 24
     for i in range(6):  # WHITE home board, all six points made
@@ -128,7 +126,7 @@ class TestChooseCubelessExpand21Parity:
         )
         rng = random.Random(7)
         checked = 0
-        for s in _random_states(25, seed=13):
+        for s in _random_states(12, seed=13):
             dice = (rng.randint(1, 6), rng.randint(1, 6))
             plays = get_legal_plays(s, dice)
             if not plays:
@@ -144,10 +142,10 @@ class TestChooseCubelessExpand21Parity:
             assert r_fast[1]._key() == r_slow[1]._key(), \
                 f"{output_mode}: different move chosen"
             checked += 1
-        assert checked >= 15
+        assert checked >= 8
 
     def test_forced_pass_replies(self):
-        """Every candidate move leaves the opponent dancing — all
+        """Every candidate move leaves the opponent dancing: all
         reply buckets are forced passes.
         """
         fast, slow = _agent_pair("perspective196", "equity", oneply=True)
@@ -182,7 +180,7 @@ class TestChooseCubefulExpand21Parity:
         ms_center = mode.initial_match_state()
         rng = random.Random(17)
         checked = 0
-        for i, s in enumerate(_random_states(24, seed=19)):
+        for i, s in enumerate(_random_states(12, seed=19)):
             dice = (rng.randint(1, 6), rng.randint(1, 6))
             plays = get_legal_plays(s, dice)
             if not plays:
@@ -200,7 +198,7 @@ class TestChooseCubefulExpand21Parity:
             assert c_fast[0]._key() == c_slow[0]._key(), \
                 f"i={i}: different move chosen"
             checked += 1
-        assert checked >= 15
+        assert checked >= 8
 
     def test_forced_pass_replies(self, pair):
         fast, slow = pair

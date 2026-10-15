@@ -1,0 +1,15 @@
+# commit 8c4fdb0c9f6fc04224bc10081dc2903bfae2a155  BENCH_CORE=1  BENCH_WARMUP_S=5  MKL shim off  date 2026-10-14T17:16:32Z
+
+########## nat experiments/benchmarks/fixedpool_bench.py --mode cubeless --configs hh-fox-1ply,hh-aureus-1ply  ##########
+[fixedpool] loaded 8000 checker decisions from the committed pool
+
+=== Fixed-pool cubeless per-decision (native, single pinned core, committed pool of 8000, cap=8000) ===
+    prob5 workload: cubeless_prob5_512_512_256_256.pt md5 ac95a983
+hh-fox-1ply      checker      54.4 moves/s  95%CI [52.1,56.9]
+hh-aureus-1ply   checker      30.4 moves/s  95%CI [29.1,31.8]
+
+########## nat experiments/benchmarks/fixedpool_bench.py --mode cubeful --engines hh-fox1,hh-aureus1  ##########
+[cubeful pool] loaded 10000 checker pts, 6000 cube pts from the committed artifact
+[cubeful pool] timing 10000 checker, 6000 cube points
+HedgeHog fox 1-ply         checker      50.1 dec/s 95%CI [48.3,52.0] (19.961 ms)  |  cube     854.9 dec/s 95%CI [835.7,874.0] (1.170 ms)
+HedgeHog aureus 1-ply      checker      29.5 dec/s 95%CI [28.5,30.6] (33.897 ms)  |  cube     481.4 dec/s 95%CI [469.8,492.6] (2.077 ms)

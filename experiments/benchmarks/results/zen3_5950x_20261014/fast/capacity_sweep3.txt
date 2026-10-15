@@ -1,0 +1,65 @@
+# commit 8c4fdb0c9f6fc04224bc10081dc2903bfae2a155  BENCH_CORE=1  BENCH_WARMUP_S=5  MKL shim off  date 2026-10-14T23:20:35Z
+# C API backend torch: torch 2.5.1 mkl=yes threads=1
+cfs-1L[torch]    39d75783  checker   25350.0 dec/s [24809.4,25872.2] (0.0394 ms)  |  cube   66115.1 dec/s [66062.3,66165.5] (0.0151 ms)
+# C API backend simd: simd avx2 VL8 mr<=4 nv2 (mr1 nv8) sparse1=1 sparse_mr=12 delta0=1
+cfs-1L[simd]     39d75783  checker  118508.4 dec/s [115720.6,121256.8] (0.0084 ms)  |  cube  573596.2 dec/s [572176.6,574951.1] (0.0017 ms)
+# C API backend torch: torch 2.5.1 mkl=yes threads=1
+cfs-2L[torch]    1ddbb775  checker    7832.6 dec/s [7663.7,7992.0] (0.1277 ms)  |  cube   21075.6 dec/s [21066.8,21083.8] (0.0474 ms)
+# C API backend simd: simd avx2 VL8 mr<=4 nv2 (mr1 nv8) sparse1=1 sparse_mr=12 delta0=1
+cfs-2L[simd]     1ddbb775  checker   28462.1 dec/s [27725.5,29168.8] (0.0351 ms)  |  cube  172325.5 dec/s [171983.8,172678.7] (0.0058 ms)
+# C API backend torch: torch 2.5.1 mkl=yes threads=1
+cf3L-mod[torch]  27a728cf  checker    5861.1 dec/s [5733.9,5982.0] (0.1706 ms)  |  cube   15250.6 dec/s [15245.4,15255.9] (0.0656 ms)
+# C API backend simd: simd avx2 VL8 mr<=4 nv2 (mr1 nv8) sparse1=1 sparse_mr=12 delta0=1
+cf3L-mod[simd]   27a728cf  checker   19994.8 dec/s [19469.2,20495.4] (0.0500 ms)  |  cube  120863.5 dec/s [120638.4,121077.2] (0.0083 ms)
+# C API backend torch: torch 2.5.1 mkl=yes threads=1
+cf4L[torch]      6afda0f8  checker    5177.0 dec/s [5065.2,5285.3] (0.1932 ms)  |  cube   13353.2 dec/s [13348.7,13357.7] (0.0749 ms)
+# C API backend simd: simd avx2 VL8 mr<=4 nv2 (mr1 nv8) sparse1=1 sparse_mr=12 delta0=1
+cf4L[simd]       6afda0f8  checker   18480.7 dec/s [17994.7,18948.0] (0.0541 ms)  |  cube  114423.1 dec/s [114217.3,114632.3] (0.0087 ms)
+# C API backend torch: torch 2.5.1 mkl=yes threads=1
+cf5L-f9[torch]   37e41475  checker    4655.2 dec/s [4554.8,4751.9] (0.2148 ms)  |  cube   11895.3 dec/s [11890.7,11900.2] (0.0841 ms)
+# C API backend simd: simd avx2 VL8 mr<=4 nv2 (mr1 nv8) sparse1=1 sparse_mr=12 delta0=1
+cf5L-f9[simd]    37e41475  checker   15905.8 dec/s [15488.0,16307.8] (0.0629 ms)  |  cube   95232.2 dec/s [95070.7,95407.9] (0.0105 ms)
+# C API backend torch: torch 2.5.1 mkl=yes threads=1
+cf768w5L[torch]  f65c49fe  checker    3643.5 dec/s [3564.0,3719.4] (0.2745 ms)  |  cube    9393.7 dec/s [9390.9,9396.5] (0.1065 ms)
+# C API backend simd: simd avx2 VL8 mr<=4 nv2 (mr1 nv8) sparse1=1 sparse_mr=12 delta0=1
+cf768w5L[simd]   f65c49fe  checker   11334.7 dec/s [11026.0,11631.2] (0.0882 ms)  |  cube   72048.1 dec/s [71928.5,72164.4] (0.0139 ms)
+# C API backend torch: torch 2.5.1 mkl=yes threads=1
+cfW1[torch]      4f86345a  checker    3375.4 dec/s [3302.4,3446.0] (0.2963 ms)  |  cube    8618.6 dec/s [8616.3,8621.0] (0.1160 ms)
+# C API backend simd: simd avx2 VL8 mr<=4 nv2 (mr1 nv8) sparse1=1 sparse_mr=12 delta0=1
+cfW1[simd]       4f86345a  checker    9996.2 dec/s [9727.0,10256.1] (0.1000 ms)  |  cube   62103.1 dec/s [62007.6,62205.3] (0.0161 ms)
+# C API backend torch: torch 2.5.1 mkl=yes threads=1
+cf768x768[torch] de9e6e84  checker    2825.4 dec/s [2763.6,2885.4] (0.3539 ms)  |  cube    7474.7 dec/s [7472.6,7476.5] (0.1338 ms)
+# C API backend simd: simd avx2 VL8 mr<=4 nv2 (mr1 nv8) sparse1=1 sparse_mr=12 delta0=1
+cf768x768[simd]  de9e6e84  checker    7979.0 dec/s [7761.5,8185.9] (0.1253 ms)  |  cube   52639.8 dec/s [52553.4,52728.1] (0.0190 ms)
+# C API backend torch: torch 2.5.1 mkl=yes threads=1
+p5s-1L[torch]    fa2c6935  checker   19248.4 dec/s [18803.3,19712.9] (0.0520 ms)
+# C API backend simd: simd avx2 VL8 mr<=4 nv2 (mr1 nv8) sparse1=1 sparse_mr=12 delta0=1
+p5s-1L[simd]     fa2c6935  checker  101447.0 dec/s [98969.3,104041.9] (0.0099 ms)
+# C API backend torch: torch 2.5.1 mkl=yes threads=1
+p5s-2L[torch]    e8c0c760  checker    6734.5 dec/s [6584.4,6892.5] (0.1485 ms)
+# C API backend simd: simd avx2 VL8 mr<=4 nv2 (mr1 nv8) sparse1=1 sparse_mr=12 delta0=1
+p5s-2L[simd]     e8c0c760  checker   23256.4 dec/s [22643.7,23928.2] (0.0430 ms)
+# C API backend torch: torch 2.5.1 mkl=yes threads=1
+p5s-3L[torch]    3da8e498  checker    5226.5 dec/s [5111.7,5347.5] (0.1913 ms)
+# C API backend simd: simd avx2 VL8 mr<=4 nv2 (mr1 nv8) sparse1=1 sparse_mr=12 delta0=1
+p5s-3L[simd]     3da8e498  checker   18139.5 dec/s [17656.6,18663.8] (0.0551 ms)
+# C API backend torch: torch 2.5.1 mkl=yes threads=1
+p5-4L256[torch]  ac95a983  checker    4653.8 dec/s [4550.7,4761.7] (0.2149 ms)
+# C API backend simd: simd avx2 VL8 mr<=4 nv2 (mr1 nv8) sparse1=1 sparse_mr=12 delta0=1
+p5-4L256[simd]   ac95a983  checker   15892.6 dec/s [15473.3,16343.7] (0.0629 ms)
+# C API backend torch: torch 2.5.1 mkl=yes threads=1
+p5-5L[torch]     bade7d51  checker    4178.7 dec/s [4085.3,4276.5] (0.2393 ms)
+# C API backend simd: simd avx2 VL8 mr<=4 nv2 (mr1 nv8) sparse1=1 sparse_mr=12 delta0=1
+p5-5L[simd]      bade7d51  checker   14336.4 dec/s [13950.8,14754.5] (0.0698 ms)
+# C API backend torch: torch 2.5.1 mkl=yes threads=1
+p5-768w5L[torch] bd1a7931  checker    3292.3 dec/s [3218.2,3370.3] (0.3037 ms)
+# C API backend simd: simd avx2 VL8 mr<=4 nv2 (mr1 nv8) sparse1=1 sparse_mr=12 delta0=1
+p5-768w5L[simd]  bd1a7931  checker   11168.9 dec/s [10854.8,11498.3] (0.0895 ms)
+# C API backend torch: torch 2.5.1 mkl=yes threads=1
+p5-768w6L[torch] a9df2ffc  checker    3052.1 dec/s [2983.2,3123.8] (0.3276 ms)
+# C API backend simd: simd avx2 VL8 mr<=4 nv2 (mr1 nv8) sparse1=1 sparse_mr=12 delta0=1
+p5-768w6L[simd]  a9df2ffc  checker   10597.0 dec/s [10299.4,10912.4] (0.0944 ms)
+# C API backend torch: torch 2.5.1 mkl=yes threads=1
+p5-768x768[torch] b3fad4eb  checker    2565.4 dec/s [2506.9,2626.7] (0.3898 ms)
+# C API backend simd: simd avx2 VL8 mr<=4 nv2 (mr1 nv8) sparse1=1 sparse_mr=12 delta0=1
+p5-768x768[simd] b3fad4eb  checker    8261.6 dec/s [8028.2,8508.8] (0.1210 ms)

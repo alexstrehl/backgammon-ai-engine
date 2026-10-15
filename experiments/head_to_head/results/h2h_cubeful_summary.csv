@@ -1,23 +1,21 @@
-# Main-results convention (2026-08-09): capped(+/-128) mean mEq/game, Jacoby on,
-# gnubg = REAL 1.08.003 binary (native money cube) via gnubg-ext / gnubg-ext-full;
-# 1-ply opponents UNPRUNED (SAGE_UNPRUNED=1 for Sage). --log-runaway 256 archives
-# redouble-war games; they are INCLUDED (capped estimator). Wrapper-era rows
-# (21-pt cube approximation) superseded — see git history; head-to-head the two
-# gnubg implementations are indistinguishable (+2.7 [-0.2,+5.5], 4M -- the
-# interval includes zero, so this accepts no difference rather than proving one).
+# Capped (+/-128) mean mEq/game, Jacoby on. gnubg = REAL 1.08.003 binary
+# (native money cube) via gnubg-ext (default pruning) / gnubg-ext-full
+# (unpruned). Open Sage's cubeful 1-ply has no pruning setting.
+# Margins at caps 32/64/128 agree within 0.2 mEq in every cell.
 #
-# Cap sensitivity is negligible: margins at caps 32/64/128 agree within
-# 0.2 mEq in every cell (4-54 games of 10M exceed 128).
-#
-# The 2-ply row uses the paper protocol: keep-all root move filter, gnubg's
-# default pruning for the opponent's replies.
-# Per-game npz raws retained offline; CIs recreatable via run.py --combine.
+# The 2-ply row plays gnubg with its default pruning (gnubg-ext).
+# recipe_rerun rows: the retraining recipe (experiments/retraining/README.md)
+# run end to end, its final cf_restart checkpoint as side1 against production
+# (PureTD_4L_6afda0f8) as side2, so a tie reads ~0. Checkpoints: best_models/experimental/recipe_runs/.
+# Per-game raws available on request; CIs recreatable via run.py --combine.
+# not_in_paper rows: recorded, not reported in the paper.
 side1,side1_md5,side1_plies,side2,side2_plies,mode,games,capped_edge_mEq,ci_lo,ci_hi,status
 PureTD_4L,6afda0f8,0,gnubg-ext,0,cubeful-money,10000000,85.2,83.5,87.0,current
 PureTD_4L,6afda0f8,0,gnubg-ext,1,cubeful-money,10000000,27.2,25.3,29.0,current
 PureTD_4L,6afda0f8,0,gnubg-ext-full,1,cubeful-money,10000000,27.8,25.9,29.6,current
-PureTD_4L,6afda0f8,0,gnubg-ext-rootfull,2,cubeful-money,1240200,-21.7,-27.1,-16.4,current
-PureTD_4L,6afda0f8,0,opensage-analyzer,0,cubeful-money,2000000,95.5,91.2,99.8,current
-PureTD_4L,6afda0f8,0,opensage-analyzer,1,cubeful-money,2000000,26.9,22.5,31.3,current
-PureTD_4L,6afda0f8,0,opensage-analyzer_unpruned,1,cubeful-money,2000000,26.8,22.4,31.3,current
-gnubg-ext-full,,1,opensage-analyzer_unpruned,1,cubeful-money,10000000,-3.8,-5.8,-1.8,current
+PureTD_4L,6afda0f8,0,gnubg-ext,2,cubeful-money,2000200,-20.7,-24.8,-16.6,current
+PureTD_4L,6afda0f8,0,opensage-native,0,cubeful-money,2000000,79.5,75.2,83.8,current
+PureTD_4L,6afda0f8,0,opensage-native,1,cubeful-money,2000000,23.8,19.5,28.2,current
+gnubg-ext-full,,1,opensage-native,1,cubeful-money,10000000,-4.4,-6.5,-2.4,not_in_paper
+recipe_cf_run1,e9f7ddc8,0,PureTD_4L_6afda0f8,0,cubeful-money,20000000,0.7,-0.5,2.0,recipe_rerun
+recipe_cf_run2,60bd300a,0,PureTD_4L_6afda0f8,0,cubeful-money,20000000,-0.0,-1.3,1.2,recipe_rerun

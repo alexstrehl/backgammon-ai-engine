@@ -1,0 +1,16 @@
+# Learned versus heuristic cube handling. Mean mEq/game for
+# side1 over side2: cubeful money, Jacoby on, both sides 0-ply with the exact
+# bearoff tables, capped +/-128 (uncapped agrees). Chunks pooled with
+# run.py --combine.
+# All rows at JANOWSKI_REV 2026-10-06c (recorded in every npz).
+# PureTD_4L_bo = bo:best_models/cubeful_money_512_512_256_256.pt (6afda0f8).
+# prob5_janowski = janowski:best_models/cubeless_prob5_512_512_256_256.pt
+# (ac95a983); x = JANOWSKI_X.
+# status: headline = the reported row (x = JANOWSKI_X default 0.76);
+# sweep = other x.
+# Per-game raws available on request; CIs recreatable via run.py --combine.
+side1,side1_md5,side1_plies,side2,side2_md5,side2_plies,x,mode,games,capped_edge_mEq,ci_lo,ci_hi,status
+PureTD_4L_bo,6afda0f8,0,prob5_janowski,ac95a983,0,0.76,cubeful-money,10000000,15.5,13.8,17.2,headline
+PureTD_4L_bo,6afda0f8,0,prob5_janowski,ac95a983,0,0.70,cubeful-money,10000000,17.0,15.1,18.9,sweep
+PureTD_4L_bo,6afda0f8,0,prob5_janowski,ac95a983,0,0.68,cubeful-money,10000000,17.4,15.6,19.3,sweep
+PureTD_4L_bo,6afda0f8,0,prob5_janowski,ac95a983,0,0.60,cubeful-money,10000000,29.2,27.2,31.2,sweep

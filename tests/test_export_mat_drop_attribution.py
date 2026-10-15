@@ -1,13 +1,9 @@
 """A dropped double must credit the DOUBLER, not the dropper.
 
 XG (and gnubg) read the winner off the column the "Wins N points" token sits
-in. export_mat used to append that token to whichever column held " Drops",
-which credited the game to the player who dropped. That inverted every
-white-doubles/black-drops game -- ~25% of a cubeful set -- in every .mat
-export, while leaving the per-decision PR columns untouched, so it showed up
-as a losing win-rate next to a winning PR.
+in, so export_mat must put that token in the doubler's column.
 """
-import gnubg_eval as ge
+from third_party_opponents.gnubg import gnubg_eval as ge
 
 COL2 = 20  # offset at/after which text is in BLACK's column
 
@@ -36,7 +32,7 @@ def _wins_col(text):
 
 
 def test_white_doubles_black_drops_credits_white():
-    # the regressing case: both columns of the last row are occupied
+    # both columns of the last row are occupied
     assert _wins_col(_mat(ge.WHITE, ge.BLACK)) == 0
 
 

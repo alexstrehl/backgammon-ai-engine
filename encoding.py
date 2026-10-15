@@ -1,33 +1,18 @@
 """
 encoding.py -- Board state encoding for neural network input.
 
-Always encodes from the ON-ROLL PLAYER's perspective.  The network
-learns a single function: P(on-roll player wins | board).
+Always encoded from the ON-ROLL player's perspective: the on-roll
+player's checkers fill the "my" block [0-97], the opponent's the
+"opponent" block [98-195]. When BLACK is on roll the point indices
+are mirrored.
 
-When WHITE is on roll, WHITE's checkers go in the "my" block [0-97]
-and BLACK's in the "opponent" block [98-195], with normal point order.
+Layout (196 features), per block (98):
+    24 points x 4-unit thermometer   = 96
+    bar / 2.0                        =  1
+    off / 15.0                       =  1
 
-When BLACK is on roll, BLACK's checkers go in the "my" block [0-97]
-and WHITE's in the "opponent" block [98-195], with MIRRORED point
-indices (so "my home board" is always in the same feature positions).
-
-Layout (196 features):
-    MY block (98 features):
-        For each of 24 points: 4 units for on-roll player's checkers = 96
-        My bar / 2.0                                                  =  1
-        My off / 15.0                                                 =  1
-
-    OPPONENT block (98 features):
-        For each of 24 points: 4 units for opponent's checkers        = 96
-        Opponent bar / 2.0                                            =  1
-        Opponent off / 15.0                                           =  1
-
-    Total: 98 + 98 = 196
-
-Network output interpretation:
-    output = P(on-roll player wins)
-    P(WHITE wins) = output          when WHITE is on roll
-    P(WHITE wins) = 1 - output      when BLACK is on roll
+Network output is also from the on-roll player's view (win
+probability, equity, or prob5; see model.py).
 """
 
 from enum import IntEnum
@@ -37,14 +22,10 @@ from backgammon_engine import BoardState, WHITE, BLACK
 
 
 # ── Feature layout constants ─────────────────────────────────────────
-#
-# Index arithmetic for the 196-feature perspective encoding.
-# "MY" block = on-roll player's checkers; "OPP" block = opponent's.
 
 FEATURES_PER_POINT = 4
 NUM_POINTS = 24
 
-MY_BLOCK_OFFSET = 0
 MY_POINT_FEATURES = NUM_POINTS * FEATURES_PER_POINT  # 96
 MY_BAR_INDEX = MY_POINT_FEATURES                      # 96
 MY_OFF_INDEX = MY_POINT_FEATURES + 1                  # 97
@@ -59,9 +40,8 @@ OPP_BLOCK_SIZE = OPP_POINT_FEATURES + 2              # 98
 BAR_SCALE = 0.5       # bar count divided by 2
 OFF_SCALE = 1.0 / 15  # off count divided by 15
 
-# Terminal detection: when OPP_OFF_INDEX feature ≥ 1.0 (off/15 = 15/15),
-# the opponent has borne off all checkers → the mover of the ENCODED
-# successor has won.
+# Terminal test on encoded successors: OPP off feature >= 1.0 means
+# the opponent (of the encoded on-roll player) has borne off all 15.
 TERMINAL_OFF_THRESHOLD = 1.0 - 1e-6
 
 
@@ -102,11 +82,7 @@ class Encoder:
 
 
 class Perspective196Encoder(Encoder):
-    """196-feature perspective encoding (4-unit thermometer per point).
-
-    Encodes from the on-roll player's perspective.  BLACK's board is
-    mirrored so that "my home board" is always in the same positions.
-    """
+    """196-feature perspective encoding (see module docstring)."""
 
     @property
     def num_features(self) -> int:
@@ -121,7 +97,7 @@ class Perspective196Encoder(Encoder):
         pts = state.points
 
         if state.turn == WHITE:
-            # MY block: WHITE's checkers at normal indices
+            # Normal indices.
             for idx in range(NUM_POINTS):
                 v = pts[idx]
                 if v > 0:
@@ -129,7 +105,6 @@ class Perspective196Encoder(Encoder):
             x[MY_BAR_INDEX] = state.bar[WHITE] * BAR_SCALE
             x[MY_OFF_INDEX] = state.off[WHITE] * OFF_SCALE
 
-            # OPPONENT block: BLACK's checkers at normal indices
             for idx in range(NUM_POINTS):
                 v = pts[idx]
                 if v < 0:
@@ -137,8 +112,8 @@ class Perspective196Encoder(Encoder):
             x[OPP_BAR_INDEX] = state.bar[BLACK] * BAR_SCALE
             x[OPP_OFF_INDEX] = state.off[BLACK] * OFF_SCALE
 
-        else:  # BLACK on roll
-            # MY block: BLACK's checkers at mirrored indices
+        else:
+            # BLACK on roll: mirrored indices.
             for idx in range(NUM_POINTS):
                 v = pts[idx]
                 if v < 0:
@@ -146,7 +121,6 @@ class Perspective196Encoder(Encoder):
             x[MY_BAR_INDEX] = state.bar[BLACK] * BAR_SCALE
             x[MY_OFF_INDEX] = state.off[BLACK] * OFF_SCALE
 
-            # OPPONENT block: WHITE's checkers at mirrored indices
             for idx in range(NUM_POINTS):
                 v = pts[idx]
                 if v > 0:
@@ -161,17 +135,10 @@ CUBE_FEATURES = 4  # 3-hot cube perspective + 1 is_cube_action bit
 
 
 class CubefulEncoder(Encoder):
-    """Wraps a base encoder, appending cube state features.
-
-    Features appended (4 total):
-      [cube_centered, cube_mine, cube_theirs]  3  (one-hot)
-      is_cube_action                         1  (binary)
-
-    Cube perspective is the on-roll player's view (CENTERED / MINE /
-    THEIRS), produced by `cube_perspective()` in modes.py from the
-    absolute CubeOwner. is_cube_action=1 at the cube decision
-    point (before doubling/not-doubling), 0 at the checker decision
-    point.
+    """Base encoder plus 4 cube features: one-hot
+    [centered, mine, theirs] (on-roll player's view, from
+    `modes.cube_perspective()`) and is_cube_action (1 at the cube
+    decision, 0 at the checker decision).
     """
 
     def __init__(self, base_encoder_name: str = "perspective196"):
@@ -183,8 +150,13 @@ class CubefulEncoder(Encoder):
         return f"cubeful_{self.base_name}"
 
     @property
+    def cube_features(self) -> int:
+        """Cube columns appended after the base features."""
+        return CUBE_FEATURES
+
+    @property
     def num_features(self) -> int:
-        return self._base.num_features + CUBE_FEATURES
+        return self._base.num_features + self.cube_features
 
     def encode(
         self, state: BoardState, cube_state: CubePerspective,
@@ -198,10 +170,8 @@ class CubefulEncoder(Encoder):
         self, base_features: np.ndarray, cube_state: CubePerspective,
         is_cube_action: bool = False,
     ) -> np.ndarray:
-        """Append cube features to a precomputed base-encoder array.
-        Lets callers reuse a fast (e.g. C) base encoding without
-        re-running the Python base encoder.
-        """
+        """Append cube features to a precomputed base encoding (e.g.
+        from the C encoder)."""
         x = np.empty(self.num_features, dtype=np.float32)
         n = base_features.shape[0]
         x[:n] = base_features
@@ -218,10 +188,8 @@ ENCODERS = {
 
 
 def get_encoder(name: str) -> Encoder:
-    """Look up an encoder by name and return a new instance.
-    Names matching `cubeful_<base>` build a `CubefulEncoder` over the
-    named base encoder.
-    """
+    """New encoder instance by name; `cubeful_<base>` wraps the base
+    in a `CubefulEncoder`."""
     if name.startswith("cubeful_"):
         base_name = name[len("cubeful_"):]
         if base_name not in ENCODERS:
@@ -237,7 +205,7 @@ def get_encoder(name: str) -> Encoder:
     return ENCODERS[name]()
 
 
-# ── Module-level backward-compatible API ─────────────────────────────────────
+# ── Module-level API (default encoder) ───────────────────────────────────────
 
 _default_encoder = Perspective196Encoder()
 
@@ -245,8 +213,5 @@ NUM_FEATURES = _default_encoder.num_features  # 196
 
 
 def encode_state(state: BoardState) -> np.ndarray:
-    """Encode a board state from the on-roll player's perspective.
-
-    Delegates to the default Perspective196Encoder.
-    """
+    """Default (Perspective196) encoding of a board state."""
     return _default_encoder.encode(state)

@@ -1,0 +1,14 @@
+Pooled 40 run(s) -> 20000000 games (cf_restart.pt vs cubeful_money_512_512_256_256.pt, cubeful-money)
+RESULTS
+Model1: 9999811 wins (50.0%)
+Model2: 10000189 wins (50.0%)
+Model1 win rate 95% CI (Wilson): [50.0%, 50.0%]
+p-value: 0.9328
+Verdict: Models are effectively tied (difference < 1%)
+Cubeful money equity (Model1), UNCAPPED mean: -0.0000 pts/game (-0.0 mEq/game)
+  95% CI (bootstrap): [-1.3, +1.2] mEq/game (±1.2)
+  Equity p-value (bootstrap): 0.9812
+  Equity verdict: No significant equity difference
+  Median equity:   -1000.0 mEq/game  [-1000.0, +1000.0]  p=0.9364
+  Trimmed mean (1%): +0.1 mEq/game  [-1.1, +1.2]  p=0.9088
+  Capped mean (±128): -0.0 mEq/game  [-1.3, +1.2]  p=0.9904

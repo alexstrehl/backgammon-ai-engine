@@ -1,10 +1,8 @@
 """Guard against Markdown that renders wrongly on GitHub but looks fine in a diff.
 
-A wrap put `+ self-play), and skips...` at the start of a line in
-experiments/benchmarks/README.md. Markdown read the leading `+ ` as a bullet,
-which opened a list; the 4-space-indented shell commands after it became list
-continuation instead of a code block, so every `# comment` line inside them
-rendered as an <h1>. Nothing in the diff looked wrong.
+A wrapped line starting with a list marker (`+ `, `- `, `* `) opens a list.
+Indented shell commands after it stop being a code block and their
+`# comment` lines render as headings.
 """
 import html
 import pathlib
@@ -28,17 +26,16 @@ def test_no_accidental_list_opener(doc):
     for i, ln in enumerate(lines, 1):
         if not re.match(r"^[-+*] ", ln):
             continue
-        # Walk back to the blank line that opens this block. If the block
-        # already contains a list marker at column 0 we are inside a list and
-        # this is a genuine item; if it is plain prose, the marker is a wrapped
-        # word that will silently open a list and swallow what follows.
+        # Walk back to the blank line that opens this block. A block that
+        # already holds a column-0 list marker is a real list. In plain prose
+        # the marker is a wrapped word.
         block = []
         for j in range(i - 2, -1, -1):
             if not lines[j].strip():
                 break
             block.append(lines[j])
         # A lead-in ending in ':' (or a finished sentence) legitimately
-        # introduces a list; the bug is a marker landing mid-sentence.
+        # introduces a list. The bug is a marker landing mid-sentence.
         lead_in = block[0].rstrip().endswith((":", ".", "!", "?")) if block else False
         if block and not lead_in and not any(re.match(r"^[-+*] |^\d+[.)] ", b) for b in block):
             bad.append(f"{doc.name}:{i}: {ln[:70]!r} (continues: {block[0][-45:]!r})")

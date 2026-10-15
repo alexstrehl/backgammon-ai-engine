@@ -18,29 +18,17 @@ c_engine/*.dll
 c_engine/.build.lock
 
 # local working data
-datasets/
-gnubg_games/
-gnubg_test/
 logs/
-**/offline_analysis/*.log
+runs/
 
-# generated benchmark position pool
-**/benchmarks/pool.pkl
-**/benchmarks/results.txt
+# benchmark scratch output
 **/benchmarks/bench_*.txt
 
-# Head-to-head raw per-game data (large: each 10M run's .npz is ~72 MB and git
-# stores binaries with no delta compression). Keep only the summary CSVs under
-# version control; treat raw .npz as out-of-band artifacts. (Already-tracked
-# .npz stay tracked; this prevents new ones from being added.)
+# Head-to-head per-game raws (.npz) stay out of git; summaries are committed.
 **/head_to_head/results/**/*.npz
 
 # c-engine build artifact
 c_engine/libbg_nply.so
-
-# c_inference build artifacts (build_play.sh)
-c_inference/play_models
-c_inference/test_nn
 
 # Training run logs — run artifacts, not source.
 runlogs/
@@ -49,3 +37,18 @@ runlogs/
 cubeful_selfplay_games/
 cubeful_selfplay_1ply_games/
 runaway_games/
+
+# HedgeHog: engine clone, per-machine shim build, untracked model weights.
+/hedgehog-public/
+third_party_opponents/hedgehog/libhhagent.so
+third_party_opponents/hedgehog/shim/build/
+*.ogxf
+
+# c_api build artifacts (build.sh)
+c_api/*.so
+c_api/obj_*/
+c_api/puretd_selfplay_*
+c_api/*.bin
+c_api/.build.lock
+third_party_opponents/opensage/opensage_mobile_build/
+third_party_opponents/opensage/opensage_bench/build/

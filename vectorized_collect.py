@@ -1,43 +1,29 @@
-"""Generator-based vectorized self-play for cubeful-money 1-ply
-collection.
+"""Vectorized (lockstep) self-play for 1-ply collection.
 
-Each game is a Python generator that runs the normal episode logic but
-`yield`s a feature matrix (N, n_feat) whenever it needs a network
-forward, receiving the (N,) values back via `.send()`. A per-process
-driver runs B games in lockstep, concatenates all B pending feature
-requests into ONE local GPU forward (net on cuda, in-process, no IPC),
-and scatters the results back. Refills finished slots until the
-episode quota is met.
+Each game is a Python generator that `yield`s a feature matrix
+(N, n_feat) whenever it needs a network forward and receives the (N,)
+values back via `.send()`. A per-process driver runs B games in
+lockstep, concatenates the B pending requests into one forward, and
+refills finished slots until the episode quota is met. Move-gen runs
+single-threaded per process, so bg_fast's shared C buffers are used
+serially.
 
-This removes the per-forward IPC / single-server serialization of the
-2a inference server: forwards from many games (and from different
-logical phases — cube decision, 1-ply target, 0-ply move selection)
-all batch together since they go through the same network. Move-gen
-(`expand_21`, C) parallelizes across the K worker processes; within a
-process everything is single-threaded so the shared C buffers in
-bg_fast are used serially (safe).
+Where the one forward per step runs (`device` in the worker args):
+  * "cuda"   -- per-worker context: the net lives in this process.
+  * "remote" -- shared context (default): the fused batch goes through
+                a shared-memory slot of an EvalServer process
+                (`remote_worker_init` claims the slot), which runs it
+                as its own forward: bitwise the same values as "cuda".
 
-Scope: cubeful-money, oneply targets, 0-ply move selection
-(oneply_acting=False). Mirrors trainer._collect_episode_cubeful_money
-exactly; rare expand_21 overflow falls back to the agent's own method.
+Scope: cubeful-money and cubeless-money, 1-ply targets, 0-ply move
+selection (oneply_acting=False). Mirrors the trainer.py collectors.
 
-EPISODE-LENGTH GUARD
-Every generator here takes `max_episode_plies` and enforces it with
-exactly the semantics of the non-vectorized collectors in trainer.py
-(see DEFAULT_MAX_EPISODE_PLIES there): count plies (turns) at the top
-of the `while not mode.is_episode_over(state)` loop and DISCARD the
-whole episode once the bound is exceeded. This is load-bearing, not
-defensive: the pathology the guard exists for (mutual-hitting
-recirculation in prob5-seeded cubeful nets) is *worse* in lockstep
-than in the serial collector. A single runaway game here does not just
-grow one worker's RSS -- it pins a driver slot forever, so the round
-never finishes even though the other B-1 games completed. The bound
-therefore has to be per-GAME, inside the generator, and it is.
-
-Discards are reported explicitly rather than inferred from an empty
-return: each generator returns `(enc, tgt, discarded)` and
-`vectorized_collect_worker` returns `(enc, tgt, n_discarded)` so the
-count flows into the same round-log line as the CPU paths.
+Episode-length guard: every generator takes `max_episode_plies` with
+the same semantics as trainer.py (DISCARD the whole episode past the
+bound). The bound must be per-game, inside the generator: a runaway
+game would otherwise pin a driver slot forever. Generators return
+`(enc, tgt, discarded)` and `vectorized_collect_worker` returns
+`(enc, tgt, n_discarded)`.
 """
 
 from __future__ import annotations
@@ -46,19 +32,19 @@ import random
 from typing import List
 
 import os
+import sys
+import time
 
 import numpy as np
 import torch
 
 from backgammon_engine import opening_roll, switch_turn
-from encoding import (
-    CUBE_FEATURES, CubePerspective, OPP_OFF_INDEX, TERMINAL_OFF_THRESHOLD,
-)
+from encoding import OPP_OFF_INDEX, TERMINAL_OFF_THRESHOLD
 from modes import CubeOwner, cube_perspective
 from model import TDNetwork
 import td_agent as _ta
 from td_agent import TDAgent
-from trainer import DEFAULT_MAX_EPISODE_PLIES
+from trainer import DEFAULT_MAX_EPISODE_PLIES, _cube_phase_oneply_gen
 
 _bg_fast = _ta._bg_fast
 _ONEPLY_PROBS = _ta._ONEPLY_PROBS
@@ -78,7 +64,7 @@ def _discarded():
 # ── generator mirrors of the forward-using methods ──────────────────
 def _value_oneply_checker_cubeful_gen(agent, state, match_state):
     """Generator mirror of TDAgent.value_oneply_checker_cubeful (fast
-    path). Yields the (n_rows, n_feat) feature matrix; receives the
+    path). Yields the (n_rows, n_feat) feature matrix. Receives the
     (n_rows,) fp32 values. Returns the 1-ply per-unit equity (float)."""
     player = state.turn
     opponent = 1 - player
@@ -118,14 +104,14 @@ def _value_oneply_checker_cubeful_gen(agent, state, match_state):
             dice_max = np.maximum.reduceat(vmover, seg)
             return float(_ONEPLY_PROBS @ dice_max)
 
-    # Rare: C path unavailable / expand_21 overflow → fall back to the
-    # real method (does its own local forward). No yield.
+    # C path unavailable or expand_21 overflow: the real method does its
+    # own local forward. No yield.
     return agent.value_oneply_checker_cubeful(state, match_state)
 
 
 def _choose_checker_action_cubeful_0ply_gen(agent, state, dice, match_state):
     """Generator mirror of TDAgent.choose_checker_action_cubeful 0-ply
-    path. Yields the (n_plays, n_feat) feature matrix; receives the
+    path. Yields the (n_plays, n_feat) feature matrix. Receives the
     (n_plays,) fp32 values. Returns (chosen_state, bootstrap) or None."""
     if agent._c_base_available:
         base_feats, _lazy = _bg_fast.get_legal_plays_encoded(state, dice)
@@ -145,7 +131,9 @@ def _choose_checker_action_cubeful_0ply_gen(agent, state, dice, match_state):
     opponent = 1 - state.turn
     opp_persp = cube_perspective(match_state.cube_owner, opponent)
     opp_cube_action = match_state.can_offer(opponent)
-    extra = np.zeros((len(next_states), CUBE_FEATURES), dtype=np.float32)
+    extra = np.zeros(
+        (len(next_states), agent.encoder.cube_features), dtype=np.float32,
+    )
     extra[:, int(opp_persp)] = 1.0
     if opp_cube_action:
         extra[:, 3] = 1.0
@@ -175,20 +163,12 @@ def _collect_episode_cubeful_money_gen(
     max_episode_plies=DEFAULT_MAX_EPISODE_PLIES,
 ):
     """Generator mirror of trainer._collect_episode_cubeful_money for
-    oneply=True. Yields feature matrices for batched forwards; returns
+    oneply=True. Yields feature matrices. Returns
     (enc_array, tgt_array, discarded) via StopIteration.
 
-    Cube targets are 0-ply (one batched forward(batch=2) over the
-    no-double and double-take encodings), exactly as
-    trainer._collect_episode_cubeful_money does on this branch. The
-    1-ply machinery applies to the CHECKER phase only.
-
-    `max_episode_plies` matches trainer._collect_episode_cubeful_money
-    exactly: the counter increments once per iteration of the
-    `is_episode_over` loop and the episode is discarded (empty arrays,
-    discarded=True) the moment the count reaches the bound -- checked
-    BEFORE any work for that ply, so a capped episode yields nothing
-    further and its slot is freed for a refill. 0 disables.
+    Cube targets are 0-ply. Only the checker phase is 1-ply.
+    `max_episode_plies`: checked at the top of each ply; the episode is
+    discarded on reaching the bound. 0 disables.
     """
     state, dice = opening_roll(rng)
     enc_list: List[np.ndarray] = []
@@ -198,45 +178,21 @@ def _collect_episode_cubeful_money_gen(
 
     while not mode.is_episode_over(state):
         if max_episode_plies > 0 and plies >= max_episode_plies:
-            # Runaway episode -- discard. In the lockstep driver this
-            # also releases the slot, which a truncate-and-continue
-            # policy would not do safely (see module docstring).
+            # Runaway episode: discard, which also frees the driver slot.
             return _discarded()
         plies += 1
         player = state.turn
 
         # ── Cube decision phase (if eligible) ───────────────────────
         if not is_opening and match_state.can_offer(player):
-            pre_persp = cube_perspective(match_state.cube_owner, player)
-            enc_list.append(agent._encode_cubeful(
-                state, pre_persp, is_cube_action=True,
-            ))
-
-            # 0-ply cube targets, batched into one forward(batch=2).
-            x_nd = agent._encode_cubeful(
-                state, pre_persp, is_cube_action=False,
-            )
-            x_dt = agent._encode_cubeful(
-                state, CubePerspective.THEIRS, is_cube_action=False,
-            )
-            values = (yield np.stack([x_nd, x_dt]))
-            values = np.asarray(values, dtype=np.float32).ravel()
-            v_no_double = float(values[0])
-            v_double_take = 2.0 * float(values[1])
-            do_double = agent._money_cube_decision(
-                v_no_double, v_double_take, pre_persp, match_state.jacoby,
-            )
-
-            if do_double:
-                takes = v_double_take <= 1.0
-                if takes:
-                    targets.append(v_double_take)
-                    match_state = match_state.after_take(player)
-                else:
-                    targets.append(1.0)
-                    break
-            else:
-                targets.append(v_no_double)
+            # Shared with the CPU collector (trainer.py); the lockstep
+            # driver serves the yield.
+            dec = yield from _cube_phase_oneply_gen(agent, state, match_state)
+            enc_list.append(dec.enc)
+            targets.append(dec.target)
+            match_state = dec.match_state
+            if dec.dropped:
+                break
 
         # ── Checker decision phase ──────────────────────────────────
         post_persp = cube_perspective(match_state.cube_owner, player)
@@ -277,41 +233,31 @@ _DICE_OUTCOMES = _ta._DICE_OUTCOMES
 
 
 def _value_oneply_checker_cubeless_gen(agent, state):
-    """Generator mirror of TDAgent.value_oneply_checker — PER-DICE, one
-    yield per dice outcome, exactly like the reference.
+    """Generator mirror of TDAgent.value_oneply_checker: one yield per
+    dice outcome, like the reference.
 
-    WHY PER-DICE. The reference runs a SEPARATE small forward for each
-    of the 21 dice outcomes, with terminal successor rows INCLUDED in
-    the batch and overridden afterwards. fp32 forwards are not
-    batch-composition invariant (kernel blocking varies with M), so a
-    single batched forward here lands 1 ulp off the reference —
-    tests/test_vectorized_cubeless.py requires bit-exact targets. The
-    GPU win survives: the lockstep driver still batches each yield step
-    ACROSS the B in-flight games.
+    Per-dice because fp32 forwards are not batch-composition invariant
+    and tests/test_vectorized_cubeless.py requires bit-exact targets.
 
-    Mirrored details, all load-bearing for bitwise equality:
-      * forward input INCLUDES terminal successor rows (net output then
-        overridden), matching the reference batch content;
-      * terminal overrides are materialised from `next_states` BEFORE
-        yielding — the C fast path's `next_states` is a lazy view over a
-        shared buffer that other lockstep games invalidate while this
-        generator is suspended (`features` is a copy and safe to yield);
-      * accumulation is Python-float (f64) in `_DICE_OUTCOMES` order;
-      * forced pass mirrors `evaluate(switch_turn(state))`: a (1, F)
-        forward of the plain encoding. The value is cached — repeat
-        forwards of an identical (1, F) input are deterministic, so the
-        cached value equals the reference's per-dice recomputation.
+    Details that bitwise equality depends on:
+      * the forward input INCLUDES terminal successor rows (overridden
+        afterwards), as in the reference;
+      * terminal overrides are read from `next_states` BEFORE yielding:
+        the C fast path's `next_states` is a lazy view over a shared
+        buffer that other games clobber while this generator is
+        suspended (`features` is a copy);
+      * accumulation is Python float in `_DICE_OUTCOMES` order;
+      * forced pass = a (1, F) forward of `switch_turn(state)`, cached.
     """
     oneply_sum = 0.0
-    pass_v = None            # cached mirror of evaluate(switch_turn(state))
+    pass_v = None            # cached evaluate(switch_turn(state))
     for idx, (d1, d2) in enumerate(_DICE_OUTCOMES):
         prob = float(_ONEPLY_PROBS[idx])
         features, next_states = agent._get_legal_plays_encoded(
             state, (d1, d2))
 
         if len(next_states) == 0:
-            # Forced pass: reference does evaluate(switch_turn(state))
-            # = net(encode(state')[None]).item().
+            # Forced pass: evaluate(switch_turn(state)).
             if pass_v is None:
                 row = agent._encode(switch_turn(state))
                 V = (yield np.ascontiguousarray(row[None, :]))
@@ -319,7 +265,7 @@ def _value_oneply_checker_cubeless_gen(agent, state):
             oneply_sum += prob * agent._flip_value(pass_v)
             continue
 
-        # Terminal overrides BEFORE yielding (lazy-buffer hazard above).
+        # Terminal overrides BEFORE yielding (lazy-buffer hazard).
         term = {
             int(i): agent._terminal_opp_value(next_states[int(i)])
             for i in np.flatnonzero(
@@ -336,50 +282,31 @@ def _value_oneply_checker_cubeless_gen(agent, state):
 
 
 def _value_oneply_checker_cubeless_gen_fast(agent, state):
-    """FAST path: one batched `expand_21` forward per position (one
-    yield), instead of 21 per-dice yields.
+    """Fast mirror of TDAgent.value_oneply_checker: one batched
+    `expand_21` forward per position (one yield) instead of 21.
 
-    See the `_CUBELESS_1PLY_GEN` note below for which models used this
-    path. It is ~5x faster under multi-worker GPU
-    collection (measured 500 vs 107 ep/s at W=24), because the per-dice
-    version costs ~22 GPU roundtrips per ply instead of ~2 and 24 worker
-    contexts serialise on those small launches.
+    NOT bit-exact with the CPU reference (the reduction differs in the
+    last ulp), so the per-dice generator is the default. Select this
+    one with BG_VEC_CUBELESS_FAST=1.
 
-    It is NOT bitwise-identical to the CPU reference: fp32 forwards are
-    not batch-composition invariant, so the reduction differs in the last
-    ulp. That is why the default path is the per-dice one, which
-    `tests/test_vectorized_cubeless.py` holds to bit-exactness. Select
-    this one with BG_VEC_CUBELESS_FAST=1 when reproducing a chain that
-    used it, or when the 5x matters more than bit-exact agreement with
-    the CPU mirror.
-
-    Generator mirror of TDAgent.value_oneply_checker. Yields a single
-    (n_rows, n_feat) feature matrix of all non-terminal 21-dice replies;
-    receives the (n_rows,) fp32 network values; returns the 1-ply
-    per-unit value (float) for the on-roll player.
-
-    Cubeless = NO cube features, NO cube decision: the encoding is the
-    plain perspective196 base encoding (== agent.encoder.encode). The
-    mover-view flip and terminal handling follow agent.output_mode
-    exactly as value_oneply_checker does:
+    Yields one (n_rows, n_feat) matrix of all non-terminal 21-dice
+    replies. Receives (n_rows,) fp32 values. Returns the 1-ply per-unit
+    value for the on-roll player. Mover-view flip and terminal handling
+    follow agent.output_mode as value_oneply_checker does:
         equity:      non-term -> -V,  term -> +game_result
         probability: non-term -> 1-V, term -> +1
-    Forced-pass dice (no legal reply) are folded into expand_21's
-    buckets, identical to value_oneply_checker's pass_prob branch.
+    Forced-pass dice are folded into expand_21's buckets.
     """
     is_equity = agent.output_mode == "equity"
 
-    # Fast path: one C 21-dice expansion + vectorized per-dice reduction,
-    # exactly like _value_oneply_checker_cubeful_gen but with no cube
-    # columns. expand_21 returns replies in _DICE_OUTCOMES order with a
-    # per-dice count, so np.maximum.reduceat over the segment offsets
-    # gives the per-dice best mover value; _ONEPLY_PROBS weights them.
+    # expand_21 returns replies in _DICE_OUTCOMES order with a per-dice
+    # count. reduceat over the segment offsets gives the per-dice max.
     if agent._c_base_available:
         exp = _bg_fast.expand_21(state)
         if exp is not None:
             base_feats, counts, gr, n_rows = exp
             if n_rows:
-                # base_feats is already the full cubeless encoding.
+                # base_feats is the full cubeless encoding.
                 V = (yield np.ascontiguousarray(base_feats))
                 V = np.asarray(V, dtype=np.float32).ravel()
             else:
@@ -388,11 +315,9 @@ def _value_oneply_checker_cubeless_gen_fast(agent, state):
             # Per-unit mover value per reply.
             vmover = np.empty(gr.shape[0], dtype=np.float64)
             if is_equity:
-                # non-term -> -V; term -> +game_result.
                 vmover[~nonterm] = gr[~nonterm]
                 vmover[nonterm] = -V
             else:
-                # probability: non-term -> 1-V; term -> +1.
                 vmover[~nonterm] = 1.0
                 vmover[nonterm] = 1.0 - V
             seg = np.empty(counts.shape[0], dtype=np.int64)
@@ -401,10 +326,8 @@ def _value_oneply_checker_cubeless_gen_fast(agent, state):
             dice_max = np.maximum.reduceat(vmover, seg)
             return float(_ONEPLY_PROBS @ dice_max)
 
-    # Slow path: per-dice expansion accumulated into ONE yielded batch
-    # (mirrors value_oneply_checker's single batched forward). Forced-
-    # pass dice eval switch_turn(state); dedup is unnecessary for
-    # correctness (probabilities sum the same).
+    # Python path: per-dice expansion accumulated into ONE yielded batch.
+    # Forced-pass dice evaluate switch_turn(state) once.
     feat_chunks = []
     chunk_meta = []          # (prob, start, end, term_overrides)
     pass_prob = 0.0
@@ -429,7 +352,7 @@ def _value_oneply_checker_cubeless_gen_fast(agent, state):
         chunk_meta.append((prob, offset, offset + n, term))
         offset += n
 
-    # Build one batch: legal-reply chunks + (optionally) one pass row.
+    # One batch: legal-reply chunks plus (optionally) one pass row.
     parts = list(feat_chunks)
     pass_off = None
     if pass_prob > 0.0:
@@ -453,13 +376,9 @@ def _value_oneply_checker_cubeless_gen_fast(agent, state):
     return oneply_sum
 
 
-# Which cubeless 1-ply generator to use. Default is the per-dice mirror,
-# which tests/test_vectorized_cubeless.py holds bit-exact against the CPU
-# reference. BG_VEC_CUBELESS_FAST=1 selects the batched expand_21 path:
-# ~5x faster at W=24 (500 vs 107 ep/s measured), 1 ulp off the reference
-# (tests/test_vectorized_cubeless_fast.py bounds the divergence). The
-# current 4-layer cubeless model, and the cubeless stage in the
-# production 4-layer cubeful model's lineage, used the fast path.
+# Cubeless 1-ply generator: the per-dice mirror (bit-exact with the CPU
+# reference) unless BG_VEC_CUBELESS_FAST=1 selects the batched expand_21
+# path (1 ulp off). See experiments/retraining/README.md.
 _CUBELESS_1PLY_GEN = (
     _value_oneply_checker_cubeless_gen_fast
     if os.environ.get("BG_VEC_CUBELESS_FAST") == "1"
@@ -467,21 +386,17 @@ _CUBELESS_1PLY_GEN = (
 )
 
 def _choose_checker_action_cubeless_0ply_gen(agent, state, dice):
-    """Generator mirror of TDAgent.choose_checker_action 0-ply cubeless
-    path. Yields the (n_plays, n_feat) feature matrix; receives the
+    """Generator mirror of TDAgent.choose_checker_action, 0-ply cubeless
+    path. Yields the (n_plays, n_feat) feature matrix. Receives the
     (n_plays,) fp32 values. Returns (chosen_state, bootstrap) or None.
-
-    No cube columns; terminal masking and Boltzmann selection match
-    choose_checker_action / _apply_terminal_mask exactly.
+    Terminal masking and Boltzmann selection match the reference.
     """
     features, lazy_next = agent._get_legal_plays_encoded(state, dice)
     n_plays = len(lazy_next)
     if n_plays == 0:
         return None
-    # Materialize successors BEFORE yielding: the C fast path backs
-    # next_states with a shared buffer that other games' move-gen calls
-    # clobber while this generator is suspended at the yield. `features`
-    # is already a private copy (bg_fast copies it), so it's safe.
+    # Materialize successors BEFORE yielding: next_states is a view over
+    # a shared C buffer that other games clobber. `features` is a copy.
     next_states = [lazy_next[i] for i in range(n_plays)]
 
     values_np = (yield features)
@@ -502,18 +417,12 @@ def _collect_episode_cubeless_money_gen(
     agent, mode, rng, max_episode_plies=DEFAULT_MAX_EPISODE_PLIES,
 ):
     """Generator mirror of trainer.collect_episode (cubeless branch) for
-    oneply=True. Yields feature matrices for batched forwards; returns
+    oneply=True. Yields feature matrices. Returns
     (enc_array, tgt_array, discarded) via StopIteration.
 
-    Mirrors the non-vectorized cubeless path exactly:
-      - encode current state (no cube features),
-      - 1-ply checker target via value_oneply_checker,
-      - 0-ply checker move selection.
-    No cube-decision phase.
-
-    `max_episode_plies`: as trainer.collect_episode -- count plies at
-    the top of the loop, discard the episode on exceeding the bound.
-    0 disables.
+    Per ply: encode the state (no cube features), 1-ply checker target,
+    0-ply move selection. No cube phase. `max_episode_plies` as in
+    trainer.collect_episode; 0 disables.
     """
     state, dice = opening_roll(rng)
     enc_list: List[np.ndarray] = []
@@ -551,21 +460,61 @@ def _collect_episode_cubeless_money_gen(
     )
 
 
+# ── shared-context transport (one CUDA context total) ───────────────
+# The pool initializer claims one EvalServer slot per worker process. It
+# is never returned, so the pool must not recycle workers.
+_WORKER_REMOTE = None
+
+# Shared-memory slot rows per in-flight game. A step larger than the
+# slot is split into chunked forwards (`_remote_forward`). Defined in
+# gpu_context so the VRAM preflight sizes the server from the same number.
+from gpu_context import SHARED_ROWS_PER_GAME as REMOTE_ROWS_PER_GAME  # noqa: E402
+
+
+def remote_max_rows(batch_games: int) -> int:
+    return int(max(8192, batch_games * REMOTE_ROWS_PER_GAME))
+
+
+def remote_worker_init(handles):
+    """Pool initializer for the shared-context collector. `handles` is one
+    server's ClientHandles or an EvalServerGroup's GroupHandles."""
+    global _WORKER_REMOTE
+    from gpu_eval_server import claim_slot
+    _WORKER_REMOTE = claim_slot(handles)
+
+
+def _remote_forward(remote, parts, n: int) -> np.ndarray:
+    """One fused lockstep batch through the server. `parts` are the B
+    pending feature matrices (n rows total), concatenated straight into
+    the shared-memory slot (one copy). Bitwise identical to the
+    per-worker-context driver, except that a step larger than the slot
+    is split, which can move that step's last ulp."""
+    if n <= remote.max_rows:
+        dst = remote.in_arr[:n]
+        if len(parts) == 1:
+            dst[...] = parts[0]
+        else:
+            np.concatenate(parts, axis=0, out=dst)
+        out = remote.forward_from_slot(n)
+        return out.reshape(-1) if out.ndim > 1 else out
+    big = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
+    outs = []
+    for s in range(0, n, remote.max_rows):
+        out = remote.forward(big[s:s + remote.max_rows])
+        outs.append(out.reshape(-1) if out.ndim > 1 else out)
+    return np.concatenate(outs)
+
+
 # ── per-process driver ──────────────────────────────────────────────
 def vectorized_collect_worker(args):
-    """Worker subprocess: run B games in lockstep, batching all pending
-    forwards into one local GPU call per step. Returns
-    (encodings, targets, n_discarded) for `num_episodes` games --
-    the same 3-tuple shape as trainer._collect_worker, so the trainer's
-    round accounting and log line are identical on both paths.
+    """Worker subprocess: run B games in lockstep, one forward per step.
+    Returns (encodings, targets, n_discarded) for `num_episodes` games,
+    the same shape as trainer._collect_worker. `n_discarded` counts
+    episodes killed by `max_episode_plies` (an empty result is not a
+    discard).
 
-    `n_discarded` counts episodes killed by `max_episode_plies`. It is
-    taken from each generator's explicit `discarded` flag, NOT inferred
-    from an empty result, so a legitimately-empty episode is never
-    miscounted as a runaway.
-
-    NOTE: the args tuple arity must stay in sync with `_build_vec_args`
-    in Trainer.train.
+    The args tuple arity must stay in sync with `_build_vec_args` in
+    Trainer.train.
     """
     import os
     os.environ["OMP_NUM_THREADS"] = "1"
@@ -573,37 +522,40 @@ def vectorized_collect_worker(args):
 
     (state_dict, hidden_sizes, input_size, output_mode, encoder_name,
      activation, mode, num_episodes, seed, oneply, oneply_acting,
-     boltzmann_temp, bf16_collect, B, device,
-     max_episode_plies) = args
+     boltzmann_temp, bf16_collect, B, device, max_episode_plies) = args
     assert oneply, "vectorized_collect is oneply-only"
-    # The generators implement 0-ply move SELECTION only (1-ply is used
-    # for TARGETS). Accepting oneply_acting here would silently play a
-    # different policy than requested, changing the data distribution
-    # with no error -- refuse instead.
+    # The generators do 0-ply move SELECTION only (1-ply is for targets).
+    # Accepting oneply_acting would silently play a different policy.
     assert not oneply_acting, (
         "vectorized_collect does not implement 1-ply move selection "
         "(--oneply-acting); it does 1-ply targets with 0-ply acting"
     )
 
-    # Driver net lives on `device` (cuda): it runs the single batched
-    # forward per step over all B games' pending feature requests.
-    net = TDNetwork(
-        hidden_sizes=hidden_sizes, input_size=input_size,
-        output_mode=output_mode, encoder_name=encoder_name,
-        # activation MUST be applied: it is not a parameter tensor, so
-        # load_state_dict cannot catch a mismatch — see _collect_worker.
-        activation=activation,
-    )
-    net.load_state_dict(state_dict)
-    net.to(device).eval()
+    # Driver net on `device` runs the one forward per step. With
+    # device == "remote" the net lives in the EvalServer process.
+    remote = None
+    net = None
+    if device == "remote":
+        remote = _WORKER_REMOTE
+        if remote is None:
+            raise RuntimeError(
+                "vectorized_collect_worker got device='remote' but this "
+                "process has no EvalServer slot: the pool must be created "
+                "with initializer=remote_worker_init")
+    else:
+        net = TDNetwork(
+            hidden_sizes=hidden_sizes, input_size=input_size,
+            output_mode=output_mode, encoder_name=encoder_name,
+            # activation is not a parameter tensor, so load_state_dict
+            # cannot catch a mismatch. It must be passed.
+            activation=activation,
+        )
+        net.load_state_dict(state_dict)
+        net.to(device).eval()
 
-    # The AGENT is built on CPU so its move-gen + encode use the fast C
-    # `bg_fast` path (which requires a CPU agent) and the 1-ply target
-    # uses the batched `expand_21` fast path — all of which only build
-    # feature matrices that the generators YIELD; the actual forwards
-    # are done by the cuda driver net above. The agent wraps its own CPU
-    # net copy purely so any rare in-agent fallback forward (e.g.
-    # expand_21 overflow in the cubeful gen) runs on a matching device.
+    # The agent is built on CPU so move-gen + encode use the C `bg_fast`
+    # path (CPU-only). Its own CPU net copy serves only the rare
+    # in-agent fallback forward (e.g. expand_21 overflow).
     agent_net = TDNetwork(
         hidden_sizes=hidden_sizes, input_size=input_size,
         output_mode=output_mode, encoder_name=encoder_name,
@@ -622,8 +574,7 @@ def vectorized_collect_worker(args):
     episodes_started = 0
     n_discarded = 0
 
-    # Cubeless modes (cubeless-money, dmp) have no MatchState/cube; route
-    # them to the cubeless generator. Cubeful modes return a MatchState.
+    # Cubeless modes (cubeless-money, dmp) have no MatchState.
     initial_ms = mode.initial_match_state()
     is_cubeless = initial_ms is None
 
@@ -657,28 +608,41 @@ def vectorized_collect_worker(args):
             return None
         return [g, feat]
 
-    # Initial fill. Keep starting games until either B slots are live or
-    # the episode quota is exhausted -- NOT just B attempts. A game that
-    # finishes without ever yielding (e.g. every episode discarded by a
-    # very small max_episode_plies) returns None and fills no slot; if
-    # we only attempted B times, `slots` could end up empty, the driver
-    # loop below would never run, and the worker would silently return
-    # having played only B of num_episodes episodes.
+    # Initial fill: keep starting games until B slots are live or the
+    # quota is exhausted, NOT just B attempts: a game that finishes
+    # without yielding fills no slot.
     slots = []
     while len(slots) < B and episodes_started < num_episodes:
         s = _start_game()
         if s is not None:
             slots.append(s)
 
+    # BG_VEC_PROFILE=1: per-task step timing on stderr. Diagnostic only.
+    _prof = bool(os.environ.get("BG_VEC_PROFILE"))
+    _t_task0 = time.perf_counter()
+    _t_fwd = 0.0
+    _n_steps = 0
+    _n_rows = 0
+
     with torch.no_grad():
         while slots:
             sizes = [s[1].shape[0] for s in slots]
-            if len(slots) == 1:
-                big = slots[0][1]
+            n_total = sum(sizes)
+            if _prof:
+                _t0 = time.perf_counter()
+            if remote is not None:
+                out = _remote_forward(remote, [s[1] for s in slots], n_total)
             else:
-                big = np.concatenate([s[1] for s in slots], axis=0)
-            t = torch.from_numpy(big).to(device)
-            out = net(t).reshape(-1).to("cpu", torch.float32).numpy()
+                if len(slots) == 1:
+                    big = slots[0][1]
+                else:
+                    big = np.concatenate([s[1] for s in slots], axis=0)
+                t = torch.from_numpy(big).to(device)
+                out = net(t).reshape(-1).to("cpu", torch.float32).numpy()
+            if _prof:
+                _t_fwd += time.perf_counter() - _t0
+                _n_steps += 1
+                _n_rows += n_total
 
             off = 0
             new_slots = []
@@ -696,8 +660,18 @@ def vectorized_collect_worker(args):
                         if ns is not None:
                             new_slots.append(ns)
                             break
-                        # else game ended with no forward; keep refilling
+                        # else: game ended without a forward; keep refilling
             slots = new_slots
+
+    if _prof and _n_steps:
+        _tot = time.perf_counter() - _t_task0
+        print(
+            f"[vec-profile pid={os.getpid()} dev={device}] steps={_n_steps} "
+            f"rows/step={_n_rows / _n_steps:.0f} step={_tot / _n_steps * 1e3:.2f}ms "
+            f"fwd={_t_fwd / _n_steps * 1e3:.2f}ms "
+            f"({_t_fwd / _tot * 100:.0f}% of task)",
+            file=sys.stderr, flush=True,
+        )
 
     if not enc_chunks:
         return (

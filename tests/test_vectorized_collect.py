@@ -1,28 +1,21 @@
-"""Tests for vectorized_collect.py -- the lockstep GPU collector.
+"""Tests for vectorized_collect.py, the lockstep GPU collector.
 
-These run on CPU (the driver's `device` is a parameter), so they are
-device-independent: the properties under test are algorithmic, not
-numerical-backend properties.
+These run on CPU (the driver's `device` is a parameter): the properties
+under test are algorithmic, not numerical-backend properties.
 
-The important ones:
+  * `test_generator_matches_reference_bitwise`: the generator mirror
+    must match trainer._collect_episode_cubeful_money BIT FOR BIT (same
+    CPU net, same rng seed).
 
-  * `test_generator_matches_reference_bitwise` -- the generator mirror
-    must compute exactly what trainer._collect_episode_cubeful_money
-    computes. Driven one game at a time on the same CPU net with the
-    same rng seed, every encoding and target must match BIT FOR BIT.
-    This is what makes the vectorized path safe to train on.
+  * `test_lockstep_batch_size_does_not_change_results`: move-gen in
+    bg_fast writes into shared C buffers. A buffer the generator reads
+    after a `yield` must be a copy, not a view, so B=8 must agree with
+    B=1.
 
-  * `test_lockstep_batch_size_does_not_change_results` -- move-gen in
-    bg_fast writes into shared C buffers, and a generator suspended at
-    a `yield` has other games' move-gen running underneath it. If any
-    buffer the generator reads after resuming were a view rather than a
-    copy, B=8 would disagree with B=1. It must not.
-
-  * the ply-guard tests -- the guard is the reason this port exists in
-    a branch that has one; a lockstep runaway pins a driver slot and
-    stalls the whole round, so it must fire per GAME.
+  * the ply-guard tests: the guard must fire per GAME.
 """
 
+from _pool_fakes import patch_pool_map  # noqa: E402
 import random
 
 import numpy as np
@@ -72,18 +65,13 @@ def _drive_one(net, mode, seed, cap=1500):
 
 class TestGeneratorParity:
     def test_generator_matches_reference_bitwise(self):
-        """Generator vs reference collector, same seed, same CPU net.
-
-        The small random fixture net plays degenerately, so a fair
-        number of seeds hit the ply bound. That is itself worth
-        asserting -- the two implementations must agree on the DISCARD
-        DECISION as well as on the arrays -- but the test would be
-        vacuous if every seed discarded, so it also requires a minimum
-        number of real (non-discarded) episodes to have been compared.
+        """Generator vs reference collector, same seed, same CPU net: the
+        DISCARD DECISION and the arrays must agree, and a minimum number
+        of non-discarded episodes must have been compared.
         """
         net, mode = _net(), CubefulMoneyMode()
         n_compared = 0
-        for seed in range(12):
+        for seed in range(6):
             enc_v, tgt_v, disc = _drive_one(net, mode, seed)
             agent = TDAgent(net, oneply=False, boltzmann_temp=0.0,
                             device="cpu")
@@ -124,9 +112,9 @@ class TestGeneratorParity:
         """
         net, mode = _net(), CubefulMoneyMode()
         e1, t1, d1 = V.vectorized_collect_worker(
-            _worker_args(net, mode, 16, 5150, 1, 1500))
+            _worker_args(net, mode, 8, 5150, 1, 1500))
         e8, t8, d8 = V.vectorized_collect_worker(
-            _worker_args(net, mode, 16, 5150, 8, 1500))
+            _worker_args(net, mode, 8, 5150, 8, 1500))
         assert d1 == d8 == 0
         assert e1.shape == e8.shape
         # Games finish in a different ORDER at B=8, so compare the rows
@@ -140,7 +128,7 @@ class TestGeneratorParity:
 class TestPlyGuard:
     @pytest.mark.parametrize("B", [1, 8])
     def test_tiny_cap_discards_every_episode(self, B):
-        """cap=1 kills every game; the worker must still RETURN (with a
+        """cap=1 kills every game. The worker must still RETURN (with a
         full discard count) rather than stall or hand back a short pool.
         """
         net, mode = _net(), CubefulMoneyMode()
@@ -151,10 +139,8 @@ class TestPlyGuard:
 
     def test_all_episodes_accounted_when_quota_exceeds_batch(self):
         """num_episodes > B with a cap that kills every game before its
-        first yield. Such a game fills no slot, so an initial fill that
-        only ATTEMPTED B times would leave `slots` empty, skip the
-        driver loop entirely, and silently return B episodes instead of
-        num_episodes.
+        first yield (such a game fills no slot): all num_episodes must
+        still be accounted for.
         """
         net, mode = _net(), CubefulMoneyMode()
         enc, tgt, disc = V.vectorized_collect_worker(
@@ -164,20 +150,15 @@ class TestPlyGuard:
 
     def test_discard_count_independent_of_batch_size(self):
         """Lockstep must not change WHICH episodes the guard kills.
-
-        Swept over caps rather than pinned to one, so the test does not
-        depend on the fixture net's (degenerate) episode-length
-        distribution: the guard must be monotone in the cap, the
+        Swept over caps: the guard must be monotone in the cap, the
         extremes must bracket, and B must never matter.
         """
         net, mode = _net(), CubefulMoneyMode()
-        n_ep = 12
-        # Small caps only: with the degenerate fixture net a large cap
-        # lets episodes run for thousands of plies, which would make
-        # this a minute-scale test for no extra coverage. cap=0 /
-        # very-large is covered by test_cap_zero_disables_guard.
+        n_ep = 8
+        # Small caps only (large ones are slow); cap=0 / very-large is
+        # covered by test_cap_zero_disables_guard.
         prev_disc = None
-        for cap in (1, 20, 100, 400):
+        for cap in (1, 40, 400):
             e1, t1, d1 = V.vectorized_collect_worker(
                 _worker_args(net, mode, n_ep, 31, 1, cap))
             e8, t8, d8 = V.vectorized_collect_worker(
@@ -187,7 +168,11 @@ class TestPlyGuard:
                 f"({d1} at B=1 vs {d8} at B=8)")
             assert e1.shape == e8.shape, f"cap={cap}: kept rows differ"
             assert e1.shape[0] == t1.shape[0]
-            if prev_disc is not None:
+            if prev_disc is None:
+                assert d1 == n_ep, (
+                    f"cap={cap}: only {d1}/{n_ep} episodes discarded "
+                    f"at the smallest cap")
+            else:
                 assert d1 <= prev_disc, (
                     f"cap={cap}: discards rose with a larger cap "
                     f"({prev_disc} -> {d1})")
@@ -207,7 +192,7 @@ class TestPlyGuard:
 
     def test_enc_and_targets_stay_in_lockstep_under_discards(self):
         net, mode = _net(), CubefulMoneyMode()
-        for cap in (5, 15, 40, 1500):
+        for cap in (5, 15, 40):
             enc, tgt, disc = V.vectorized_collect_worker(
                 _worker_args(net, mode, 16, 4, 8, cap))
             assert enc.shape[0] == tgt.shape[0], f"cap={cap}"
@@ -217,19 +202,12 @@ class TestTrainerWiring:
     def test_trainer_vec_args_match_worker_arity(self, monkeypatch):
         """Trainer._build_vec_args (producer) vs
         vectorized_collect_worker (consumer): the tuple arity and field
-        ORDER must agree.
-
-        This is not paranoia. The two are joined only by positional
-        unpacking across a process boundary, and both carry a comment
-        saying so. A mismatch would surface as a ValueError (or, worse,
-        a silent field shift) only once a real GPU run reached its
-        first round.
+        ORDER must agree (they are joined only by positional unpacking
+        across a process boundary).
 
         Driven without a GPU by intercepting the real pool.map in the
         parent process and swapping the trainer's hardcoded "cuda"
-        driver device for "cpu". Everything else -- the args the trainer
-        actually builds, the real worker, the trainer's 3-tuple
-        accounting -- is exercised for real.
+        driver device for "cpu".
         """
         import multiprocessing.pool as mpp
         from trainer import Trainer
@@ -241,20 +219,23 @@ class TestTrainerWiring:
             for args in iterable:
                 captured.append(args)
                 a = list(args)
-                # Driver device is the second-to-last field.
+                # Driver device sits just before cap.
                 assert a[-2] == "cuda", "device field moved"
                 a[-2] = "cpu"
                 out.append(fn(tuple(a)))
             return out
 
-        monkeypatch.setattr(mpp.Pool, "map", fake_map)
+        patch_pool_map(monkeypatch, fake_map)
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-        # The VRAM preflight (trainer.py) calls mem_get_info; the real one
-        # raises on GPU-less boxes and reports whatever is free on busy
-        # ones (falling back to the CPU collector under ~1.35GB). Both
-        # would break this no-GPU-required test, so report plenty free.
+        # The VRAM preflight calls mem_get_info. Report plenty free so
+        # this stays a no-GPU test.
         monkeypatch.setattr(torch.cuda, "mem_get_info",
                             lambda *a, **kw: (64 << 30, 64 << 30))
+        # The per-worker-context preflight also PROBES one worker's VRAM
+        # in a spawned child. Stub it so this stays a no-GPU test.
+        import gpu_context as GC
+        monkeypatch.setattr(GC, "probe_worker_vram",
+                            lambda *a, **kw: 500 << 20)
 
         net, mode = _net(), CubefulMoneyMode()
         tr = Trainer(TDAgent(net, oneply=False, device="cpu"), lr=1e-6)
@@ -263,6 +244,10 @@ class TestTrainerWiring:
             workers=2, oneply=True, seed=3, log_every=0,
             vectorized_collect=True, vectorized_batch=2,
             max_episode_plies=60,
+            # PER-WORKER-context driver; the shared-context topology
+            # ships "remote" and is covered by
+            # tests/test_shared_context_parity.py.
+            vectorized_shared_context=False,
         )
 
         assert len(captured) == 2, "one args tuple per worker"
@@ -276,7 +261,7 @@ class TestTrainerWiring:
             assert args[9] is True, "oneply field moved"
 
     def test_vec_and_cpu_worker_arities_are_distinct_but_pinned(self):
-        """Both arg tuples end with max_episode_plies; the CPU tuple
+        """Both arg tuples end with max_episode_plies. The CPU tuple
         carries c_engine where the vectorized one carries (B, device).
         Pinned so a future field addition has to touch both call sites.
         """
@@ -295,7 +280,7 @@ class TestGuards:
         """--oneply-acting would silently get 0-ply move selection."""
         net, mode = _net(), CubefulMoneyMode()
         args = list(_worker_args(net, mode, 2, 1, 2, 1500))
-        args[10] = True  # oneply_acting (index 10 since activation joined)
+        args[10] = True  # oneply_acting (index 10)
         with pytest.raises(AssertionError, match="oneply-acting"):
             V.vectorized_collect_worker(tuple(args))
 

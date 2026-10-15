@@ -1,0 +1,43 @@
+host: A (Ryzen 9 9950X) | x86_64 | 16 physical cores (32 logical) | GPU NVIDIA GeForce RTX 4080 16376 MiB driver 595.84 | 2.13.0+cu132 13.2 | 2026-09-04
+protocol: rounds=8 episodes/round=500 repeats=2 lr=1e-08 seed=12345; ep/s = steady state over rounds 2..n (Round-line timestamps); VRAM = peak nvidia-smi used minus idle
+
+== cubeful (train_batch.py)
+ W req       mode W used            ep/s per repeat    mean  spread   peak VRAM MiB per repeat     max  notes
+     4 per-worker      4                168.7/168.0   168.4      0%                  2203/2203    2203  
+     4     shared      4                174.2/175.5   174.8      1%                  1376/1376    1376  
+     8 per-worker      8                239.8/239.8   239.8      0%                  4072/4092    4092  
+     8     shared      8                262.1/263.0   262.5      0%                  1416/1416    1416  
+    12 per-worker     12                266.8/270.6   268.7      1%                  5922/5942    5942  
+    12     shared     12                291.7/281.9   286.8      3%                  1396/1416    1416  
+    16 per-worker     16                268.0/267.7   267.9      0%                  7731/7751    7751  
+    16     shared     16                309.7/305.1   307.4      1%                  1398/1378    1398  
+    24 per-worker     21                256.5/259.1   257.8      1%                  9498/9478    9498  NOTE: VRAM preflight capped GPU collection workers 24 -> 21 (15693 MB free, 677 MB/worker 
+    24     shared     24                290.3/288.8   289.6      1%                  1258/1218    1258  
+    32 per-worker     21                257.7/258.2   257.9      0%                  9458/9518    9518  NOTE: VRAM preflight capped GPU collection workers 32 -> 21 (15693 MB free, 677 MB/worker 
+    32     shared     32                274.1/271.6   272.9      1%                  1098/1098    1098  
+   fit per-worker: peak VRAM ~= 661 MiB + 426 MiB x W   (over W used = [4, 8, 12, 16, 21])
+   fit     shared: peak VRAM flat, <= 1416 MiB at every W   (over W used = [4, 8, 12, 16, 24, 32]; slope not > 0)
+   extrapolated per-worker: W=48: 20.6 GB  W=64: 27.3 GB  W=96: 40.6 GB  W=128: 53.9 GB
+   extrapolated     shared: W=48: 1.4 GB  W=64: 1.4 GB  W=96: 1.4 GB  W=128: 1.4 GB  (flat; add ~0.5-1 GB per extra eval-server process, one per 16 workers)
+
+== prob5 (train_prob5.py)
+ W req       mode W used            ep/s per repeat    mean  spread   peak VRAM MiB per repeat     max  notes
+     4 per-worker      4                122.7/122.4   122.5      0%                  2961/2961    2961  
+     4     shared      4                127.4/126.8   127.1      0%                  2476/2496    2496  
+     8 per-worker      8                193.3/193.5   193.4      0%                  4282/4322    4322  
+     8     shared      8                207.9/210.2   209.0      1%                  1676/1696    1696  
+    12 per-worker     12                226.1/230.0   228.1      2%                  5604/5604    5604  
+    12     shared     12                260.9/254.6   257.7      2%                  1416/1436    1436  
+    16 per-worker     16                234.1/235.1   234.6      0%                  6945/6885    6945  
+    16     shared     16                271.6/276.3   274.0      2%                  1296/1256    1296  
+    24 per-worker     24                226.8/223.8   225.3      1%                  9448/9448    9448  
+    24     shared     24                270.8/264.8   267.8      2%                  1136/1136    1136  
+    32 per-worker     28                218.9/217.9   218.4      0%                10848/10888   10888  NOTE: VRAM preflight capped GPU collection workers 32 -> 28 (15695 MiB free, 516 MiB/worke
+    32     shared     32                244.5/246.6   245.6      1%                  1056/1056    1056  
+   fit per-worker: peak VRAM ~= 1670 MiB + 327 MiB x W   (over W used = [4, 8, 12, 16, 24, 28])
+   fit     shared: peak VRAM flat, <= 2496 MiB at every W   (over W used = [4, 8, 12, 16, 24, 32]; slope not > 0)
+   extrapolated per-worker: W=48: 17.0 GB  W=64: 22.1 GB  W=96: 32.3 GB  W=128: 42.5 GB
+   extrapolated     shared: W=48: 2.4 GB  W=64: 2.4 GB  W=96: 2.4 GB  W=128: 2.4 GB  (flat; add ~0.5-1 GB per extra eval-server process, one per 16 workers)
+
+
+NOTE: a 'shared' fit with slope <= 0 is reported flat, not extrapolated.

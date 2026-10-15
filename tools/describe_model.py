@@ -3,8 +3,8 @@
 describe_model.py -- Print architecture and training info for a saved model.
 
 Usage:
-    python3 describe_model.py model.pt
-    python3 describe_model.py model1.pt model2.pt ...
+    python3 tools/describe_model.py model.pt
+    python3 tools/describe_model.py model1.pt model2.pt ...
 """
 
 import argparse

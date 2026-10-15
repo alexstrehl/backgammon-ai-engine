@@ -1,0 +1,15 @@
+# Cube capped at 64 for BOTH sides (--cube-cap 64): neither side is offered
+# a double at cube 64, HedgeHog's CUBE_MAX_VALUE ceiling made symmetric.
+# Jacoby on, no bearoff database on either side. With the
+# cap the raw mean equals the capped(+/-128) mean (no game exceeds 192 =
+# 3x64). Each npz records cube_cap=64; run.py --combine refuses to pool
+# them with uncapped runs. fox = fox v0.34, aureus = aureus v0.12 (md5s in
+# ../HEDGEHOG.md). Engine e8847f498f7be8798c0b71314e83c8b4075f2043, played
+# 2026-10-10, side1 md5 6afda0f85b039a186f018753120ed74c through the C API (simd).
+# Models: fox v0.34 240a6a1605d58c44decf4fc3db413559, aureus v0.12
+# 379f8f20dd2b0ce05f9e24f05098fb87.
+# Per-game raws available on request; CIs recreatable via run.py --combine.
+side1,side1_md5,side1_plies,side2,side2_plies,mode,games,cube_cap,edge_mEq,ci_lo,ci_hi,win_pct,status
+PureTD_4L,6afda0f8,0,hedgehog-fox_v0.34,0,cubeful-money,10000000,64,68.5,66.7,70.4,52.6,current
+PureTD_4L,6afda0f8,0,hedgehog-aureus_v0.12,0,cubeful-money,10000000,64,47.8,46.0,49.7,53.2,current
+PureTD_4L,6afda0f8,0,hedgehog-fox_v0.34,1,cubeful-money,4000000,64,18.0,15.2,21.1,51.4,current

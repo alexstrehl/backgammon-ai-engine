@@ -1,8 +1,7 @@
 """
-train_cli.py -- Shared helpers for train_online.py and train_batch.py.
-
-Keeps the per-script files small by factoring out network/mode
-construction, the resume path, and a vs-Random eval helper.
+train_cli.py -- Shared helpers for train_online.py and train_batch.py:
+common CLI args, network/mode construction (fresh, resume, expand,
+warm-start), and a vs-Random eval.
 """
 
 import argparse
@@ -17,19 +16,20 @@ from model import TDNetwork, suggested_depth_expand_eps
 from modes import CubefulMoneyMode, CubelessMoneyMode, DMPMode
 
 
+DEFAULT_HIDDEN = "40"
+DEFAULT_OUTPUT_MODE = "probability"
+
+
 def parse_hidden_sizes(s: str):
     """Parse '80,40' → [80, 40]."""
     return [int(x) for x in s.split(",") if x]
 
 
 def resolve_save_path(save: str, game_mode: str, hidden_sizes) -> str:
-    """Normalize --save so both `path/to/file.pt` and `path/to/dir/`
-    work, and so missing parent directories are created rather than
-    causing torch.save to silently fail.
-
-    If `save` is a directory (existing or trailing-separator), generate
-    a deterministic filename inside it from the game mode and hidden
-    sizes, e.g. `models/dmp_512_512_256.pt`.
+    """Normalize --save: a directory (existing or trailing-separator)
+    gets a filename from the game mode and hidden sizes, e.g.
+    `models/dmp_512_512_256.pt`. Missing parent directories are
+    created.
     """
     if save.endswith(("/", "\\")) or os.path.isdir(save):
         hidden_str = "_".join(str(h) for h in hidden_sizes)
@@ -51,12 +51,9 @@ def build_mode(name: str, jacoby: bool = True):
 
 
 def apply_cubeful_money_upgrades(args) -> None:
-    """In-place cubeful-money auto-upgrades on parsed CLI args: the
-    encoder must include the cube one-hot and the output must be equity.
-    Overrides silently if the user left the defaults; errors if they set
-    conflicting flags. No-op unless game_mode == "cubeful-money" (and not
-    resuming, where the saved architecture wins). Shared by train_online
-    and train_batch.
+    """Cubeful-money needs a cubeful_* encoder and equity output.
+    Upgrades the defaults in place. Errors on conflicting flags. No-op
+    unless game_mode == "cubeful-money" and not resuming.
     """
     if args.game_mode == "cubeful-money" and not args.resume:
         if args.encoder == "perspective196":
@@ -76,18 +73,19 @@ def apply_cubeful_money_upgrades(args) -> None:
 
 
 def build_network(args) -> TDNetwork:
-    """Construct, resume, or expand a TDNetwork from CLI args.
+    """Construct, resume, expand, or warm-start a TDNetwork from CLI args.
 
     Mutually-exclusive sources (in priority order):
-      --resume       — load and continue with the saved architecture
-      --expand       — load and width-expand to --hidden
-      --expand-depth — load and depth-expand by appending one hidden layer
-      (none)         — fresh network with --hidden / --output-mode / --encoder
+      --resume             continue with the saved architecture
+      --expand             width-expand to --hidden
+      --expand-depth       append one hidden layer
+      --warm-start-equity  probability -> equity head
+      --warm-start-cubeful 196 -> 200 inputs, equity head
+      (none)               fresh --hidden / --output-mode / --encoder
 
-    --output-mode and --encoder are inherited from the source network
-    when resuming or expanding (CLI overrides are ignored with a warning).
+    Resuming or expanding inherits --output-mode and --encoder from
+    the source (CLI overrides are ignored with a warning).
     """
-    # Mutual exclusivity guard
     warm_start_eq = getattr(args, "warm_start_equity", None)
     warm_start_cf = getattr(args, "warm_start_cubeful", None)
     sources = [args.resume, args.expand, args.expand_depth,
@@ -104,13 +102,16 @@ def build_network(args) -> TDNetwork:
             f"Resumed from {args.resume}: hidden={net.hidden_sizes} "
             f"output_mode={net.output_mode} encoder={net.encoder_name}"
         )
-        cli_hidden = parse_hidden_sizes(args.hidden) if args.hidden else None
+        # Warn only on values the user set: the parser defaults are not None.
+        cli_hidden = (parse_hidden_sizes(args.hidden)
+                      if args.hidden and args.hidden != DEFAULT_HIDDEN else None)
         if cli_hidden and cli_hidden != net.hidden_sizes:
             print(
                 f"  WARN: --hidden {args.hidden} ignored "
                 f"(saved network has {net.hidden_sizes})"
             )
-        if args.output_mode and args.output_mode != net.output_mode:
+        if (args.output_mode and args.output_mode != DEFAULT_OUTPUT_MODE
+                and args.output_mode != net.output_mode):
             print(
                 f"  WARN: --output-mode {args.output_mode} ignored "
                 f"(saved network has {net.output_mode})"
@@ -137,7 +138,7 @@ def build_network(args) -> TDNetwork:
             raise SystemExit(
                 "ERROR: --expand-depth requires --expand-depth-eps. There is "
                 "no default on purpose -- the safe value is net-specific "
-                "(measurements in model.py, DEPTH_EXPAND_EPS_SCALE).\n"
+                "(DEPTH_EXPAND_EPS_SCALE in model.py is a starting point).\n"
                 f"  --expand-depth-eps 0.0     exact copy, but symmetric\n"
                 f"  --expand-depth-eps {suggested_depth_expand_eps(w):.6f}  suggested "
                 f"starting point for width {w}\n"
@@ -160,7 +161,7 @@ def build_network(args) -> TDNetwork:
         return net
 
     if warm_start_cf:
-        net = _warm_start_cubeful(warm_start_cf)
+        net = _warm_start_cubeful(warm_start_cf, args.encoder)
         return net
 
     return TDNetwork(
@@ -171,10 +172,9 @@ def build_network(args) -> TDNetwork:
 
 
 def _warm_start_equity(path: str, reinit_output: bool = True) -> TDNetwork:
-    """Load a probability-output model and convert to equity output.
-
-    Copies all hidden layer weights. If reinit_output=True, re-initializes
-    the output layer; if False, copies the output layer weights as-is.
+    """Load a probability-output model as an equity-output net. Hidden
+    layers are copied. The output layer is re-initialized unless
+    reinit_output=False.
     """
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     old_output = checkpoint.get("output_mode", "probability")
@@ -213,20 +213,37 @@ def _warm_start_equity(path: str, reinit_output: bool = True) -> TDNetwork:
     return net
 
 
-def _warm_start_cubeful(path: str) -> TDNetwork:
-    """Load a 196-input model and extend to cubeful (200-input).
-
-    Copies the first 196 columns of the input layer from the pretrained
-    model. The 4 new columns (cube features) get Kaiming initialization.
-    Output mode is set to equity.
+def _warm_start_cubeful(path: str,
+                        encoder_name: str = "cubeful_perspective196",
+                        ) -> TDNetwork:
+    """Load a base-input model as a cubeful equity net of the encoder's
+    width (200 for cubeful_perspective196). The base input columns are
+    copied. The new cube columns keep their fresh init. A non-cubeful
+    `encoder_name` (the CLI default) selects cubeful_perspective196.
     """
+    from encoding import get_encoder
+
+    if not encoder_name.startswith("cubeful_"):
+        encoder_name = "cubeful_perspective196"
+    encoder = get_encoder(encoder_name)
+    if not isinstance(encoder, CubefulEncoder):
+        raise ValueError(
+            f"--warm-start-cubeful requires a cubeful encoder; got "
+            f"--encoder {encoder_name!r}")
+
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     old_hidden = checkpoint["hidden_sizes"]
     old_input = checkpoint.get("input_size", 196)
     old_activation = checkpoint.get("activation", "relu")
 
-    encoder = CubefulEncoder()
-    new_input = encoder.num_features  # 200 (196 + CUBE_FEATURES)
+    n_base = encoder._base.num_features
+    if old_input != n_base:
+        raise ValueError(
+            f"--warm-start-cubeful expects a {n_base}-input base model "
+            f"(encoder {encoder.base_name}); {path} has {old_input} "
+            f"inputs. A cubeful checkpoint resumes with --resume."
+        )
+    new_input = encoder.num_features  # base + encoder.cube_features
 
     net = TDNetwork(
         hidden_sizes=old_hidden,
@@ -248,13 +265,14 @@ def _warm_start_cubeful(path: str) -> TDNetwork:
 
     net.load_state_dict(new_state)
     print(f"Warm-started cubeful from: {path}")
-    print(f"  Input: {old_input} -> {new_input}, output -> equity")
+    print(f"  Input: {old_input} -> {new_input} "
+          f"(+{encoder.cube_features} cube columns), output -> equity")
     print(f"  Hidden: {old_hidden}, encoder: {encoder.name}")
     return net
 
 
 def eval_vs_random(agent, n_games: int = 200, seed: int = 99) -> float:
-    """Play `n_games` of `agent` (WHITE) vs RandomAgent. Returns win rate."""
+    """Win rate of `agent` (WHITE) over `n_games` vs RandomAgent."""
     rng = random.Random(seed)
     rnd = RandomAgent()
     wins = 0
@@ -274,7 +292,7 @@ def eval_vs_random(agent, n_games: int = 200, seed: int = 99) -> float:
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
-    """Args shared by train_online.py and train_batch.py."""
+    """Flags shared by train_online.py and train_batch.py."""
     g_arch = parser.add_argument_group("network / game")
     g_arch.add_argument("--game-mode",
                         choices=["dmp", "cubeless-money", "cubeful-money"],
@@ -288,10 +306,10 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
                              "don't count while the cube is centered. "
                              "Ignored for non-cubeful modes. Default: on.")
     g_arch.add_argument("--output-mode", choices=["probability", "equity"],
-                        default="probability",
+                        default=DEFAULT_OUTPUT_MODE,
                         help="Network output: 'probability' (sigmoid P(win)) or "
                              "'equity' (linear ±3). Ignored when --resume is set.")
-    g_arch.add_argument("--hidden", default="40",
+    g_arch.add_argument("--hidden", default=DEFAULT_HIDDEN,
                         help="Comma-separated hidden layer sizes, e.g. '40' or '80,40'. "
                              "Ignored when --resume is set.")
     g_arch.add_argument("--encoder", default="perspective196")
@@ -341,8 +359,8 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     g_io.add_argument("--warm-start-cubeful", default=None, metavar="PATH",
                       help="Initialize a cubeful money model from any "
                            "196-input model (DMP or cubeless money). Extends "
-                           "input 196->200 (adds cube features), sets output "
-                           "to equity.")
+                           "the input to the --encoder's width (200 for "
+                           "cubeful_perspective196), sets output to equity.")
     g_io.add_argument("--save", default=None,
                       help="Path to save the trained network at the end of the run.")
 

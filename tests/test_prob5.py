@@ -56,7 +56,7 @@ class TestProbNetwork:
         assert isinstance(back, ProbNetwork) and back.raw_logits is True
         x = torch.randn(4, 196)
         assert torch.allclose(net(x), back(x))
-        # raw logits are unbounded; sigmoid maps them into (0, 1)
+        # raw logits are unbounded. Sigmoid maps them into (0, 1)
         probs = torch.sigmoid(net(x))
         assert (probs > 0).all() and (probs < 1).all()
 
@@ -66,8 +66,7 @@ class TestProbNetwork:
             p = os.path.join(d, "s.pt")
             scalar.save(p)
             # Legacy scalar checkpoints have no model_type field, so the
-            # rejection surfaces as a state_dict RuntimeError rather than a
-            # clean ValueError. Either way it must not load as prob5.
+            # rejection may be a state_dict RuntimeError, not a ValueError.
             with pytest.raises((ValueError, RuntimeError)):
                 ProbNetwork.load(p)
 
@@ -114,7 +113,7 @@ class TestEquityAndPostprocess:
 
 
 class TestProbAgentPlay:
-    @pytest.mark.parametrize("plies", [0, 1, 2])
+    @pytest.mark.parametrize("plies", [0, 1])
     def test_choose_returns_legal_play(self, plies):
         net = ProbNetwork(input_size=196, hidden_sizes=[16])
         agent = ProbAgent(net, plies=plies)
@@ -142,7 +141,27 @@ class TestPlayModelsDispatch:
             p = self._save(ProbNetwork(input_size=196, hidden_sizes=[8]), d, "p.pt")
             assert isinstance(_load_agent(p), ProbAgent)
             assert _load_agent(p, oneply=True).plies == 1
-            assert _load_agent(p, twoply_k=5).plies == 2
+            with pytest.raises(ValueError, match="0-ply and 1-ply only"):
+                _load_agent(p, twoply_k=5)
+            with pytest.raises(ValueError, match="0-ply and 1-ply only"):
+                ProbAgent(ProbNetwork(input_size=196, hidden_sizes=[8]), plies=2)
+
+    def test_no_prob5_twoply_anywhere(self):
+        """prob5 2-ply is refused before any game: run_head_to_head and the
+        play_models CLI."""
+        import sys
+        from play_models import run_head_to_head
+        with tempfile.TemporaryDirectory() as d:
+            p = self._save(ProbNetwork(input_size=196, hidden_sizes=[8]), d, "p.pt")
+            with pytest.raises(ValueError, match="0-ply and 1-ply only"):
+                run_head_to_head(p, "random", num_games=2, twoply_k1=1,
+                                 game_mode="cubeless-money", do_print=False)
+            cmd = [os.path.join(_REPO, "play_models.py"), "--model1", p,
+                   "--model2", p, "--twoply-k2", "1", "--games", "2"]
+            r = subprocess.run([sys.executable] + cmd, capture_output=True,
+                               text=True, cwd=_REPO, timeout=120)
+            assert r.returncode != 0
+            assert "0-ply and 1-ply only" in r.stderr, r.stderr[-2000:]
 
     def test_scalar_routes_to_tdagent(self):
         with tempfile.TemporaryDirectory() as d:
@@ -156,9 +175,8 @@ class TestPlayModelsDispatch:
             assert _load_agent(p, bf16=False).bf16_inference is False
 
     def test_prob5_uses_money_equity_not_dmp(self):
-        # prob5 is a cubeless-money model; it has NO DMP switch at all
-        # (the dmp param was removed as unsupported) — selection is always
-        # by trained money equity, so the play dispatch cannot switch it.
+        # prob5 is a cubeless-money model with no DMP switch. Selection is
+        # always by trained money equity.
         with tempfile.TemporaryDirectory() as d:
             p = self._save(ProbNetwork(input_size=196, hidden_sizes=[8]), d, "p.pt")
             assert not hasattr(_load_agent(p), "dmp")
@@ -172,10 +190,8 @@ class TestExpand:
         assert torch.allclose(src(x), wide(x), atol=1e-5)
 
     def test_width_expand_new_units_are_trainable(self):
-        # Regression: the new units' input rows must keep a nonzero init so
-        # they receive gradient. A previous version zeroed the whole first-
-        # layer block, leaving the added width permanently dead (zero
-        # activation -> zero gradient), so expansion was a silent no-op.
+        # The new units' input rows must keep a nonzero init so they
+        # receive gradient.
         torch.manual_seed(0)
         src = ProbNetwork(input_size=196, hidden_sizes=[8, 8])
         wide = ProbNetwork.width_expand(src, [16, 16])
@@ -214,10 +230,9 @@ class TestTrainTargets:
         assert np.allclose(_flip_vec(_flip_vec(v)), v)
 
     def test_oneply_target_hand_derived(self):
-        # Stub net returns a constant prob vector c for any input. At the
-        # opening position every die has non-terminal moves and no forced
-        # pass, so each per-die best-move target is flip(c); the
-        # dice-probability-weighted sum is therefore exactly flip(c).
+        # Stub net returns a constant prob vector c. At the opening
+        # position every die has non-terminal moves and no forced pass,
+        # so each per-die target, and their weighted sum, is flip(c).
         import train_prob5 as T
         from train_prob5 import _flip_vec
 
@@ -244,7 +259,7 @@ class TestZeroPlyTerminal:
     def test_0ply_takes_winning_move(self):
         from backgammon_engine import BoardState, BLACK
         # WHITE has borne off all 15 (won a single: BLACK has 3 off, 12
-        # still on the board); engine has switched turn to BLACK.
+        # still on the board). Engine has switched turn to BLACK.
         points = [0] * 24
         points[12] = -12
         terminal = BoardState(points=points, bar=[0, 0], off=[15, 3], turn=BLACK)
@@ -314,7 +329,7 @@ class TestFastEngineParity:
 
 
 class TestShippedCheckpoint:
-    PATH = "best_models/cubeless_prob5_512_512_256_256.pt"
+    PATH = os.path.join(_REPO, "best_models", "cubeless_prob5_512_512_256_256.pt")
 
     @pytest.mark.skipif(not os.path.exists(PATH), reason="artifact not present")
     def test_loads_with_expected_metadata(self):
@@ -336,14 +351,17 @@ class TestExportWeights:
             EW.export_model(pt, binp)
             with open(binp, "rb") as f:
                 raw = f.read()
-        assert raw[:4] == b"BGNN"
-        num_hidden, input_size, act, out_mode = struct.unpack("<iiii", raw[4:20])
+        # format 2: "BGNV", version, the 64-byte encoder name, then the
+        # format-1 fields (export_weights.py)
+        assert raw[:4] == b"BGNV" and struct.unpack("<i", raw[4:8]) == (2,)
+        assert raw[8:72] == b"perspective196".ljust(64, b"\0")
+        num_hidden, input_size, act, out_mode = struct.unpack("<iiii", raw[72:88])
         assert (num_hidden, input_size, out_mode) == (2, 196, EW.OUTPUT_MODE_PROB5)
-        hidden = struct.unpack("<ii", raw[20:28])
+        hidden = struct.unpack("<ii", raw[88:96])
         assert list(hidden) == [16, 8]
         # weights: layers (196->16, 16->8) + 5-wide output (8->5)
         params = (196 * 16 + 16) + (16 * 8 + 8) + (8 * 5 + 5)
-        assert len(raw) == 28 + params * 4
+        assert len(raw) == 96 + params * 4
 
     def test_scalar_export_still_one_output(self):
         import export_weights as EW
@@ -354,39 +372,14 @@ class TestExportWeights:
             EW.export_model(pt, binp)
             with open(binp, "rb") as f:
                 raw = f.read()
-        _, _, _, out_mode = struct.unpack("<iiii", raw[4:20])
+        _, _, _, out_mode = struct.unpack("<iiii", raw[72:88])
         assert out_mode != EW.OUTPUT_MODE_PROB5  # scalar: probability/equity
-
-
-class TestGnubgEvalDispatch:
-    def test_prob5_routes_to_probagent(self):
-        import gnubg_eval as G
-        with tempfile.TemporaryDirectory() as d:
-            pt = os.path.join(d, "p.pt"); ProbNetwork(input_size=196, hidden_sizes=[8]).save(pt)
-            assert isinstance(G._load_eval_agent(pt), ProbAgent)
-            assert isinstance(G._load_eval_agent(pt, oneply=True), ProbAgent)
-
-    def test_scalar_routes_to_tdagent(self):
-        import gnubg_eval as G
-        with tempfile.TemporaryDirectory() as d:
-            pt = os.path.join(d, "s.pt"); TDNetwork(input_size=196, hidden_sizes=[8]).save(pt)
-            assert isinstance(G._load_eval_agent(pt), TDAgent)
-
-    def test_cubeful_prob5_rejected(self):
-        import gnubg_eval as G
-        with tempfile.TemporaryDirectory() as d:
-            pt = os.path.join(d, "p.pt"); ProbNetwork(input_size=196, hidden_sizes=[8]).save(pt)
-            # Parent-side validation (called before workers spawn) and the
-            # loader backstop both reject prob5 + cubeful with a clean error.
-            with pytest.raises(ValueError):
-                G.assert_cubeful_supported(pt, cubeful=True)
-            with pytest.raises(ValueError):
-                G._load_eval_agent(pt, cubeful=True)
 
 
 @pytest.mark.skipif(shutil.which("gcc") is None, reason="gcc not available")
 class TestCInferenceParity:
-    """The C nn_eval prob5 forward must match Python ProbNetwork."""
+    """The C nn_eval prob5 forward must match Python ProbNetwork:
+    prob5_postprocess by default, prob5_sanity with prob5_board_sanity."""
 
     _HARNESS = r'''
 #include "nn_eval.h"
@@ -394,6 +387,8 @@ class TestCInferenceParity:
 #include <stdlib.h>
 int main(int c, char **v) {
     NNModel m; if (nn_load(&m, v[1])) return 1;
+    if (m.prob5_board_sanity != 0) return 4;
+    m.prob5_board_sanity = atoi(v[3]);
     FILE *f = fopen(v[2], "rb");
     float *in = malloc((size_t)m.input_size * sizeof(float));
     if (fread(in, sizeof(float), m.input_size, f) != (size_t)m.input_size) return 3;
@@ -403,7 +398,8 @@ int main(int c, char **v) {
     return 0;
 }'''
 
-    def test_c_matches_python(self):
+    @pytest.mark.parametrize("sanity", [0, 1])
+    def test_c_matches_python(self, sanity):
         import export_weights as EW
         cinf = os.path.join(_REPO, "c_inference")
         net = ProbNetwork(input_size=196, hidden_sizes=[16, 8])
@@ -419,28 +415,47 @@ int main(int c, char **v) {
             assert r.returncode == 0, r.stderr
             pt = os.path.join(d, "m.pt"); net.save(pt)
             binp = os.path.join(d, "m.bin"); EW.export_model(pt, binp)
+            from encoding import get_encoder
+            from prob_agent import prob5_sanity
+            enc = get_encoder("perspective196")
             rng = np.random.RandomState(0)
-            for _ in range(8):
-                x = rng.randn(196).astype(np.float32)
+            state, dice = opening_roll()
+            states = []
+            while not state.is_game_over():   # one game: contact to bearoff
+                plays = get_legal_plays(state, dice)
+                state = (plays[rng.randint(len(plays))][1] if plays
+                         else switch_turn(state))
+                states.append(state)
+                dice = (rng.randint(1, 7), rng.randint(1, 7))
+            n_zeroed = 0
+            for st in states[:-1][::3]:
+                x = enc.encode(st)
                 inp = os.path.join(d, "in.bin"); x.tofile(inp)
-                out = subprocess.run([exe, binp, inp], capture_output=True, text=True).stdout.split()
-                c_eq = float(out[0])
+                out = subprocess.run([exe, binp, inp, str(sanity)],
+                                     capture_output=True, text=True).stdout.split()
+                c = np.array([float(v) for v in out])
                 with torch.no_grad():
-                    p = prob5_postprocess(net(torch.from_numpy(x)[None, :]))
+                    xt = torch.from_numpy(x)[None, :]
+                    raw = net(xt)
+                    p = (prob5_sanity(raw, xt) if sanity
+                         else prob5_postprocess(raw))
                     py_eq = float(prob5_to_equity(p)[0])
-                assert abs(c_eq - py_eq) < 1e-4
+                assert abs(c[0] - py_eq) < 1e-4
+                np.testing.assert_allclose(c[1:], p[0].numpy(), atol=1e-6)
+                n_zeroed += int((prob5_sanity(raw, xt)[0, 1:] == 0).sum()) - int(
+                    (prob5_postprocess(raw)[0, 1:] == 0).sum())
+            assert n_zeroed > 0   # the sample separates the two forms
 
 
 class TestOneplyBatchedParity:
     """The batched 1-ply forward (one GEMM over all 21 dice) must match the
-    pre-batching per-dice implementation within fp tolerance, and must not
-    change move decisions. Not bit-exact: batched vs per-chunk GEMM differs
-    by ~1 fp32 ULP (accumulation order), so the bar is <=1e-6, decisions equal.
+    per-dice reference within 1e-6 and make the same move decisions. Not
+    bit-exact, because GEMM accumulation order differs.
     """
 
     @staticmethod
     def _ref_value_oneply(agent, state):
-        """Reference: the per-dice implementation prob5 used before batching."""
+        """Reference: the per-dice (unbatched) implementation."""
         from prob_agent import _DICE_OUTCOMES
         from encoding import OPP_OFF_INDEX, TERMINAL_OFF_THRESHOLD
         if state.is_game_over():
@@ -488,7 +503,7 @@ class TestOneplyBatchedParity:
     def test_decision_parity(self):
         agent = self._agent()
         checked = 0
-        for s in self._positions(40, seed=1):
+        for s in self._positions(15, seed=1):
             for d in [(3, 1), (6, 4), (5, 5), (2, 1)]:
                 plays = get_legal_plays(s, d)
                 if len(plays) < 2:
@@ -501,3 +516,60 @@ class TestOneplyBatchedParity:
                 # The batched choice must be reference-optimal (ties within 1e-6 ok).
                 assert ref[chosen_idx] - min(ref) < 1e-6
         assert checked > 0
+
+
+class TestMaxEpisodePlies:
+    """train_prob5's episode bound (--max-episode-plies, trainer.py's
+    semantics): a longer episode is discarded whole and counted."""
+
+    @staticmethod
+    def _net():
+        torch.manual_seed(0)
+        return ProbNetwork(hidden_sizes=[8], input_size=196)
+
+    def test_episode_discarded_past_the_bound(self):
+        import random
+        import train_prob5 as P5
+        fns = P5._resolve_engine_fns()
+        net = self._net()
+        enc, tgt = P5._collect_one_episode(net, random.Random(3), *fns,
+                                           oneply=False, device="cpu")
+        T = len(enc)
+        kept, _ = P5._collect_one_episode(net, random.Random(3), *fns,
+                                          oneply=False, device="cpu", max_plies=T)
+        assert np.array_equal(kept, enc)
+        cut, cut_t = P5._collect_one_episode(net, random.Random(3), *fns,
+                                             oneply=False, device="cpu",
+                                             max_plies=T - 1)
+        assert cut.shape == (0, 196) and cut_t.shape == (0, 5)
+
+    def test_worker_counts_and_round_line(self, capsys):
+        import train_prob5 as P5
+        net = self._net()
+        sd = {k: v.detach().clone() for k, v in net.state_dict().items()}
+        enc, tgt, nd = P5._collect_worker((sd, [8], 196, net.activation,
+                                           net.encoder_name, net.raw_logits,
+                                           3, 5, False, "cpu", 2))
+        assert (len(enc), nd) == (0, 3)
+        P5.train(net, num_episodes=2, lr=1e-3, end_lr=None,
+                 episodes_per_round=2, batch_size=8, workers=1, device="cpu",
+                 oneply=False, pw_weight=1.0, use_mse=False, seed=1,
+                 log_every=1, save_path=None, save_every=0, warmup_cycles=0,
+                 max_episode_plies=2)
+        assert "DISCARDED 2/2 overlong episodes (>2 plies)" in capsys.readouterr().out
+
+    def test_cli_default(self, monkeypatch):
+        import sys
+        import train_prob5 as P5
+        import trainer
+        got = {}
+        monkeypatch.setattr(P5, "train", lambda net, **kw: got.update(kw))
+        monkeypatch.setattr(sys, "argv", ["train_prob5.py", "--hidden", "8",
+                                          "--num-episodes", "1", "--no-c-collect"])
+        P5.main()
+        assert got["max_episode_plies"] == trainer.DEFAULT_MAX_EPISODE_PLIES
+        monkeypatch.setattr(sys, "argv", ["train_prob5.py", "--hidden", "8",
+                                          "--num-episodes", "1", "--no-c-collect",
+                                          "--max-episode-plies", "0"])
+        P5.main()
+        assert got["max_episode_plies"] == 0

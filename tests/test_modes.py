@@ -20,9 +20,8 @@ from model import TDNetwork
 
 
 def _terminal_state_with_winner(winner: int, *, gammon=False, backgammon=False) -> BoardState:
-    """Build a synthetic terminal BoardState where `winner` has borne off
-    all 15 checkers. Per the engine turn convention, the
-    returned state has `turn = loser` (the engine would have switched
+    """Synthetic terminal BoardState where `winner` has borne off all 15
+    checkers. `turn = loser`, per the engine convention (it switches
     after the winning move)."""
     state = BoardState(
         points=[0] * 24,
@@ -36,11 +35,11 @@ def _terminal_state_with_winner(winner: int, *, gammon=False, backgammon=False) 
     if backgammon:
         # Loser has a checker in the winner's home board
         if loser == WHITE:
-            # WHITE's home = idx 0-5; for backgammon, WHITE-as-loser must have
+            # WHITE's home = idx 0-5. For backgammon, WHITE-as-loser must have
             # a checker in BLACK's home (idx 18-23). WHITE checkers are positive.
             state.points[18] = 1
         else:
-            # BLACK's home = idx 18-23; loser BLACK with a checker in WHITE's
+            # BLACK's home = idx 18-23. Loser BLACK with a checker in WHITE's
             # home (idx 0-5). BLACK checkers are negative.
             state.points[5] = -1
     elif gammon:
@@ -114,10 +113,8 @@ class TestTerminalAssertions:
             CubelessMoneyMode().make_terminal_outcome(state)
 
     def test_state_with_winner_on_roll_raises(self):
-        # If state.turn == winner (instead of the loser), the assertion
-        # should fire — under the new convention the engine has
-        # already switched after the winning move so the loser is on
-        # roll at terminal.
+        # state.turn == winner must fire the assertion. The loser is
+        # on roll at terminal.
         state = _terminal_state_with_winner(WHITE)
         state = switch_turn(state)  # now winner is on roll: invalid
         with pytest.raises(AssertionError, match="state.turn"):
@@ -239,9 +236,8 @@ class TestCubefulMoneyTerminal:
         assert outcome.cube_value == 2
         net = TDNetwork(hidden_sizes=[8], output_mode="equity")
         agent = TDAgent(net)
-        # Target is PER-UNIT: gammon → 2.0. cube_value lives on
-        # the outcome as metadata but doesn't scale the training target
-        # (the network is trained at cube_value=1).
+        # Target is PER-UNIT: gammon → 2.0. cube_value does not scale
+        # it (the network is trained at cube_value=1).
         assert agent.terminal_target(outcome) == 2.0
 
     def test_no_jacoby_keeps_gammon_centered(self):
@@ -265,9 +261,8 @@ class TestCubefulMoneyTerminal:
 
 
 class TestModeOutputModeValidation:
-    """Money modes must reject probability-output agents — probability
-    can't represent gammon (2) or backgammon (3) terminal targets, so
-    the gammon signal is silently dropped during training."""
+    """Money modes must reject probability-output agents, which cannot
+    represent gammon (2) or backgammon (3) terminal targets."""
 
     def test_money_rejects_probability_agent(self):
         net = TDNetwork(hidden_sizes=[8], output_mode="probability")
@@ -333,7 +328,7 @@ class TestTDAgentCubeActions:
         m = MatchState()
         offer = agent.offer_double(state, m)
         # Replace v_double_take in the cache with a sentinel that
-        # would change the take/pass decision; verify respond uses it.
+        # would change the take/pass decision. Verify respond uses it.
         offer._cache["v_double_take_0ply"] = 1.2  # > 1.0 → pass
         assert agent.respond_to_double(state, m, hint=offer) is False
         offer._cache["v_double_take_0ply"] = 0.8  # ≤ 1.0 → take
@@ -351,7 +346,7 @@ class TestTDAgentCubeActions:
 
     def test_offer_double_huge_advantage_doubles_and_offered_passes(self):
         """White borne off 14, last checker on 1: model would predict
-        nearly +1 equity. Should double; opponent should pass."""
+        nearly +1 equity. Should double. Opponent should pass."""
         agent = _make_cubeful_agent()
         state = BoardState(
             points=[0]*24, bar=[0,0], off=[14, 0], turn=WHITE,
@@ -363,10 +358,8 @@ class TestTDAgentCubeActions:
         assert offer.should_double is True
 
     def test_cubeless_agent_falls_back_to_passive_cube_policy(self):
-        """A cubeless TDAgent dropped into cubeful play shouldn't
-        crash — it should use the Agent-base default ('never offer,
-        always take'). This lets a cubeless model act as a baseline
-        opponent in cubeful matches."""
+        """A cubeless TDAgent in cubeful play must use the Agent-base
+        default ('never offer, always take')."""
         net = TDNetwork(hidden_sizes=[8], output_mode="equity")
         agent = TDAgent(net)
         offer = agent.offer_double(BoardState.initial(), MatchState())

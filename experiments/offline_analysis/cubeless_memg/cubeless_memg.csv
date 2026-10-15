@@ -1,7 +1,0 @@
-player,model_md5,config,chequer_mEMG,ci_lo,ci_hi,n_games,status
-prob5-0ply,ac95a983,prod prob5 4L256,1.350,1.320,1.380,4000,current
-prob5-1ply,ac95a983,full-width 1-ply,0.690,0.680,0.710,4000,current
-gnubg-ext-0ply,,gnubg 1.08 ext,2.878,2.825,2.933,4000,current
-gnubg-ext-1ply,,gnubg 1.08 ext full/unpruned,1.626,1.591,1.660,4000,current
-sage-0ply,,native production filter,3.007,2.949,3.066,4000,current
-sage-1ply,,SAGE_UNPRUNED (paper row),1.670,1.626,1.717,4000,current

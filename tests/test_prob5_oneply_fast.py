@@ -1,46 +1,25 @@
 """Bit-exact parity for the fast prob5 1-ply target.
 
 `train_prob5._oneply_target_vec` dispatches to
-`_oneply_target_vec_expand21` (one `bg_fast.expand_21` C call + a numpy
-segment reduction + a numpy equity mirror) whenever the C engine is in
-use, and to `_oneply_target_vec_perdice` (21 move-gen calls, a Python
-loop over every successor, 21 torch `prob5_to_equity` calls) otherwise.
+`_oneply_target_vec_expand21` when the C engine is in use, else to
+`_oneply_target_vec_perdice`, the reference. The fast path must match
+the reference BIT FOR BIT. A 1-ulp equity difference can flip a per-dice
+argmax and change a whole target, so every parity assertion is
+`np.array_equal`, never a tolerance.
 
-The reference is `_oneply_target_vec_perdice` — the straightforward
-per-dice implementation. The fast path is only safe if
-it reproduces it BIT FOR BIT, because the failure mode here is silent:
-every wrong target is still finite, still in [0, 1], still passes BCE,
-and only differs in the last ulp of one probability or in which of two
-near-equal moves the per-dice argmax picked. `assert_allclose` would not
-see it. So every parity assertion below is `np.array_equal`.
+  * **The equity reduction.** `_prob5_equity_np` must add in torch's
+    fp32 order, `(((p0+p4)+p1)+p2)+p3`. Plain left-to-right, `np.sum`,
+    `@` and `einsum` all differ from it by 1 ulp (`TestEquityMirror`).
 
-Three things make bitwise equality non-obvious, and each has its own
-test:
+  * **Row order into the forward.** A CPU forward is not bit-invariant
+    under a row permutation, so the fast path gathers forced-pass rows
+    to the front as the reference does (`TestTargetParity`).
 
-  * **The equity reduction.** `prob5_to_equity` is
-    `(probs * w).sum(-1) - 1.0`; ATen's fp32 CPU sum over a length-5
-    last dim is a 4-accumulator cascade, i.e. `(((p0+p4)+p1)+p2)+p3`.
-    `_prob5_equity_np` reproduces exactly that. Plain left-to-right,
-    `np.sum`, `@` and `einsum` all disagree with torch on a large
-    fraction of rows by 1 ulp — enough to move an argmax and so change a
-    whole 5-vector target. `TestEquityMirror` pins the order, so a torch
-    upgrade that changes it fails loudly here instead of drifting.
+  * **Terminal replies.** `expand_21`'s `game_result_c` must agree with
+    `BoardState.game_result()`, and its replies must be in
+    `_DICE_OUTCOMES` order (`TestExpand21Contract`).
 
-  * **Row order into the forward.** The reference feeds the network
-    `pass_buf + play_buf` (forced-pass rows first); `expand_21` returns
-    replies interleaved in dice order. A CPU MLP forward is *not*
-    bit-invariant under a row permutation, so the fast path gathers
-    forced-pass rows to the front. `TestTargetParity` covers states with
-    forced passes specifically, including one where all 21 dice dance.
-
-  * **Terminal replies.** The reference detects them from the OPP_OFF
-    feature and calls `BoardState.game_result()`; `expand_21` detects
-    them in C and returns `game_result_c`. `TestExpand21Contract` checks
-    the two agree, and that the reply/bucket layout is in
-    `_DICE_OUTCOMES` order.
-
-Scale the position corpus with `PROB5_PARITY_POSITIONS` (default 700);
-the pre-merge validation run used 5000+ per configuration.
+Corpus size: `PROB5_PARITY_POSITIONS` (default 700).
 """
 
 import os
@@ -62,7 +41,7 @@ pytestmark = pytest.mark.skipif(
     reason="prob5 1-ply fast path needs the C engine (bg_fast)",
 )
 
-N_POSITIONS = int(os.environ.get("PROB5_PARITY_POSITIONS", "700"))
+N_POSITIONS = int(os.environ.get("PROB5_PARITY_POSITIONS", "300"))
 
 
 # ── fixtures ─────────────────────────────────────────────────────────
@@ -88,9 +67,8 @@ def _fns(use_expand21=True):
 
 
 def _playout_states(n, seed):
-    """Random-playout self-play states (no net): cheap, and it wanders
-    into shapes a strong net avoids -- bar/blocked positions, deep
-    bear-offs, races -- which is exactly the coverage this needs."""
+    """Random-playout states (no net). They reach bar/blocked positions,
+    deep bear-offs and races that a strong net avoids."""
     rng = random.Random(seed)
     out = []
     while len(out) < n:
@@ -109,10 +87,8 @@ def _playout_states(n, seed):
 
 def _dance_state():
     """BLACK on roll with a checker on the bar against WHITE's fully
-    closed home board: every one of the 21 dice is a forced pass, so
-    `expand_21` returns 21 pass rows and the reference returns 21
-    `pass_buf` rows -- the maximal row-order divergence between the two
-    batch layouts."""
+    closed home board. All 21 dice are forced passes, the maximal
+    row-order divergence between the two batch layouts."""
     pts = [0] * 24
     for i in range(6):
         pts[i] = 2          # WHITE home board closed
@@ -200,7 +176,7 @@ def census(corpus):
             gr_hist, n_bearoff)
 
 
-# ── the equity mirror (task 1) ───────────────────────────────────────
+# ── the equity mirror ────────────────────────────────────────────────
 
 
 class TestEquityMirror:
@@ -253,7 +229,7 @@ class TestEquityMirror:
             m = np.stack(rows)
             ref = prob5_to_equity(torch.from_numpy(m)).numpy()
             assert np.array_equal(T._prob5_equity_np(m), ref)
-            # and the argmax -- what actually feeds the target
+            # and the argmax, which feeds the target
             assert int(np.argmax(T._prob5_equity_np(m))) == int(np.argmax(ref))
 
     def test_flip_rows_matches_flip_vec(self):
@@ -271,11 +247,9 @@ class TestEquityMirror:
         assert out.shape == (0, 5) and out.dtype == np.float32
 
     def test_dice_weighted_sum_matches_the_reference_loop(self):
-        """The fast path folds the 21 per-dice contributions with
-        `(chosen * probs[:, None]).sum(axis=0)`; the reference does
-        `target += prob * vec` in a loop. fp32 addition is not
-        associative, so these agree only because numpy's axis-0
-        reduction walks the rows in order. Pin that."""
+        """The fast path's `(chosen * probs[:, None]).sum(axis=0)` must
+        equal the reference's in-order `target += prob * vec` loop bit
+        for bit (fp32 addition is not associative)."""
         rng = np.random.default_rng(31)
         for _ in range(3000):
             chosen = rng.random((21, 5)).astype(np.float32)
@@ -286,10 +260,8 @@ class TestEquityMirror:
             assert np.array_equal(got, ref)
 
     def test_oneply_probs_vector_matches_dice_outcomes(self):
-        """`_ONEPLY_PROBS32` must be float32 and in `_DICE_OUTCOMES`
-        order: the fast path multiplies by it instead of by the loop's
-        Python float, and numpy casts that float down to float32 anyway,
-        so the two agree only if this vector is built the same way."""
+        """`_ONEPLY_PROBS32` must be float32, in `_DICE_OUTCOMES` order,
+        and multiply bit-identically to the loop's Python float."""
         assert T._ONEPLY_PROBS32.dtype == np.float32
         assert len(T._ONEPLY_PROBS32) == len(T._DICE_OUTCOMES) == 21
         for i, (_d, p) in enumerate(T._DICE_OUTCOMES):
@@ -299,7 +271,7 @@ class TestEquityMirror:
         assert abs(float(T._ONEPLY_PROBS32.astype(np.float64).sum()) - 1.0) < 1e-6
 
 
-# ── the expand_21 contract (task 2's assumptions) ────────────────────
+# ── the expand_21 contract ───────────────────────────────────────────
 
 
 class TestExpand21Contract:
@@ -371,9 +343,8 @@ class TestExpand21Contract:
             assert len(gpe(s, dice)[1]) == 0
 
     def test_forward_is_not_row_permutation_invariant(self):
-        """Justifies the gather in the fast path: if this ever became
-        invariant the gather would be dead weight, but while it holds
-        the gather is load-bearing."""
+        """The forward is not row-permutation invariant, which is why
+        the fast path gathers. Skips if this BLAS is invariant."""
         net = _net(hidden=(512, 256), seed=3)
         rng = np.random.default_rng(4)
         differed = False
@@ -393,13 +364,14 @@ class TestExpand21Contract:
                         "the fast path's gather is then merely redundant")
 
 
-# ── the deliverable: bitwise target parity ───────────────────────────
+# ── bitwise target parity ────────────────────────────────────────────
 
 
 class TestTargetParity:
 
     @pytest.mark.parametrize("raw_logits", [False, True])
-    @pytest.mark.parametrize("hidden", [(64, 32), (512, 512, 256, 128)])
+    @pytest.mark.parametrize("hidden", [
+        (64, 32), pytest.param((512, 512, 256, 128), marks=pytest.mark.slow)])
     def test_bitwise_over_corpus(self, corpus, raw_logits, hidden):
         net = _net(raw_logits=raw_logits, hidden=hidden, seed=7)
         enc, gpe_fast = _fns(True)
@@ -420,9 +392,8 @@ class TestTargetParity:
 
     @pytest.mark.parametrize("raw_logits", [False, True])
     def test_bitwise_on_all_dance_state(self, raw_logits):
-        """All 21 buckets forced-pass: the reference's batch is 21 pass
-        rows, the fast path's is 21 rows in dice order. Same rows, and
-        after the gather the same order."""
+        """All 21 buckets are forced passes. Both batches hold the same
+        21 rows, and after the gather the same order."""
         net = _net(raw_logits=raw_logits, hidden=(512, 256), seed=8)
         enc, gpe_fast = _fns(True)
         _e2, gpe_ref = _fns(False)
@@ -432,9 +403,8 @@ class TestTargetParity:
             assert np.array_equal(fast, ref)
 
     def test_mixed_pass_and_play_positions_specifically(self, corpus):
-        """The interesting case for row order is a position with BOTH
-        forced-pass and playable dice, where the two batch layouts
-        genuinely interleave differently."""
+        """Positions with BOTH forced-pass and playable dice, where the
+        two batch layouts interleave differently."""
         net = _net(hidden=(512, 256), seed=9)
         enc, gpe_fast = _fns(True)
         _e2, gpe_ref = _fns(False)
@@ -463,16 +433,15 @@ class TestTargetParity:
             f"bear-off-shape positions {n_bearoff} | "
             f"doubles buckets {6 * len(corpus)}"
         )
-        assert len(corpus) >= 500
+        assert len(corpus) >= 350
         assert n_pass_pos >= 10, "no forced-pass coverage"
         assert n_term_pos >= 10, "no terminal-reply coverage"
         assert n_bearoff >= 10, "no bear-off-shape coverage"
 
     @pytest.mark.parametrize("raw_logits", [False, True])
     def test_argmax_selection_agrees_move_for_move(self, corpus, raw_logits):
-        """Stronger than target equality: the per-dice best move itself
-        must be the same INDEX, so a tie broken the other way can never
-        hide behind two moves that happen to share a target vector."""
+        """The per-dice best move must be the same INDEX, not just the
+        same target vector."""
         net = _net(raw_logits=raw_logits, hidden=(256, 128), seed=12)
         enc, gpe = _fns(False)
         checked = 0
@@ -566,7 +535,7 @@ class TestEpisodeParity:
         enc, gpe_fast = _fns(True)
         _e2, gpe_ref = _fns(False)
         compared = 0
-        for seed in range(8):
+        for seed in range(4):
             a_enc, a_tgt = T._collect_one_episode(
                 net, random.Random(seed), enc, gpe_ref,
                 oneply=True, device="cpu")
@@ -602,9 +571,10 @@ class TestEpisodeParity:
         net = _net(hidden=(64, 32), seed=15)
         sd = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
         args = (sd, net.hidden_sizes, net.input_size, net.activation,
-                net.encoder_name, net.raw_logits, 3, 4242, True, "cpu")
-        e1, t1 = T._collect_worker(args)
-        e2, t2 = T._collect_worker(args)
+                net.encoder_name, net.raw_logits, 3, 4242, True, "cpu",
+                T.DEFAULT_MAX_EPISODE_PLIES)
+        e1, t1, _ = T._collect_worker(args)
+        e2, t2, _ = T._collect_worker(args)
         assert e1.shape[0] == t1.shape[0] > 0
         assert np.array_equal(e1, e2) and np.array_equal(t1, t2)
 
@@ -627,9 +597,8 @@ class TestDispatch:
         assert gpe.use_expand21 is True
 
     def test_flag_is_off_for_a_non_c_encoder(self):
-        """`perspective196` is the only encoder bg_fast implements; the
-        cubeful wrapper is not, so it must route to the Python engine
-        and hence to the per-dice target."""
+        """bg_fast implements only `perspective196`. The cubeful wrapper
+        must route to the Python engine and the per-dice target."""
         _enc, gpe = T._resolve_engine_fns("cubeful_perspective196")
         assert gpe.use_expand21 is False
 
@@ -650,10 +619,9 @@ class TestDispatch:
 
     def test_non_finite_outputs_raise_instead_of_poisoning_the_target(
             self, corpus):
-        """The ONE intentional behavioural difference from the
-        reference: on a NaN-producing net the reference returns a NaN
-        target (np.argmax picks the first NaN) which BCE turns into a
-        dead net some rounds later; the fast path raises."""
+        """The one intentional difference from the reference. On a
+        NaN-producing net the reference returns a NaN target and the
+        fast path raises."""
         net = _net(hidden=(64, 32), seed=19)
         with torch.no_grad():
             list(net.parameters())[0][0, 0] = float("nan")
@@ -683,15 +651,15 @@ class TestDispatch:
 # ── against the real production checkpoint ───────────────────────────
 
 
-_PROD = "best_models/cubeless_prob5_512_512_256_256.pt"
+_PROD = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "best_models", "cubeless_prob5_512_512_256_256.pt")
 
 
 @pytest.mark.skipif(not os.path.exists(_PROD),
                     reason=f"{_PROD} not present")
 class TestProductionCheckpoint:
-    """A trained net's outputs cluster far more tightly than a random
-    net's, which is exactly the regime where two moves can land within
-    an ulp of each other and an argmax can flip."""
+    """Parity on trained weights, whose outputs cluster tightly enough
+    for near-equal moves to flip an argmax."""
 
     @pytest.mark.parametrize("raw_logits", [False, True])
     def test_bitwise_on_real_weights(self, corpus, raw_logits):

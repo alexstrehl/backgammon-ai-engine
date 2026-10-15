@@ -1,15 +1,14 @@
 """
 modes.py -- Game-mode abstractions for backgammon training.
 
-A GameMode describes one game type: initial state, episode (full game or match) 
-boundary, terminal outcome construction.
+A GameMode describes one game type: initial state, episode (full game
+or match) boundary, terminal outcome construction.
 
 Mode × output_mode pairing
 --------------------------
 GameMode and TDAgent.output_mode are orthogonal axes paired at
-training time. The coupling is the `TerminalOutcome` dataclass: the
+training time. The coupling is the `TerminalOutcome` dataclass. The
 Mode populates fields and the Agent reads the fields it cares about.
-New modes can extend TerminalOutcome.
 
   | Game          | Output mode | Terminal value         | Status     |
   |---------------|-------------|------------------------|------------|
@@ -19,12 +18,12 @@ New modes can extend TerminalOutcome.
   | CubefulMoney  | equity      | game_result × cube_val | ✓ exact    |
 
 Terminal call convention: at terminal `state.turn` is the LOSER
-because the engine already switched after the winning move; the
+because the engine already switched after the winning move. The
 mode asserts `state.winner() == 1 - state.turn`.
 
-Cubeful modes additionally carry a MatchState (cube ownership and
-cube value) alongside the BoardState. Cubeless modes never produce
-one — `initial_match_state()` returns None.
+Cubeful modes also carry a MatchState (cube ownership and cube value)
+alongside the BoardState. Cubeless modes never produce one. Their
+`initial_match_state()` returns None.
 """
 
 from dataclasses import dataclass, replace
@@ -108,7 +107,7 @@ class GameMode:
 
     def validate_agent(self, agent) -> None:
         """Reject incompatible agents at training-loop entry. Default
-        accepts everything; modes with a hard requirement override.
+        accepts everything. Modes with a hard requirement override.
         """
         return
 
@@ -133,7 +132,7 @@ def _require_equity_output(mode_name: str, agent) -> None:
 
 
 class CubelessMoneyMode(GameMode):
-    """Cubeless money: episode = single game; gammons (2x) and
+    """Cubeless money: episode = single game. Gammons (2x) and
     backgammons (3x) carried in TerminalOutcome. Requires an
     equity-output agent.
     """
@@ -158,7 +157,7 @@ class CubelessMoneyMode(GameMode):
 
 
 class DMPMode(GameMode):
-    """Double Match Point: episode = single game; gammons don't matter."""
+    """Double Match Point: episode = single game. Gammons don't matter."""
 
     def is_episode_over(self, state: BoardState) -> bool:
         return state.is_game_over()
@@ -173,7 +172,7 @@ class DMPMode(GameMode):
 
 
 class CubefulMoneyMode(GameMode):
-    """Cubeful money. Carries a MatchState; terminal target multiplies
+    """Cubeful money. Carries a MatchState. Terminal target multiplies
     game_result by cube_value. Under Jacoby (default), gammons and
     backgammons only count once the cube has been turned.
     """

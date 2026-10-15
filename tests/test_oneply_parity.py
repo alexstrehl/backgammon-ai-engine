@@ -1,15 +1,9 @@
 """Parity harness for value_oneply_checker_cubeful.
 
-Generates a deterministic fixture of cubeful-money states via seeded
-self-play with a fixed-weight network, then runs current-vs-current
-checks on value_oneply_checker_cubeful: determinism (repeated calls
-agree exactly), bounded outputs, and bf16 inference parity with the
-fp32 reference.
-
-The fixture is regenerated on each test run (seeded), so there is no
-on-disk golden file to keep in sync. A future C/fast path for 1-ply
-target computation can plug into the same fixture and assert against
-the current Python reference at ~1e-5 tolerance.
+Seeded self-play with a fixed-weight network generates cubeful-money
+states, regenerated each run (no on-disk golden file). The tests check
+determinism, bounded outputs, and bf16 inference parity with the fp32
+reference.
 """
 
 import random
@@ -25,9 +19,8 @@ from modes import CubefulMoneyMode, MatchState, CubeOwner
 from model import TDNetwork
 from td_agent import TDAgent, cpu_supports_fast_bf16
 
-# bf16 inference is auto-disabled on CPUs without bf16 ISA support
-# (torch emulation is ~20x slower than fp32), so its behavior can only
-# be tested on hosts that have it.
+# bf16 inference is auto-disabled on CPUs without bf16 ISA support, so
+# it can only be tested on hosts that have it.
 requires_bf16 = pytest.mark.skipif(
     not cpu_supports_fast_bf16(),
     reason="CPU lacks bf16 ISA (avx512_bf16/amx_bf16); "
@@ -37,8 +30,7 @@ requires_bf16 = pytest.mark.skipif(
 
 def _make_fixed_net(seed: int = 12345) -> TDNetwork:
     """Build a [512,512,256] cubeful_perspective196 equity net with
-    deterministic small weights. Architecture matches the production
-    3-layer cubeful model.
+    deterministic small weights.
     """
     torch.manual_seed(seed)
     net = TDNetwork(
@@ -46,9 +38,8 @@ def _make_fixed_net(seed: int = 12345) -> TDNetwork:
         encoder_name="cubeful_perspective196",
         output_mode="equity",
     )
-    # Shrink initial weights so the untrained net produces small,
-    # non-saturated outputs — better signal for detecting numerical
-    # drift in a fast path.
+    # Shrink initial weights so the untrained net's outputs are small
+    # and non-saturated.
     with torch.no_grad():
         for p in net.parameters():
             p.mul_(0.05)
@@ -58,9 +49,8 @@ def _make_fixed_net(seed: int = 12345) -> TDNetwork:
 def _generate_states(
     agent: TDAgent, n: int, seed: int = 42,
 ) -> List[Tuple[BoardState, MatchState]]:
-    """Seeded self-play to collect `n` (state, match_state) pairs at
-    cubeful-money decision points. Includes a mix of opening, midgame,
-    and bearoff positions. The cube may or may not have been turned.
+    """Seeded self-play collecting `n` (state, match_state) pairs at
+    cubeful-money decision points, across game phases and cube states.
     """
     mode = CubefulMoneyMode(jacoby=True)
     rng = random.Random(seed)
@@ -114,8 +104,8 @@ N_STATES = 200
 
 
 class TestOneplyCubefulParity:
-    """Current-vs-current determinism checks, plus a hook for the
-    future fast path to plug into.
+    """Determinism, bounds and bf16 parity of
+    value_oneply_checker_cubeful on the fixture states.
     """
 
     @pytest.fixture(scope="class")
@@ -135,7 +125,7 @@ class TestOneplyCubefulParity:
             1 for s, _ in states
             if s.off[0] > 0 or s.off[1] > 0
         )
-        # We want variety — not all openings, not all cube-eligible.
+        # Variety: not all openings, not all cube-eligible.
         assert cube_phases > 20
         assert bearoffs > 20
 
@@ -161,12 +151,8 @@ class TestOneplyCubefulParity:
 
     @requires_bf16
     def test_bf16_inference_parity(self, fixture):
-        """Bf16 inference path must match fp32 reference within a bf16-
-        precision tolerance. Bf16 has ~3 decimal digits of mantissa
-        (7-bit fraction), so per-value error is dominated by
-        accumulated rounding across the 4-layer MLP — empirically
-        well under 1e-2 on our 1-ply sums (which mix in fp32 terminal
-        results and probability weights, damping the error).
+        """Bf16 inference path must match the fp32 reference within a
+        bf16-precision tolerance.
         """
         net, agent, states = fixture
         refs = [agent.value_oneply_checker_cubeful(s, m) for s, m in states]
@@ -181,15 +167,14 @@ class TestOneplyCubefulParity:
         diffs = [abs(r - f) for r, f in zip(refs, fasts)]
         max_abs = max(diffs)
         mean_abs = sum(diffs) / len(diffs)
-        # Absolute tolerance picked to allow for the full bf16 rounding
-        # budget on a mid-depth MLP. Tighten if this drifts up.
+        # Absolute tolerance: the full bf16 rounding budget of a mid-depth
+        # MLP.
         assert max_abs < 1e-2, (
             f"bf16 1-ply diverges from fp32: max abs diff = {max_abs:.2e}, "
             f"mean = {mean_abs:.2e}"
         )
-        # Also require that the mean error is well below the tolerance
-        # — a uniformly large error would indicate a bug, not just
-        # rounding.
+        # The mean error must be well below the tolerance. A uniformly
+        # large error is a bug, not rounding.
         assert mean_abs < 2e-3, (
             f"bf16 1-ply mean error too high: {mean_abs:.2e}"
         )
@@ -197,22 +182,20 @@ class TestOneplyCubefulParity:
     @requires_bf16
     def test_bf16_refresh_after_weight_change(self, fixture):
         """After the fp32 weights change and refresh_bf16_inference()
-        is called, bf16 outputs must track the new weights (not stay
-        frozen at the pre-change snapshot).
+        is called, bf16 outputs must track the new weights.
         """
         net, agent, states = fixture
         bf16_agent = TDAgent(net, bf16_inference=True)
         s, m = states[0]
         v0 = bf16_agent.value_oneply_checker_cubeful(s, m)
 
-        # Perturb fp32 weights: scale the output layer. This produces
-        # a clean, large change in every output value, well above bf16
-        # rounding noise.
+        # Scale the output layer, which changes every output well above
+        # bf16 rounding noise.
         with torch.no_grad():
             net.fc_output.weight.mul_(1.5)
             net.fc_output.bias.add_(0.1)
 
-        # Without refresh, bf16 copy is stale — should give v0.
+        # Without refresh the bf16 copy is stale and gives v0.
         v_stale = bf16_agent.value_oneply_checker_cubeful(s, m)
         assert v_stale == v0, \
             "bf16 copy should be stale until refresh_bf16_inference()"

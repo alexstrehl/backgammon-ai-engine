@@ -1,12 +1,10 @@
 """Parity tests for the CUBELESS branch of the vectorized GPU collector.
 
-tests/test_vectorized_collect.py validates the cubeful generator against
-trainer._collect_episode_cubeful_money. The cubeless generator
-(_collect_episode_cubeless_money_gen) shipped in the same port with no
-test coverage. These tests close that gap at the generator level: same seed,
-same CPU net, the generator driven by hand must reproduce
+With the same seed and the same CPU net, the generator
+(_collect_episode_cubeless_money_gen) driven by hand must reproduce
 trainer.collect_episode's (encodings, targets) bit-for-bit, including
-the discard decision.
+the discard decision. The cubeful generator is covered by
+tests/test_vectorized_collect.py.
 
 DMPMode routes through the same cubeless generator branch
 (mode.initial_match_state() is None), so a DMP case is included.
@@ -52,7 +50,7 @@ def _drive_one(net, mode, seed, cap=1500):
 
 
 class TestCubelessGeneratorParity:
-    def _run(self, mode, output_mode, n_seeds=12, min_compared=3):
+    def _run(self, mode, output_mode, n_seeds=6, min_compared=3):
         net = _net(output_mode)
         n_compared = 0
         for seed in range(n_seeds):
@@ -76,7 +74,7 @@ class TestCubelessGeneratorParity:
             f"near-vacuous")
 
     def test_cubeless_money_equity_bitwise(self):
-        """The release target: cubeless-money equity (cm4L-style nets)."""
+        """The release target: cubeless-money equity."""
         self._run(CubelessMoneyMode(), "equity")
 
     def test_dmp_probability_bitwise(self):

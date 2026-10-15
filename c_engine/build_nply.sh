@@ -1,38 +1,32 @@
 #!/bin/bash
 # Build libbg_nply.so: fused move-gen + nn-eval + N-ply search.
 #
-# Needs a CBLAS exporting the standard LP64 symbol names (cblas_sgemm).
+# Needs OpenBLAS, not a generic BLAS: bg_nply.c calls
+# openblas_set_num_threads and links the LP64 cblas_sgemm.
 # On Debian/Ubuntu: `sudo apt install libopenblas-dev`.
-#
-# NOTE: numpy ships its own OpenBLAS in numpy.libs/, but that build is ILP64
-# with mangled symbols (scipy_cblas_sgemm64_) and does NOT export cblas_sgemm,
-# so it cannot satisfy this link without editing the sgemm calls in bg_nply.c.
+# numpy's bundled OpenBLAS (ILP64, mangled symbols) does NOT export
+# cblas_sgemm and cannot satisfy this link.
 set -e
 cd "$(dirname "$0")"
 
-# Resolve a BLAS: explicit override, then system (apt), then a conda tree.
+# Resolve OpenBLAS: explicit override, then system (apt), then a conda tree.
 if [ -n "${BLAS_LIB:-}" ]; then
     BLAS_LINK="$BLAS_LIB"
 elif ldconfig -p 2>/dev/null | grep -q "libopenblas\.so"; then
     BLAS_LINK="-lopenblas"
 elif [ -f /opt/conda/lib/libopenblas.so.0 ]; then
     BLAS_LINK="-Wl,-rpath,/opt/conda/lib /opt/conda/lib/libopenblas.so.0"
-elif ldconfig -p 2>/dev/null | grep -q "libblas\.so"; then
-    BLAS_LINK="-lblas"
 else
-    echo "FATAL: no usable CBLAS found." >&2
-    echo "  install one with:  sudo apt install libopenblas-dev" >&2
-    echo "  or set BLAS_LIB to a library exporting cblas_sgemm." >&2
+    echo "FATAL: OpenBLAS not found. bg_nply.c needs openblas_set_num_threads, so a generic BLAS will not link." >&2
+    echo "  install it with:  sudo apt install libopenblas-dev" >&2
+    echo "  or set BLAS_LIB to the link flags of an OpenBLAS exporting cblas_sgemm," >&2
+    echo "  e.g. BLAS_LIB='-Wl,-rpath,/path/to/lib /path/to/lib/libopenblas.so.0'" >&2
     exit 1
 fi
 echo "Building libbg_nply.so (BLAS: $BLAS_LINK) ..."
 
-# NO -ffast-math. It implies -ffinite-math-only, which lets the compiler
-# assume expf() never overflows to inf -- but the sigmoid is 1/(1+expf(-x)),
-# and a large negative pre-activation legitimately overflows (-> 0). With
-# the flag that path produced NaNs on real positions, silently poisoning
-# BCE targets. No speed cost: the hot path is OpenBLAS sgemm, which
-# compiler math flags do not touch.
+# NO -ffast-math. It implies -ffinite-math-only, but the sigmoid's expf()
+# legitimately overflows to inf, and the flag turns that into NaNs.
 gcc -O3 -march=native -funroll-loops -shared -fPIC \
     -o libbg_nply.so \
     bg_nply.c bg_engine.c ../c_inference/nn_eval.c \

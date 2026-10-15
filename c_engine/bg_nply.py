@@ -1,5 +1,5 @@
 """bg_nply -- Python binding for libbg_nply.so (fused move-gen + nn-eval
-N-ply search in C). Zero PyTorch in the inner loop.
+N-ply search in C). No PyTorch in the inner loop.
 
 Load a model once with `load_model(path_to_bin)` (a .bin exported by
 export_weights.py), then call the value/move functions with Python
@@ -13,7 +13,7 @@ import shutil
 import tempfile
 
 from backgammon_engine import BoardState, switch_turn  # noqa
-from c_engine.bg_fast import _CBoardState, _python_to_c  # reuse layout
+from c_engine.bg_cstructs import _CBoardState, _python_to_c  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SO = os.path.join(_HERE, "libbg_nply.so")
@@ -88,11 +88,10 @@ def value_2ply_generic(state: BoardState, k: int, flip_mode: int, term_mode: int
 def forward5(feats):
     """Batched raw 5-output forward for a loaded prob5 model.
 
-    `feats` is an (n, 196) float32 array of perspective196 encodings; the
+    `feats` is an (n, 196) float32 array of perspective196 encodings. The
     returned (n, 5) array holds the raw sigmoid outputs (no nested-event
-    postprocess, no scalar reduce) -- matching ProbNetwork(x) for a
-    sigmoid-output net. Use to drive prob5 1-ply target generation through
-    the C engine while keeping the Python flip/postprocess/equity logic.
+    postprocess, no scalar reduce), as ProbNetwork(x) returns for a
+    sigmoid-output net.
     """
     import numpy as np
     lib = _ensure_lib()
@@ -111,12 +110,30 @@ def forward5(feats):
     return out
 
 
+def _stale_for(bin_path: str) -> bool:
+    """True when bin_path is a format-2 export ("BGNV") and _SO is a
+    format-1-only build (no "BGNV" in it), which rejects it at the magic."""
+    try:
+        with open(bin_path, "rb") as f:
+            if f.read(4) != b"BGNV":
+                return False
+        with open(_SO, "rb") as f:
+            return b"BGNV" not in f.read()
+    except OSError:
+        return False
+
+
 def load_model(bin_path: str) -> None:
     """Load a .bin model into the C engine (replaces any previous)."""
     global _loaded_path
     lib = _ensure_lib()
     rc = lib.bgn_load(bin_path.encode())
     if rc != 0:
+        if _stale_for(bin_path):
+            # Not rebuilt here: other processes may have it loaded.
+            raise RuntimeError(f"bgn_load({bin_path}) failed: {_SO} predates "
+                               f"the format-2 export header; rebuild: "
+                               f"bash c_engine/build_nply.sh")
         raise RuntimeError(f"bgn_load({bin_path}) failed rc={rc}")
     _loaded_path = bin_path
 

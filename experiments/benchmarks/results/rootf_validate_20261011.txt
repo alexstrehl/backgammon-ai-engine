@@ -1,0 +1,7 @@
+# python experiments/benchmarks/rootf_validate.py --n 10000 --workers 16   (simd backend, full pools, 2026-10-11)
+prob5: 8000 pool items, 7054 with >= 2 candidates (mean 20.5 candidates)
+  root 0.08: agreement 100.00% (0 differ), mean loss 0.0000 mEq/decision (max 0.0), mean expanded 5.65 of 20.5
+  root 0.16: agreement 100.00% (0 differ), mean loss 0.0000 mEq/decision (max 0.0), mean expanded 8.25 of 20.5
+cubeful: 10000 pool items, 8073 with >= 2 candidates (mean 20.6 candidates)
+  root 0.08: agreement 99.91% (7 differ), mean loss 0.0102 mEq/decision (max 18.8), mean expanded 4.73 of 20.6
+  root 0.16: agreement 100.00% (0 differ), mean loss 0.0000 mEq/decision (max 0.0), mean expanded 6.73 of 20.6

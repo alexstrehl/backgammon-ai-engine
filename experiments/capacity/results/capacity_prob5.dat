@@ -1,0 +1,9 @@
+params	edge	ehi	elo	kind	label	anc	zen5	anc2
+103	-82.6	0.8	0.9	direct	1L	west	22837	west
+366	-12.1	0.8	0.9	direct	2L	west	7333	west
+496	-3.7	0.9	0.8	direct	3L	west	5726	west
+561	0	0	0	direct	4L	west	5032	west
+627	1.9	0.9	0.8	direct	5L	west	4571	west
+809	5.2	0.8	0.9	direct	5Lw	east	3619	west
+875	6.7	0.9	0.9	direct	6Lw	west	3332	east
+1071	9.7	0.9	0.8	direct	5Lww	west	2748	west

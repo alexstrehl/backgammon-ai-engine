@@ -1,13 +1,10 @@
 """RNG-independence guards for pooled head-to-head evaluation.
 
-Pooling H-H runs from several machines (combine_head_to_head) is only
-valid if every run's dice stream is independent. These tests pin the two
-guarantees that make that true:
+Pooling H-H runs (combine_head_to_head) is only valid if every run's
+dice stream is independent:
 
-1. Repeated identical invocations (same command, same args — as happens
-   when several boxes run the same repro command) must produce different
-   game streams: workers are seeded from OS entropy, never a fixed
-   default.
+1. Identical invocations must produce different game streams. Workers
+   are seeded from OS entropy, never a fixed default.
 2. combine_head_to_head must refuse to pool two files with identical
    per-game sequences (the symptom of a shared seed).
 """
@@ -30,7 +27,7 @@ def _run_random_h2h(games=60, workers=2):
 
 def test_identical_invocations_differ():
     """Two identical runs (same args, fresh pools) must not replay the
-    same games — this is what makes multi-machine pooling sound."""
+    same games; multi-machine pooling relies on this."""
     a = _run_random_h2h()
     b = _run_random_h2h()
     assert not np.array_equal(a, b), (

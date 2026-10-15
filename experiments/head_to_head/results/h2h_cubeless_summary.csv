@@ -1,13 +1,29 @@
-# Main-results convention (2026-08-09): gnubg = REAL gnubg 1.08.003 binary via
-# the external-player socket (side specs gnubg-ext / gnubg-ext-full); all 1-ply
-# opponents UNPRUNED (gnubg: prune nets off + keep-all filter; Sage:
-# SAGE_UNPRUNED=1). Cubeless criterion fix applied (chequer eval cubeful off).
-# Superseded wrapper-era rows (gnubg-nn in-process opponent): see git history.
-# Per-game npz raws retained offline; CIs recreatable via run.py --combine.
+# gnubg = REAL gnubg 1.08.003 binary via the external-player socket (side
+# specs gnubg-ext / gnubg-ext-full), chequer eval cubeful off. gnubg-ext and
+# opensage use their default move pruning; gnubg-ext-full and opensage_unpruned
+# (SAGE_UNPRUNED=1) are unpruned.
+# hedgehog-* = HedgeHog fox v0.34 / aureus v0.12 (HEDGEHOG.md), engine
+# e8847f498f7be8798c0b71314e83c8b4075f2043, played 2026-10-10, side1 md5
+# ac95a983a114c269257225e0b84a5d9f through the C API (simd). Models: fox v0.34
+# 240a6a1605d58c44decf4fc3db413559, aureus v0.12 379f8f20dd2b0ce05f9e24f05098fb87.
+# recipe_rerun rows: the retraining recipe (experiments/retraining/README.md)
+# run end to end, its final p5_restart checkpoint as side1 against production
+# (PureTD_prob5_ac95a983) as side2, so a tie reads ~0. Checkpoints: best_models/experimental/recipe_runs/.
+# opensage = bgsage 2.0.20260907, cubeless BgBotAnalyzer with its bearoff
+# database (OPENSAGE.md); the gnubg-ext-full row's opensage side is
+# best_move_index. Pooled outputs: prob5_vs_opensage*_cbl_*.txt.
+# Per-game raws available on request; CIs recreatable via run.py --combine.
+# not_in_paper rows: recorded, not reported in the paper.
 side1,side1_md5,side1_plies,side2,side2_plies,mode,games,edge_mEq,ci_lo,ci_hi,status
 PureTD_prob5,ac95a983,0,gnubg-ext,0,cubeless-money,10000000,45.8,45.0,46.7,current
 PureTD_prob5,ac95a983,0,gnubg-ext-full,1,cubeless-money,10000000,12.3,11.5,13.2,current
-PureTD_prob5,ac95a983,0,opensage,0,cubeless-money,10000000,40.0,39.2,40.9,current
-PureTD_prob5,ac95a983,0,opensage_unpruned,1,cubeless-money,10000000,8.6,7.8,9.5,current
-PureTD_prob5,ac95a983,0,PureTD_prob5_c8b2b265,0,cubeless-money,10000000,1.0,0.2,1.9,current
-gnubg-ext-full,,1,opensage_unpruned,1,cubeless-money,10000000,-3.4,-4.2,-2.5,current
+PureTD_prob5,ac95a983,0,opensage,0,cubeless-money,10000000,36.8,35.9,37.7,current
+PureTD_prob5,ac95a983,0,opensage_unpruned,1,cubeless-money,2000000,6.7,4.8,8.6,current
+PureTD_prob5,ac95a983,0,gnubg-ext,1,cubeless-money,10000000,12.1,11.2,12.9,current
+PureTD_prob5,ac95a983,0,opensage,1,cubeless-money,10000000,5.9,5.1,6.8,current
+gnubg-ext-full,,1,opensage_unpruned,1,cubeless-money,10000000,-4.6,-5.5,-3.8,not_in_paper
+PureTD_prob5,ac95a983,0,hedgehog-fox_v0.34,0,cubeless-money,10000000,26.6,25.7,27.5,current
+PureTD_prob5,ac95a983,0,hedgehog-fox_v0.34,1,cubeless-money,4000000,-0.8,-2.1,0.6,current
+PureTD_prob5,ac95a983,0,hedgehog-aureus_v0.12,0,cubeless-money,10000000,13.0,12.1,13.9,current
+recipe_p5_run1,64860333,0,PureTD_prob5_ac95a983,0,cubeless-money,20000000,-1.0,-1.6,-0.4,recipe_rerun
+recipe_p5_run2,5d130631,0,PureTD_prob5_ac95a983,0,cubeless-money,20000000,-0.0,-0.6,0.6,recipe_rerun

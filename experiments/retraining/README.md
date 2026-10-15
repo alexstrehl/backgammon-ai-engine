@@ -1,77 +1,84 @@
 # Retraining recipe
 
-This is the recipe we use for training a cubeful-money model from scratch
-to production strength. It follows the chain shape that trained
-`best_models/cubeful_money_512_512_256_256.pt`, with some schedule
-adjustments. An end-to-end replication at exactly these settings is in
-progress, and the recipe will be amended if it disagrees.
+The chain that trains the cubeful-money and prob5 models from scratch to
+production strength. It is the recipe behind
+[best_models/cubeful_money_512_512_256_256.pt](../../best_models/cubeful_money_512_512_256_256.pt)
+(md5 `6afda0f8`) and
+[best_models/cubeless_prob5_512_512_256_256.pt](../../best_models/cubeless_prob5_512_512_256_256.pt)
+(md5 `ac95a983`), with schedule adjustments, and was run end to end twice
+at these settings ([Results](#results)). Each architecture or task change
+runs a subsequence of: 0-ply at a constant LR, 0-ply annealed, 1-ply at a
+constant LR, 1-ply annealed, and for cubeful a second 1-ply anneal. 0-ply
+training uses sampled Bellman targets, 1-ply training exact Bellman targets.
 
-Each time the architecture changes (e.g. one hidden layer to two) or the task
-changes (e.g. DMP to cubeless money), we run a subsequence of the following:
-0-ply training at a constant learning rate, 0-ply with an annealed learning
-rate, 1-ply at a constant learning rate, and 1-ply with an annealed learning
-rate. Additionally, a second 1-ply annealed run is the final step, which we
-found necessary to reproduce production strength.
+1. DMP (double match point) 4L: progressive expansion from scratch (the ladder below).
+2. Cubeless equity 4L: `--warm-start-equity` from the DMP final.
+3. Cubeful 4L: `--warm-start-cubeful` from the cubeless final (input widens
+   196 to 200).
+4. prob5 4L: `train_prob5.py --warm-start-equity-trunk` from the cubeless
+   final (hidden layers copied, five-output head fresh). Steps 3 and 4 fork
+   from the same checkpoint and run independently.
 
-In the descriptions below, **0-ply** training means training on *Sampled
-Bellman Targets*, while **1-ply** training refers to training on *Exact
-Bellman Targets*.
+Legs at each task's final architecture (episodes, LR schedule). s1-s6 of the
+DMP ladder, a further 8.3M episodes, precede the DMP row. `wu20` =
+`--warmup-cycles 20`, on the three task transfers only.
 
-## Chain order
-
-1. **DMP 4L** — progressive expansion from scratch (ladder below).
-2. **Cubeless equity 4L** — `--warm-start-equity` from the DMP final.
-3. **Cubeful 4L** — `--warm-start-cubeful` from the cubeless final
-   (input widens 196 → 200).
-
-## Legs (episodes, LR schedule)
-
-| task | 0-ply const | 0-ply anneal (seed) | 1-ply const-LR | 1-ply anneal (descent) | 1-ply 2nd-anneal |
+| task | 0-ply const | 0-ply anneal (seed) | 1-ply const | 1-ply anneal (descent) | 1-ply 2nd anneal |
 |---|---|---|---|---|---|
 | DMP (final shape) | — | 9M, 5e-5 → 5e-6 | — | 1M, 1e-4 → 1e-5 | — |
-| cubeless equity | — | 16M, 5e-5 → 5e-6, **wu20** | 2.5M @ 1e-5 | 12M, 1e-5 → 9e-7 | — |
-| cubeful | **2M @ 1e-4, wu20** | 25M, 6e-5 → 5e-7 | 12M @ 1.8e-5 | 115M, 1.8e-5 → 3e-7 | **44M, 1.62e-5 → 2.7e-7** |
+| cubeless equity | — | 16M, 5e-5 → 5e-6, wu20 | 2.5M @ 1e-5 | 12M, 1e-5 → 9e-7 | — |
+| cubeful | 2M @ 1e-4, wu20 | 25M, 6e-5 → 5e-7 | 12M @ 1.8e-5 | 115M, 1.8e-5 → 3e-7 | 44M, 1.62e-5 → 2.7e-7 |
+| prob5 | — | 6M, 1e-4 → 1e-5, wu20 | 8M @ 1.8e-4 | 49M, 1.8e-4 → 2e-6 | 8M, 9e-5 → 9e-6 |
 
-A dash means that step is skipped. Only cubeful needs a 0-ply constant leg,
-to absorb the 196 → 200 input widening; only cubeful gets a 2nd-anneal.
+Every leg runs `train_batch.py` (`train_prob5.py` for the prob5 fork) from
+the repo root at `--episodes-per-round 1000` (the default).
 
-**This table covers only the legs run at each task's final architecture**;
-for the entire recipe, see below.
+Collectors. Self-play is collected in C by default (`bgc_collect`,
+`c_api/libpuretd_simd.so`, built on demand by the first run;
+[../c_collect/SPEC.md](../c_collect/SPEC.md)). Its samples match the
+Python collector's for the same seed (SPEC, gate section). Configurations
+it does not cover (`--boltzmann-temp`, `--oneply-acting`, `--bf16-collect`,
+`--c-engine`) print a NOTE and fall back to the vectorized GPU collector
+for `--oneply --device cuda` with `--boltzmann-temp`, to the Python
+collector otherwise. On a CUDA host every leg, 1-ply included, takes
+`--device cuda` for the train step and keeps `--pipeline-collect`. The
+train step then replays a CUDA graph with the round's pool on the GPU
+(`BG_TRAIN_CUDA_GRAPH`), and the workers hand their rows to the master
+through shared memory (`BG_COLLECT_SHM`). Both are bitwise equal to the
+eager step and the pool pipe. For cubeful 1-ply at 48 workers the C
+collector runs at 1.87x the GPU collector's ep/s
+([../c_collect/results/p4_throughput.md](../c_collect/results/p4_throughput.md)).
+The GPU-collector form of the 1-ply legs is `--device cuda
+--vectorized-collect --vectorized-batch 32` (`train_prob5.py`: `--device
+cuda --vectorized-collect 32`) in place of `--pipeline-collect`, plus
+`BG_VEC_CUBELESS_FAST=1` on the cubeless 1-ply legs. An explicit
+`--vectorized-collect` replaces the C collector, with a NOTE.
+Opt-outs, each on its own:
+- `--no-c-collect`: the Python collector (with `--oneply --device cuda`:
+  the vectorized GPU collector);
+- `BG_TRAIN_CUDA_GRAPH=0`: the eager train step, with the pool on the host;
+- `BG_COLLECT_SHM=0`: rows pickled through the pool pipe.
 
-`wu20` = `--warmup-cycles 20`, and it appears **only on task transfers**
-(DMP → equity, equity → cubeful). A task transfer is exactly a
-freshly-initialised head on a trained trunk.
+Memory: the graphed step holds the round's pool in VRAM (~50 MB
+per 1000-episode round, 4x that at 4000). The shared-memory arenas are
+host memory, pinned when the pool is on the GPU: one per round in flight,
+two under `--pipeline-collect`, ~100 MB each at 8 workers and 1000
+episodes per round, ~390 MB at 48 workers and 4000.
 
-Run flags: `--episodes-per-round 1000` everywhere;
-`LD_PRELOAD=c_engine/libfakeintel.so` on AMD hosts. Every leg runs
-`train_batch.py`; 1-ply legs take `--max-episode-plies 1500` and a collector,
-either `--pipeline-collect` or `--vectorized-collect`. Collector choice and
-worker counts are host-dependent — benchmark first.
+## Step 1: DMP ladder
 
-## Shape rules
-
-- **The constant leg and the descent share one LR.** The constant leg runs at
-  the top of the band; the descent then starts at that same LR and anneals
-  down from it, so the LR never rises between the two.
-- **2nd-anneal leg**: resume the finished descent at ~half to 0.9× the band
-  peak, anneal one decade, over ~12–35% of the descent's length. Why it helps
-  is not established. Two hypotheses: `--resume` resets Adam's moments
-  (checkpoints carry no optimizer state), and two shorter back-to-back
-  anneals may be more robust than one long linear one.
-
-## Step 1 — DMP ladder
-
-Start small, then alternate widening and deepening, training briefly after
-each step so the new units differentiate. Every expansion is
-near-function-preserving at initialization (exactly function-preserving
-for width; for depth, up to the `eps` symmetry-breaking noise), so no step
-starts from a materially worse model than it inherited. Only the last two steps (s7,
-s8) appear in the Legs table; s1–s6 build the architecture and total a
-further 8.3M episodes.
+Alternate widening (`--expand`, function-preserving) and deepening
+(`--expand-depth`, a square near-identity layer appended after the last
+hidden layer; `--expand-depth-eps` is the symmetry-breaking noise on the
+identity init), training briefly after each step. At `eps=1e-4` the
+appended layer deviates from the parent by ~0.6 mEq (256-wide, 4,000
+positions; linear in eps). No `--warmup-cycles` on expansions.
 
 ```bash
-# Build C engine first (optional but ~20x faster)
+# Build the C engine first (optional, ~20x faster) and the C collector
+# (the default collector; built on demand by the first run otherwise)
 cd c_engine && bash build_unix.sh && cd ..
+bash c_api/build.sh simd
 
 # Working directory for checkpoints (created automatically on first save)
 mkdir -p models
@@ -118,31 +125,20 @@ python train_batch.py --game-mode dmp \
   --workers 8 --device cuda --save models/dmp_4L_0ply.pt
 
 # s8. 1-ply refinement  <- DMP row, 1-ply anneal
+# (1-ply legs on a CUDA host: add --device cuda; see Collectors above)
 python train_batch.py --game-mode dmp \
   --resume models/dmp_4L_0ply.pt --oneply \
   --num-episodes 1000000 --optimizer adam --lr 1e-4 --end-lr 1e-5 \
   --workers 8 --save models/dmp_final.pt
-
 ```
 
-Depth expansion appends a square near-identity layer, so it only deepens by
-the last hidden size; widen first with `--expand` if you want a different
-width. `--expand-depth-eps` is required — it is the symmetry-breaking noise on
-the identity init. The append is exactly function-preserving at `eps=0`; `1e-4`
-keeps the symmetry-breaking at ~0.6 mEq of deviation from the parent (measured,
-256-wide, 4k real positions; deviation is linear in eps). **No
-`--warmup-cycles` on expansions** — warmup is for task transfers only, per the
-rule above.
+## Step 2: cubeless equity
 
-## Step 2 — cubeless equity
-
-`--warm-start-equity` converts the DMP model's win-probability output to an
-equity output, re-initialising the output layer and keeping the trunk. That
-fresh head on a trained trunk is the task transfer, so `cm_seed` takes
-`--warmup-cycles 20`; the two legs after it do not.
+`--warm-start-equity` keeps the trunk and re-initialises the output layer
+for an equity output; `cm_seed` takes `--warmup-cycles 20`.
 
 ```bash
-# cm_seed — TASK TRANSFER (wu20), 0-ply
+# cm_seed: task transfer (wu20), 0-ply
 python train_batch.py --game-mode cubeless-money --output-mode equity \
   --warm-start-equity models/dmp_final.pt \
   --num-episodes 16000000 --optimizer adam \
@@ -150,69 +146,118 @@ python train_batch.py --game-mode cubeless-money --output-mode equity \
   --workers 8 --device cuda --pipeline-collect \
   --save-every 4000000 --save models/cm_seed.pt
 
-# cm_const — 1-ply at the band top
+# cm_const: 1-ply at the band top
+# (1-ply legs on a CUDA host: add --device cuda; see Collectors above)
 python train_batch.py --game-mode cubeless-money --resume models/cm_seed.pt --oneply \
   --num-episodes 2500000 --optimizer adam --lr 1e-5 \
   --max-episode-plies 1500 --workers 8 --pipeline-collect \
   --save-every 500000 --save models/cm_const.pt
 
-# cm_final — 1-ply descent from that same LR
+# cm_descent: 1-ply descent from that same LR
 python train_batch.py --game-mode cubeless-money --resume models/cm_const.pt --oneply \
   --num-episodes 12000000 --optimizer adam --lr 1e-5 --end-lr 9e-7 \
   --max-episode-plies 1500 --workers 8 --pipeline-collect \
-  --save-every 2000000 --save models/cm_final.pt
+  --save-every 2000000 --save models/cm_descent.pt
 ```
 
-## Step 3 — cubeful
+## Step 3: cubeful
 
 `--warm-start-cubeful` widens the input 196 → 200 for the four cube features
-and re-initialises the output layer. `cf_adapt` absorbs that widening at a
-constant LR before any annealing starts, and is the second task transfer, so
-it takes `--warmup-cycles 20`.
+and copies the hidden layers and the equity head; `cf_adapt` absorbs the widening at a
+constant LR and takes `--warmup-cycles 20`.
 
 ```bash
-# cf_adapt — TASK TRANSFER (wu20), absorbs the 196 -> 200 input widening
+# cf_adapt: task transfer (wu20), absorbs the 196 -> 200 input widening
 python train_batch.py --game-mode cubeful-money \
-  --warm-start-cubeful models/cm_final.pt \
+  --warm-start-cubeful models/cm_descent.pt \
   --num-episodes 2000000 --optimizer adam --lr 1e-4 --warmup-cycles 20 \
   --workers 8 --device cuda --pipeline-collect --save models/cf_adapt.pt
 
-# cf_seed — 0-ply
+# cf_seed: 0-ply
 python train_batch.py --game-mode cubeful-money --resume models/cf_adapt.pt \
   --num-episodes 25000000 --optimizer adam --lr 6e-5 --end-lr 5e-7 \
   --workers 8 --device cuda --pipeline-collect \
   --save-every 4000000 --save models/cf_seed.pt
 
-# cf_plateau — 1-ply at the band top
+# cf_const: 1-ply at the band top
+# (1-ply legs on a CUDA host: add --device cuda; see Collectors above)
 python train_batch.py --game-mode cubeful-money --resume models/cf_seed.pt --oneply \
   --num-episodes 12000000 --optimizer adam --lr 1.8e-5 \
   --max-episode-plies 1500 --workers 8 --pipeline-collect \
-  --save-every 2000000 --save models/cf_plateau.pt
+  --save-every 2000000 --save models/cf_const.pt
 
-# cf_final — 1-ply descent from that same LR (the long leg)
-python train_batch.py --game-mode cubeful-money --resume models/cf_plateau.pt --oneply \
+# cf_descent: 1-ply descent from that same LR (the long leg)
+python train_batch.py --game-mode cubeful-money --resume models/cf_const.pt --oneply \
   --num-episodes 115000000 --optimizer adam --lr 1.8e-5 --end-lr 3e-7 \
   --max-episode-plies 1500 --workers 8 --pipeline-collect \
-  --save-every 2000000 --save models/cf_final.pt
+  --save-every 2000000 --save models/cf_descent.pt
 
-# cf_restart — 2nd anneal; this is the finished model
-python train_batch.py --game-mode cubeful-money --resume models/cf_final.pt --oneply \
+# cf_restart: 2nd anneal; this is the finished model
+python train_batch.py --game-mode cubeful-money --resume models/cf_descent.pt --oneply \
   --num-episodes 44000000 --optimizer adam --lr 1.62e-5 --end-lr 2.7e-7 \
   --max-episode-plies 1500 --workers 8 --pipeline-collect \
   --save-every 2000000 --save models/cf_restart.pt
 ```
 
-## Notes
+## Step 4: prob5
 
-On a CUDA host the 1-ply legs run substantially faster with
-`--device cuda --vectorized-collect --vectorized-batch 32` in place of
-`--pipeline-collect`.
+`--warm-start-equity-trunk` copies the hidden layers of the cubeless final
+into a fresh prob5 net (`--hidden` names the shape) and starts the
+five-output head fresh; `p5_seed` takes `--warmup-cycles 20`.
 
-For the **cubeless** 1-ply legs (`cm_const`, `cm_final`) also set
-**`BG_VEC_CUBELESS_FAST=1`**. It selects a batched target generator that is
-~5x faster under multi-worker GPU collection — measured 522 vs 109 ep/s at
-`--workers 24`, which over those two legs' 14.5M episodes is about 8 hours
-instead of 37. The default generator is bit-exact against the CPU reference;
-the fast one differs in the last ulp. The current 4-layer cubeless model,
-and the cubeless stage in the production 4-layer cubeful model's lineage,
-used this batched path. The cubeful legs are unaffected either way.
+```bash
+# p5_seed: task transfer (wu20), 0-ply
+python train_prob5.py --warm-start-equity-trunk models/cm_descent.pt --hidden 512,512,256,256 \
+  --num-episodes 6000000 --lr 1e-4 --end-lr 1e-5 --warmup-cycles 20 \
+  --workers 8 --device cuda --pipeline-collect \
+  --save-every 1000000 --save models/p5_seed.pt
+
+# p5_const: 1-ply at the band top
+# (1-ply legs on a CUDA host: add --device cuda; see Collectors above)
+python train_prob5.py --resume models/p5_seed.pt --oneply \
+  --num-episodes 8000000 --lr 1.8e-4 \
+  --workers 8 --pipeline-collect \
+  --save-every 1000000 --save models/p5_const.pt
+
+# p5_descent: 1-ply descent from that same LR (the long leg)
+python train_prob5.py --resume models/p5_const.pt --oneply \
+  --num-episodes 49000000 --lr 1.8e-4 --end-lr 2e-6 \
+  --workers 8 --pipeline-collect \
+  --save-every 2000000 --save models/p5_descent.pt
+
+# p5_restart: 2nd anneal; this is the finished model
+python train_prob5.py --resume models/p5_descent.pt --oneply \
+  --num-episodes 8000000 --lr 9e-5 --end-lr 9e-6 \
+  --workers 8 --pipeline-collect \
+  --save-every 1000000 --save models/p5_restart.pt
+```
+
+## Results
+
+Final checkpoint of each of the two end-to-end runs against production,
+both sides 0-ply: cubeful money with Jacoby, capped
++/-128, or cubeless money. Negative = production ahead.
+
+```bash
+python experiments/head_to_head/run.py --side1 models/cf_restart.pt \
+  --side2 best_models/cubeful_money_512_512_256_256.pt \
+  --game-mode cubeful-money --jacoby --games 500000 --workers 48 --save DIR_CF
+python experiments/head_to_head/run.py --side1 models/p5_restart.pt \
+  --side2 best_models/cubeless_prob5_512_512_256_256.pt \
+  --game-mode cubeless-money --games 500000 --workers 48 --save DIR_P5
+python experiments/head_to_head/run.py --combine DIR_CF
+python experiments/head_to_head/run.py --combine DIR_P5
+```
+
+| run | final checkpoint (md5) | games | mEq/game vs production |
+|---|---|---|---|
+| cubeful, run 1 | [../../best_models/experimental/recipe_runs/cubeful_money_512_512_256_256_run1.pt](../../best_models/experimental/recipe_runs/cubeful_money_512_512_256_256_run1.pt) `e9f7ddc8` | 20M | +0.7 [-0.5, +2.0] |
+| cubeful, run 2 | [../../best_models/experimental/recipe_runs/cubeful_money_512_512_256_256_run2.pt](../../best_models/experimental/recipe_runs/cubeful_money_512_512_256_256_run2.pt) `60bd300a` | 20M | -0.0 [-1.3, +1.2] |
+| prob5, run 1 | [../../best_models/experimental/recipe_runs/cubeless_prob5_512_512_256_256_run1.pt](../../best_models/experimental/recipe_runs/cubeless_prob5_512_512_256_256_run1.pt) `64860333` | 20M | -1.0 [-1.6, -0.4] |
+| prob5, run 2 | [../../best_models/experimental/recipe_runs/cubeless_prob5_512_512_256_256_run2.pt](../../best_models/experimental/recipe_runs/cubeless_prob5_512_512_256_256_run2.pt) `5d130631` | 20M | -0.0 [-0.6, +0.6] |
+
+Rows `recipe_*` of
+[h2h_cubeful_summary.csv](../head_to_head/results/h2h_cubeful_summary.csv)
+and
+[h2h_cubeless_summary.csv](../head_to_head/results/h2h_cubeless_summary.csv);
+pooled `run.py --combine` outputs in [results/](results/).

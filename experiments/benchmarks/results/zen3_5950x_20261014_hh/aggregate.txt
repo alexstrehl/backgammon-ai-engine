@@ -1,0 +1,35 @@
+# python experiments/benchmarks/aggregate_sweeps.py experiments/benchmarks/results/zen3_5950x_20261014_hh/<group>/<job>_sweep*.txt, per job; rates in decisions/s (moves/s, evals/s)
+
+## fast/hh0
+8 sweeps, t(7 df) = 2.365
+
+row                                                    mean            95% t-interval     +-%     sd%
+FP prob5c[torch]-0ply checker                        4689.9          [4669.7, 4710.1]   0.43%   0.52%
+FP prob5c[simd]-0ply checker                        15814.1        [15732.3, 15896.0]   0.52%   0.62%
+FP hh-fox-0ply checker                              20830.0        [20691.3, 20968.6]   0.67%   0.80%
+FP hh-aureus-0ply checker                            7733.4          [7524.1, 7942.6]   2.71%   3.24%
+FP PureTD-C[torch] 0-ply (4L cubeful) checker        5202.4          [5186.2, 5218.6]   0.31%   0.37%
+FP PureTD-C[torch] 0-ply (4L cubeful) cube          13401.4        [13339.9, 13462.8]   0.46%   0.55%
+FP PureTD-C[simd] 0-ply (4L cubeful) checker        18466.6        [18429.6, 18503.7]   0.20%   0.24%
+FP PureTD-C[simd] 0-ply (4L cubeful) cube          114669.0      [113941.0, 115397.0]   0.63%   0.76%
+FP HedgeHog fox 0-ply checker                       21839.9        [21755.5, 21924.3]   0.39%   0.46%
+FP HedgeHog fox 0-ply cube                         290153.4      [286844.6, 293462.1]   1.14%   1.36%
+FP HedgeHog aureus 0-ply checker                     8325.2          [8097.1, 8553.3]   2.74%   3.28%
+FP HedgeHog aureus 0-ply cube                      124181.1      [120582.7, 127779.5]   2.90%   3.47%
+
+  between-sweep sd across rows: median 0.69%, range 0.24-3.47%
+  (the design assumes ~1.5%; if these are much larger, add sweeps)
+
+## slow/hh1
+8 sweeps, t(7 df) = 2.365
+
+row                                       mean            95% t-interval     +-%     sd%
+FP hh-fox-1ply checker                    45.3              [44.5, 46.2]   1.87%   2.23%
+FP hh-aureus-1ply checker                 16.7              [16.0, 17.3]   3.75%   4.48%
+FP HedgeHog fox 1-ply checker             42.7              [42.2, 43.2]   1.12%   1.34%
+FP HedgeHog fox 1-ply cube               734.3            [722.8, 745.8]   1.57%   1.88%
+FP HedgeHog aureus 1-ply checker          16.5              [16.0, 17.0]   2.96%   3.54%
+FP HedgeHog aureus 1-ply cube            273.9            [266.5, 281.3]   2.70%   3.23%
+
+  between-sweep sd across rows: median 2.73%, range 1.34-4.48%
+  (the design assumes ~1.5%; if these are much larger, add sweeps)

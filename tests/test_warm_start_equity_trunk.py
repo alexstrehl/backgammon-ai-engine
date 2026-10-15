@@ -1,9 +1,7 @@
 """Tests for prob5's --warm-start-equity-trunk.
 
-This flag shipped as argparse-only for a while: it was accepted, training ran
-to completion and exited 0, silently from a random init. These tests exist so
-that failure mode cannot come back — the copy must actually happen, and every
-way of getting it wrong must raise rather than quietly train garbage.
+The copy must actually happen, and every way of getting it wrong must raise
+rather than train from a random init.
 """
 import argparse
 
@@ -64,11 +62,8 @@ def test_copies_matching_layers_and_leaves_head_fresh(equity_ckpt):
 
 
 def test_head_is_random_not_copied(equity_ckpt):
-    """Warm-starting twice must give identical trunks but different heads.
-
-    Identical trunks prove the copy is deterministic; differing heads prove
-    the head is freshly initialised rather than derived from the source.
-    """
+    """Warm-starting twice must give identical trunks (deterministic copy)
+    but different heads (freshly initialised, not copied)."""
     path, _ = equity_ckpt
     a = _warm_start_equity_trunk(str(path), PROB5_HIDDEN, "relu", False)
     b = _warm_start_equity_trunk(str(path), PROB5_HIDDEN, "relu", False)
@@ -106,7 +101,7 @@ def test_raises_when_nothing_would_be_copied(equity_ckpt):
 
 
 def test_rejects_activation_mismatch(equity_ckpt):
-    """Trunk weights are meaningless under a different activation; the
+    """Trunk weights are meaningless under a different activation. The
     mismatch must refuse, not silently reinterpret tanh weights as relu."""
     path, _ = equity_ckpt  # saved with activation="relu"
     with pytest.raises(ValueError, match="activation"):
@@ -130,13 +125,9 @@ def test_missing_activation_warns_not_raises(tmp_path, capsys):
 
 
 def test_no_island_copy_after_a_mismatch(tmp_path):
-    """A later layer that re-matches after a mismatch must NOT be copied:
-    it would sit on top of random-init earlier layers and receive garbage
-    activations -- worse than a fresh init. Because layer dims chain
-    (layer i's in-dim is layer i-1's out-dim), a re-match after a mismatch
-    implies the mismatch was at layer 0, so the island case is exactly the
-    zero-copied case and must raise rather than "warm-start" layers 2-3
-    of an otherwise random net (which the pre-fix code did)."""
+    """A later layer that re-matches after a mismatch must NOT be copied.
+    Layer dims chain, so a re-match implies the mismatch was at layer 0.
+    That is the zero-copied case, which must raise."""
     src_hidden = [512, 256, 512, 512]
     net = TDNetwork(hidden_sizes=src_hidden, input_size=196)
     path = tmp_path / "island_src.pt"
@@ -151,7 +142,7 @@ def test_no_island_copy_after_a_mismatch(tmp_path):
         },
         path,
     )
-    # Layer 0 mismatches (128 vs 512 out); layers 2-3 coincidentally
+    # Layer 0 mismatches (128 vs 512 out). Layers 2-3 coincidentally
     # re-match (512x256, 512x512).
     with pytest.raises(ValueError, match="ZERO layers"):
         _warm_start_equity_trunk(str(path), [128, 256, 512, 512], "relu",
@@ -159,7 +150,7 @@ def test_no_island_copy_after_a_mismatch(tmp_path):
 
 
 def test_missing_file_raises(tmp_path):
-    """The original bug: a bogus path trained happily from random init."""
+    """A missing checkpoint file must raise, not train from random init."""
     with pytest.raises(Exception):
         _warm_start_equity_trunk(
             str(tmp_path / "does_not_exist.pt"), PROB5_HIDDEN, "relu", False,

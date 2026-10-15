@@ -9,20 +9,18 @@ PR convention (per the official XG2 manual, "Performance" section):
 PR = 500 * sum(-Eq errors) / sum(decisions), where per row Eq errors =
 Eq Move + Eq Double + Eq Take (the Wrong Double/Take columns are subsets
 of those, fully penalized, never re-added) and decisions = Moves +
-Doubles + Takes — XG's own non-obvious-decision counts (forced/trivial
+Doubles + Takes, XG's own non-obvious-decision counts (forced/trivial
 moves and obvious cube actions are already excluded by XG upstream).
 
-Two XG display quirks, so nobody chases them again (researched Jul 2026,
-all manual-verified): (1) the profile Detail tab's "Resigns" row count is
-the number of GAMES, not resign decisions — it is NOT in the PR
-denominator; (2) the profile Summary tab "Overall Level" is a recency-
-weighted PR (exponential, decision half-life 10,000), so it drifts from
-the flat session PR whenever play quality varies over the import order.
-Quote the flat PR this tool computes, not the Summary widget.
+Two XG display quirks. (1) The profile Detail tab's "Resigns" row count
+is the number of GAMES, not resign decisions, and it is NOT in the PR
+denominator. (2) The profile Summary tab "Overall Level" is a recency-
+weighted PR (exponential, decision half-life 10,000), not the flat PR
+this tool computes.
 
 The 95% CI is a game-level percentile bootstrap of that same weighted ratio
 (games are the resampling unit, pooling both seats of a self-play game),
-B=100,000 by default per the main-results convention.
+B=100,000 by default.
 """
 import argparse
 import csv
@@ -45,11 +43,9 @@ def load_rows(path):
 def row_err_dec(r):
     """(-PR error, -all error, decisions, checker/cube split) for one row.
 
-    The two error values are intentionally IDENTICAL: XG's Wrong
-    Double/Wrong Take columns are subsets of Eq Double/Eq Take, so the
-    PR numerator already counts them in full and "Eq per Decision" is
-    exactly PR/500. The tuple carries the value twice only so the two
-    printed lines share one code path.
+    The two error values are intentionally IDENTICAL. XG's Wrong
+    Double/Wrong Take columns are subsets of Eq Double/Eq Take, so
+    "Eq per Decision" is exactly PR/500.
     """
     eq_move = float(r["Eq Move"])
     eq_cube = float(r["Eq Double"]) + float(r["Eq Take"])
@@ -68,8 +64,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("results", help="XG per-game stats export (.txt, tab-separated)")
     ap.add_argument("--player", default=None,
-                    help="only rows whose player matches (prefix of any name "
-                         "that is not 'Opp Name'); default: all rows")
+                    help="keep only this player's rows: rows whose 'Opp Name' "
+                         "does NOT start with this prefix (the export names "
+                         "only the opponent). Default: all rows")
     ap.add_argument("--rows-per-game", type=int, default=2,
                     help="rows forming one bootstrap unit (2 = both seats of "
                          "a self-play game; use 1 for single-player exports)")
@@ -78,9 +75,8 @@ def main():
     args = ap.parse_args()
 
     rows = load_rows(args.results)
-    # The export names only the OPPONENT; a row belongs to the player whose
-    # opponent it names. --player keeps rows where Opp Name does NOT start
-    # with the given prefix.
+    # The export names only the OPPONENT. --player keeps rows where
+    # Opp Name does NOT start with the given prefix.
     if args.player:
         rows = [r for r in rows if not r["Opp Name"].startswith(args.player)]
         if not rows:
@@ -121,9 +117,8 @@ def main():
         resample indices for every metric, so CIs are comparable)."""
         ge = row_e.reshape(-1, g).sum(axis=1)
         gd = row_d.reshape(-1, g).sum(axis=1)
-        # Guard the denominator like the point estimate does: a cubeless
-        # export has 0 cube decisions in every resample, which would
-        # otherwise print a [nan, nan] CI.
+        # Guard the denominator. A cubeless export has 0 cube decisions
+        # in every resample.
         boot = 500.0 * ge[idx].sum(axis=1) / np.maximum(gd[idx].sum(axis=1), 1)
         boot.sort()
         return boot[int(0.025 * args.n_boot)], boot[int(0.975 * args.n_boot)]

@@ -1,0 +1,20 @@
+Pooled 27 run(s) -> 10000000 games (cubeful_money_768_768_256_256_256.pt vs cubeful_money_512_512_256_256.pt, cubeful-money)
+
+============================================================
+RESULTS
+============================================================
+Model1: 5029542 wins (50.3%)
+Model2: 4970458 wins (49.7%)
+
+Model1 win rate 95% CI (Wilson): [50.3%, 50.3%]
+p-value: 0.0000
+Verdict: Model1 is significantly stronger (p<0.05)
+
+Cubeful money equity (Model1), UNCAPPED mean: +0.0164 pts/game (+16.4 mEq/game)
+  95% CI (bootstrap): [+14.7, +18.2] mEq/game (±1.7)
+  Equity p-value (bootstrap): 0.0000
+  Equity verdict: Model1 significantly stronger (p<0.05)
+  Median equity:   +1000.0 mEq/game  [+1000.0, +1000.0]  p=0.0000
+  Trimmed mean (1%): +16.8 mEq/game  [+15.2, +18.5]  p=0.0000
+  Capped mean (±128): +16.4 mEq/game  [+14.7, +18.2]  p=0.0000
+============================================================

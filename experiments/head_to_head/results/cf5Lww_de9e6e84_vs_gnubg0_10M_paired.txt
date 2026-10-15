@@ -1,0 +1,25 @@
+Pooled 37 run(s) -> 10000000 games (cubeful_money_768_768_256_256_256.pt vs gnubg-ext, cubeful-money, paired dice: 5000000 pairs)
+
+============================================================
+RESULTS  (paired dice: 5000000 pairs, CIs bootstrap over pairs)
+============================================================
+Model1: 5088265 wins (50.9%)
+Model2: 4911735 wins (49.1%)
+
+Model1 win rate 95% CI (pair bootstrap): [50.9%, 50.9%]
+p-value: 0.0000
+Verdict: Model1 is significantly stronger (p<0.05)
+
+Cubeful money equity (Model1), UNCAPPED mean: +0.1113 pts/game (+111.3 mEq/game)
+  95% CI (bootstrap): [+102.2, +127.1] mEq/game (±12.5)
+  Equity p-value (bootstrap): 0.0000
+  Equity verdict: Model1 significantly stronger (p<0.05)
+  Median equity:   +1000.0 mEq/game  [+1000.0, +1000.0]  p=0.0000
+  Trimmed mean (1%): +103.7 mEq/game  [+102.0, +105.3]  p=0.0000
+  Capped mean (±128): +102.8 mEq/game  [+101.1, +104.5]  p=0.0000
+
+  Paired-dice gain (sample variances; 1.00 = no gain):
+    win_rate     one pair ~  2.44 independent games  (variance factor 1.22)
+    equity       one pair ~  2.00 independent games  (variance factor 1.00)
+    capped_mean  one pair ~  2.21 independent games  (variance factor 1.10)
+============================================================

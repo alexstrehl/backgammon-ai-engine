@@ -1,8 +1,6 @@
-"""BG_VEC_CUBELESS_FAST regression: the batched cubeless 1-ply generator
-must agree with the default per-dice generator (which is itself held
-bit-exact against the CPU reference by test_vectorized_cubeless.py) to
-float32 round-off. The two paths batch forwards differently, so bitwise
-equality is NOT expected — the contract is last-ulp-level agreement.
+"""BG_VEC_CUBELESS_FAST parity. The batched cubeless 1-ply generator must
+agree with the default per-dice generator to float32 round-off. Bitwise
+equality is NOT expected, because the two paths batch forwards differently.
 """
 import os
 import random
@@ -20,7 +18,7 @@ from model import TDNetwork
 from td_agent import TDAgent
 import vectorized_collect as V
 
-ATOL = 1e-6  # measured max |d| is ~6e-8; leave float32 headroom
+ATOL = 1e-6  # float32 round-off headroom
 
 
 def _net(output_mode):
@@ -77,8 +75,7 @@ class TestCubelessFastPathParity:
             assert abs(ref - fast) <= ATOL, (
                 f"{output_mode}: fast path diverged |d|={abs(ref-fast):.3e} > {ATOL}")
         # Guards against a vacuous comparison: enough states, all finite,
-        # and genuinely different positions (a constant column would mean
-        # the sampler or the drive collapsed rather than the paths agreeing).
+        # and genuinely different positions.
         assert len(refs) >= 20, f"only {len(refs)} states compared"
         assert all(np.isfinite(r) for r in refs), "non-finite target"
         assert max(refs) - min(refs) > 1e-6, (

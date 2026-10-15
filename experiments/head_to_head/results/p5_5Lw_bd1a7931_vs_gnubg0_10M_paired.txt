@@ -1,0 +1,23 @@
+Pooled 29 run(s) -> 10000000 games (cubeless_prob5_768_512_256_256_256.pt vs gnubg-ext, cubeless-money, paired dice: 5000000 pairs)
+
+============================================================
+RESULTS  (paired dice: 5000000 pairs, CIs bootstrap over pairs)
+============================================================
+Model1: 5174860 wins (51.7%)
+Model2: 4825140 wins (48.3%)
+
+Model1 win rate 95% CI (pair bootstrap): [51.7%, 51.8%]
+p-value: 0.0000
+Verdict: Model1 is significantly stronger (p<0.05)
+
+Cubeless money equity (Model1), UNCAPPED mean: +0.0511 pts/game (+51.1 mEq/game)
+  95% CI (bootstrap): [+50.3, +51.9] mEq/game (±0.8)
+  Equity p-value (bootstrap): 0.0000
+  Equity verdict: Model1 significantly stronger (p<0.05)
+  Median equity:   +1000.0 mEq/game  [+1000.0, +1000.0]  p=0.0000
+  Trimmed mean (1%): +52.3 mEq/game  [+51.5, +53.1]  p=0.0000
+
+  Paired-dice gain (sample variances; 1.00 = no gain):
+    win_rate     one pair ~  2.37 independent games  (variance factor 1.18)
+    equity       one pair ~  2.41 independent games  (variance factor 1.20)
+============================================================

@@ -1,9 +1,8 @@
 """train_prob5 must never overwrite an existing checkpoint file.
 
-Covers _unique_ckpt_path (used by both the periodic _ep{N}.pt saves and,
-since the resume-clobber fix, the final --save): a resumed leg re-run
-with the same --save must land next to the earlier run's files, never on
-top of them.
+Covers _unique_ckpt_path, used by the periodic _ep{N}.pt saves and the
+final --save. A re-run with the same --save must land next to the earlier
+run's files, never on top of them.
 """
 import os
 

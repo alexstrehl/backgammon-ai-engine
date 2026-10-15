@@ -1,8 +1,9 @@
 """Shared helpers for the single-thread compute benchmarks.
 
-Fixed-pool loading, Open Sage board conversion, and the bootstrap
-moves/s timer used by the fixed-pool benchmarks. Import side effects: sets OMP/MKL/torch to 1 thread and
-pins the process to one core (BENCH_NO_PIN=1 / BENCH_CORE=N to override).
+Fixed-pool loading, Open Sage board conversion, and the bootstrap moves/s
+timer used by the fixed-pool benchmarks. Import side effects: sets
+OMP/MKL/torch to 1 thread and pins the process to one core (BENCH_NO_PIN=1 /
+BENCH_CORE=N to override).
 """
 import os
 import sys
@@ -13,8 +14,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 if not os.environ.get("BENCH_NO_PIN"):
     _env = os.environ.get("BENCH_CORE", "").strip()
     if _env:
-        # An explicitly requested core must be honored — silently running on a
-        # different core makes cross-engine/cross-sweep numbers incomparable.
+        # An explicitly requested core must be honored.
         _core = int(_env)
         if _core == 0:
             raise SystemExit("BENCH_CORE=0 is the IRQ core; pick another or set BENCH_NO_PIN=1")
@@ -62,10 +62,8 @@ FIXEDPOOL = os.path.join(_HERE, "fixedpool_positions.json")
 def load_fixedpool(cap=None):
     """Load the committed benchmark pool -> list of (BoardState, dice).
 
-    The pool is a frozen artifact (provenance in its meta block and the
-    README): 8000 checker-decision points from seeded gnubg 0-ply
-    cubeless-money self-play, recorded once so running the benchmarks
-    needs no position-generating engine.
+    The pool is a frozen artifact. Provenance is in its meta block and the
+    README.
     """
     import json
     with open(FIXEDPOOL) as f:
@@ -86,20 +84,15 @@ def sage_conv(points, bar, mover):
     return [obar] + body + [mbar]
 
 
-# Timing is dominated, for the tiny-eval configs (e.g. prob5-0ply), by
-# per-call overhead that scales with the core's clock. A cold core sits at
-# base clock and ramps to boost over ~1-3 s of sustained load, so a few-call
-# warmup reads ~20-25% low if it runs first. Warm the core for a fixed
-# WALL-TIME (BENCH_WARMUP_S, default 3s) before every timed config.
+# Warm the core for a fixed wall-time before every timed config, because a
+# cold core reads low. Override: BENCH_WARMUP_S.
 WARMUP_S = float(os.environ.get("BENCH_WARMUP_S", "3.0"))
 
 
 def _spin_ramp(seconds):
-    """Ramp the pinned core from idle base clock to boost, WITHOUT touching
-    the engine or the timed board pool. A cache-neutral scalar busy loop:
-    it must not pre-load the exact positions being timed, or tiny-eval
-    configs (gnubg-0ply, Sage's position cache) read all-cache-hot and
-    inflate 2-7x above their realistic (self-play) cost."""
+    """Ramp the pinned core to boost clock with a cache-neutral scalar busy
+    loop. It must not touch the engine or the timed positions, or tiny-eval
+    configs read all-cache-hot."""
     if seconds <= 0:
         return
     t0 = time.perf_counter()
@@ -118,18 +111,45 @@ def _warmup(fn, items, seconds=WARMUP_S):
         fn(it)
 
 
+_M64 = 0xFFFFFFFFFFFFFFFF
+
+
+def sample_indices(n, k, seed=1):
+    """k of range(n) drawn uniformly without replacement, sorted: a partial
+    Fisher-Yates shuffle over a splitmix64 stream from `seed`.
+    fixedpool_bench_gnubg.py has an inline copy (gnubg's Python cannot import
+    this module)."""
+    idx = list(range(n))
+    s = seed & _M64
+    for i in range(k):
+        s = (s + 0x9E3779B97F4A7C15) & _M64
+        z = ((s ^ (s >> 30)) * 0xBF58476D1CE4E5B9) & _M64
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _M64
+        z ^= z >> 31
+        j = i + z % (n - i)
+        idx[i], idx[j] = idx[j], idx[i]
+    return sorted(idx[:k])
+
+
+def sample(items, cap, seed=1):
+    """The pool when cap is 0 or covers it, else `cap` items drawn uniformly
+    at random (sample_indices), in pool order: the same items for every
+    engine."""
+    n = len(items)
+    if not cap or cap >= n:
+        return items
+    return [items[i] for i in sample_indices(n, cap, seed)]
+
+
 def rate(fn, items, cap):
     """calls/s and percentile-bootstrap 95% CI, resampling ITEMS.
 
     Point estimate AND bootstrap statistic are the RATIO OF SUMS
-    (total calls / total wall-time), not the mean of per-item rates:
-    with variable per-call cost (e.g. Sage's analyzer position cache)
-    the arithmetic mean is Jensen-biased upward by ~CV^2 of the times —
-    measured +40% on the cubeful Sage checker row. Ratio-of-sums is the
-    faithful throughput and matches a plain total/dt timing exactly.
+    (total calls / total wall-time), not the mean of per-item rates,
+    which is biased upward when per-call cost varies.
 
-    Items are resampled individually. Per-call perf_counter costs ~113 ns,
-    under 0.1% except on sub-10us rows."""
+    Items are resampled individually. Per-call perf_counter overhead is
+    included."""
     items = items[:cap]
     _warmup(fn, items)  # ramp core clock to steady state before timing
     dts = []
@@ -137,6 +157,13 @@ def rate(fn, items, cap):
         t = time.perf_counter()
         fn(it)
         dts.append(time.perf_counter() - t)
+    return rate_from_dts(dts)
+
+
+def rate_from_dts(dts):
+    """`rate`'s estimator on given per-item seconds: (point, lo, hi) of
+    calls/s, the ratio of sums with an item-resampling percentile
+    bootstrap 95% CI."""
     n = len(dts)
     point = n / sum(dts)
     rng = random.Random(1)
@@ -150,37 +177,18 @@ def rate(fn, items, cap):
     return point, bm[25], bm[975]
 
 
-def ratio_ci(dts, counts, B=10000, seed=1):
-    """Game-level percentile bootstrap 95% CI of sum(counts)/sum(dts).
-
-    The self-play combined rate is a ratio of two sums over games (total
-    decisions / total wall-time), so the natural resampling unit is the
-    game: resample games with replacement B times and take the 2.5/97.5
-    percentiles of the resampled ratio. Identical estimator to
-    selfplay_bench_gnubg.ratio_ci (that script inlines its own copy because
-    gnubg's embedded Python can't import this module)."""
-    n = len(dts)
-    rng = random.Random(seed)
-    out = []
-    for _ in range(B):
-        sd = sc = 0.0
-        for _ in range(n):
-            j = rng.randrange(n)
-            sd += dts[j]
-            sc += counts[j]
-        out.append(sc / sd)
-    out.sort()
-    return out[int(0.025 * B)], out[int(0.975 * B)]
+def c_engine(model, backend):
+    """A C API Engine (c_api/puretd_py) on `backend`, after printing the
+    backend header line of the C rows."""
+    from c_api import puretd_py as P
+    eng = P.Engine(model, backend)
+    print(f"# C API backend {eng.backend}: {eng.describe}", flush=True)
+    return eng
 
 
 def model_stamp(path) -> str:
     """'<basename> md5 <8hex>' for a model path, for bench output headers.
-
-    Bench rows record a MACHINE, but the number depends on which model was
-    the workload: prob5 tail-256 is 2-6% slower than tail-128 on identical
-    hardware, large enough to be misread as a hardware or code regression
-    across eras. Stamping the md5 makes that impossible.
-    """
+    The rate depends on which model was the workload."""
     import hashlib
     import os
     if not path or not os.path.isfile(path):
@@ -190,3 +198,17 @@ def model_stamp(path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return f"{os.path.basename(path)} md5 {h.hexdigest()[:8]}"
+
+
+# HedgeHog .ogxf weights are not tracked: $HH_FOX / $HH_AUREUS name the
+# files, default third_party_opponents/hedgehog/<published filename>.
+_HH_FILES = {"fox": "fox_v0.34_2026-09-26.ogxf",
+             "aureus": "aureus_v0.12_2026-09-26.ogxf"}
+
+
+def hh_model_path(name):
+    import os
+    hh_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "..", "..", "third_party_opponents", "hedgehog")
+    return (os.environ.get("HH_" + name.upper())
+            or os.path.join(hh_dir, _HH_FILES[name]))

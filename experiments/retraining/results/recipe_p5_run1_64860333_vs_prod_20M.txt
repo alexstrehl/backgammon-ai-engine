@@ -1,0 +1,20 @@
+# python experiments/head_to_head/run.py --combine DIR  (20M games, retrained prob5 run 1 vs production, 0-ply)
+Pooled 19 run(s) -> 20000000 games (p5_restart.pt vs cubeless_prob5_512_512_256_256.pt, cubeless-money)
+
+============================================================
+RESULTS
+============================================================
+Model1: 9990388 wins (50.0%)
+Model2: 10009612 wins (50.0%)
+
+Model1 win rate 95% CI (Wilson): [49.9%, 50.0%]
+p-value: 0.0000
+Verdict: Model2 is significantly stronger (p<0.05)
+
+Cubeless money equity (Model1), UNCAPPED mean: -0.0010 pts/game (-1.0 mEq/game)
+  95% CI (bootstrap): [-1.6, -0.4] mEq/game (±0.6)
+  Equity p-value (bootstrap): 0.0012
+  Equity verdict: Model2 significantly stronger (p<0.05)
+  Median equity:   -1000.0 mEq/game  [-1000.0, -1000.0]  p=0.0000
+  Trimmed mean (1%): -1.0 mEq/game  [-1.6, -0.4]  p=0.0010
+============================================================

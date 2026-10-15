@@ -16,10 +16,9 @@ Internal storage:
     off    : list[int]  — [white_borne_off, black_borne_off]
     turn   : int        — WHITE (0) or BLACK (1)
 
-`BoardState.initial()` returns a position with WHITE to move. For
-self-play training and matchplay where the opening must follow real
-backgammon rules, use `opening_roll(rng)` to draw a non-doublet
-opening and determine which player goes first.
+`BoardState.initial()` returns the start position with WHITE to move.
+`opening_roll(rng)` draws a real (non-doublet) opening roll and sets
+who moves first.
 """
 
 from __future__ import annotations
@@ -151,10 +150,7 @@ class BoardState:
 
 def _single_moves(state: BoardState, die: int) -> List[Move]:
     """All legal single-checker moves for *state.turn* using one die.
-
-    Performance-critical: accesses state.points directly to avoid
-    method-call overhead (checker_count was 30M calls in profiling).
-    """
+    Hot path: reads state.points directly, no helper calls."""
     player = state.turn
     pts = state.points
     moves: List[Move] = []
@@ -163,7 +159,7 @@ def _single_moves(state: BoardState, die: int) -> List[Move]:
     if state.bar[player] > 0:
         target = (24 - die) if player == WHITE else (die - 1)
 
-        # Inline is_blocked: opponent has 2+ checkers?
+        # Blocked if the opponent holds 2+ checkers there.
         v = pts[target]
         opp_count = (-v) if player == WHITE else v
         if opp_count < 2:
@@ -172,12 +168,12 @@ def _single_moves(state: BoardState, die: int) -> List[Move]:
 
     # ── Regular moves and bearing off ────────────────────────────────
     #
-    # WHITE: checkers are positive, direction = -1
-    # BLACK: checkers are negative, direction = +1
+    # WHITE: checkers positive, moves toward index 0.
+    # BLACK: checkers negative, moves toward index 23.
     is_white = (player == WHITE)
     direction = -1 if is_white else 1
 
-    # Inline all_in_home check
+    # May bear off only with every checker in the home board.
     can_bear_off = (state.bar[player] == 0)
     if can_bear_off:
         if is_white:
@@ -191,7 +187,7 @@ def _single_moves(state: BoardState, die: int) -> List[Move]:
                     can_bear_off = False
                     break
 
-    # Pre-compute farthest checker in home board (only if bearing off).
+    # Farthest checker from the edge (for the over-bear rule).
     farthest = -1
     if can_bear_off:
         if is_white:
@@ -207,7 +203,7 @@ def _single_moves(state: BoardState, die: int) -> List[Move]:
 
     for src in range(24):
         v = pts[src]
-        # Inline has_checker: for WHITE, v > 0; for BLACK, v < 0
+        # Skip points without our checkers.
         if is_white:
             if v <= 0:
                 continue
@@ -219,18 +215,17 @@ def _single_moves(state: BoardState, die: int) -> List[Move]:
 
         # Normal move (target on the board)
         if 0 <= target <= 23:
-            # Inline is_blocked
             tv = pts[target]
             opp_count = (-tv) if is_white else tv
             if opp_count < 2:
                 moves.append((src, target))
             continue
 
-        # Bearing off attempt (target off the board)
+        # Bear-off (target off the board): exact die, or a larger die
+        # from the farthest checker.
         if not can_bear_off:
             continue
 
-        # Distance from bearing off
         d = (src + 1) if is_white else (24 - src)
         if die == d:
             moves.append((src, OFF))
@@ -241,71 +236,50 @@ def _single_moves(state: BoardState, die: int) -> List[Move]:
 
 
 def _apply_move(state: BoardState, move: Move) -> BoardState:
-    """Apply a single move, returning a NEW BoardState.  Handles hits.
-
-    Performance-critical: inlines _add/_remove/checker_count to avoid
-    method-call overhead (~2M calls during move generation).
-    """
-    # Inline copy: direct list slicing is faster than calling state.copy()
+    """Apply a single move, returning a NEW BoardState. Handles hits.
+    Hot path: everything inlined."""
     pts = state.points[:]
     bar = state.bar[:]
     off = state.off[:]
     player = state.turn
     src, dst = move
 
-    # sign: +1 for WHITE checkers, -1 for BLACK
     sign = 1 if player == WHITE else -1
 
-    # Remove checker from source
     if src == BAR:
         bar[player] -= 1
     else:
         pts[src] -= sign
 
-    # Place checker at destination
     if dst == OFF:
         off[player] += 1
     else:
-        # Hit? Opponent has exactly 1 checker on dst
+        # Hit: a lone opposing checker goes to the bar.
         tv = pts[dst]
         opp_count = (-tv) if player == WHITE else tv
         if opp_count == 1:
-            pts[dst] += sign   # remove opponent's checker
+            pts[dst] += sign
             bar[1 - player] += 1
-        pts[dst] += sign  # place our checker
+        pts[dst] += sign
 
     return BoardState(pts, bar, off, state.turn)
 
 
 def _generate_plays(
-    state: BoardState,          # read-only (copies made via _apply_move)
-    remaining_dice: Tuple[int, ...], # read-only (new tuples created each level)
-    current_play: Play,         # read-only (immutable tuple)
-    results: dict,              # MUTATED: accumulates all terminal plays
-    dice_used: int,             # read-only (immutable int, new value per level)
-    max_used: List[int],        # MUTATED: tracks global max (num of) dice used
+    state: BoardState,
+    remaining_dice: Tuple[int, ...],
+    current_play: Play,
+    results: dict,              # MUTATED: board key -> (play, state)
+    dice_used: int,
+    max_used: List[int],        # MUTATED: [most dice any play used]
 ):
-    """Recursively build all legal plays, collecting results.
-
-    For each remaining_dice die value, we find every legal single-checker move
-    with that die, apply it, and recurse with the remaining_dice dice.
-
-    When no die can be used (either none left or all blocked), this is a
-    terminal node and we record the resulting board state.
-
-    Different orderings of moves can reach the same board position
-    (e.g. move A then B vs B then A).  We deduplicate by keying results
-    on the board state, so the caller only sees distinct outcomes.
-
-    max_used tracks the highest dice_used across all terminal nodes.
-    max_used is a 1-element list (rather than an int) so that recursive
-    calls can mutate it.
-    """
+    """Recursively build all legal plays into `results`, keyed by board
+    state so move orderings that reach the same position collapse to
+    one entry."""
     found = False
 
-    # Avoid exploring the same die value twice at this recursion level.
-    # For non-doubles this is a no-op (two distinct values), but for
-    # doubles [6,6,6,6] it prevents generating the same subtree 4 times.
+    # Try each die value once per level (doubles would otherwise
+    # explore the same subtree 4 times).
     seen_this_level: set = set()
 
     for i, die in enumerate(remaining_dice):
@@ -313,7 +287,6 @@ def _generate_plays(
             continue
         seen_this_level.add(die)
 
-        # Remove this die from the remaining_dice tuple (order-preserving).
         new_remaining_dice = remaining_dice[:i] + remaining_dice[i + 1:]
 
         for move in _single_moves(state, die):
@@ -326,14 +299,11 @@ def _generate_plays(
             )
 
     if not found:
-        # No legal move with any remaining_dice die -- this path is complete.
         if dice_used > max_used[0]:
             max_used[0] = dice_used
         key = state._key()
-        # On a key collision keep the play using MORE dice: a shorter
-        # game-ending play (2/off with the 2 of a 21) can reach the same board
-        # as the full play, and the maximal-dice filter would then drop the
-        # position entirely — a false forced pass.
+        # On a collision keep the play using MORE dice, or the max-dice
+        # filter drops the position (a false forced pass).
         prev = results.get(key)
         if prev is None or len(current_play) > len(prev[0]):
             results[key] = (current_play, state)
@@ -342,13 +312,10 @@ def _generate_plays(
 def get_legal_plays(
     state: BoardState, dice: Tuple[int, int]
 ) -> List[Tuple[Play, BoardState]]:
-    """Return every legal play for *state.turn* given *dice*.
-
-    Each entry is ``(play, resulting_state)`` where *play* is a tuple
-    of ``(src, dst)`` single moves and ``resulting_state.turn`` is
-    already switched to the opponent (the next player to act).
-    Callers should NOT switch_turn again. Results are deduplicated by
-    resulting board state.
+    """Return every legal play for *state.turn* given *dice*, as
+    ``(play, resulting_state)`` pairs. *play* is a tuple of ``(src, dst)``
+    moves. ``resulting_state.turn`` is already the opponent, so callers
+    must NOT switch_turn again. Deduplicated by resulting board.
 
     Rules enforced:
     * All four sub-moves for doubles.
@@ -356,23 +323,18 @@ def get_legal_plays(
     * Checkers on the bar must enter before any other move.
     * Bearing off respects exact / over-bear rules.
     """
-    # Doubles get 4 sub-moves; non-doubles get 2.
     d1, d2 = dice
     if d1 == d2:
         remaining_dice = (d1, d1, d1, d1)
     else:
         remaining_dice = (d1, d2)
 
-    # results: maps board-state key -> (play, state), giving us
-    #          automatic deduplication of plays that reach the same position.
-    # max_used: tracks the most dice any complete play managed to use.
     results: dict = {}
     max_used: List[int] = [0]
 
     _generate_plays(state, remaining_dice, (), results, 0, max_used)
 
-    # Rule: must use as many dice as possible.  Discard plays that used fewer.
-    # When no dice can be used at all, most_dice_used == 0 and we return [].
+    # Must use as many dice as possible. 0 = forced pass.
     most_dice_used = max_used[0]
     if most_dice_used == 0:
         return []
@@ -382,31 +344,25 @@ def get_legal_plays(
         if len(play) == most_dice_used
     ]
 
-    # Rule: if non-doubles and only one die can be used, must use the larger.
-    # (If using the smaller die would *also* allow using the larger, that
-    # 2-die play already survived the max filter above, so this only
-    # matters when exactly one die is playable.)
+    # Non-doubles with only one die playable: must use the larger.
     if d1 != d2 and most_dice_used == 1:
         big = max(d1, d2)
         uses_big = [(p, s) for p, s in filtered if _play_uses_die(p, state, big)]
         if uses_big:
             filtered = uses_big
 
-    # Switch turn on each result so .turn is the opponent (next to act).
     return [(p, switch_turn(s)) for p, s in filtered]
 
 
 def get_legal_plays_encoded(state: BoardState, dice, encoder=None):
-    """Combined move generation + perspective encoding. Mirrors
-    `bg_fast.get_legal_plays_encoded` so callers use the same
-    signature regardless of which engine is active.
+    """Move generation + perspective encoding, same signature as
+    `bg_fast.get_legal_plays_encoded`.
 
     Returns `(features, next_states)`:
-      - features: (N, num_features) float32, perspective-encoded
-      - next_states: list of N BoardState objects (already switched)
+      - features: (N, num_features) float32
+      - next_states: list of N BoardState (turn already switched)
     """
-    # Lazy import to avoid a circular dep with encoding.py.
-    from encoding import get_encoder
+    from encoding import get_encoder  # circular import otherwise
     if encoder is None:
         encoder = get_encoder("perspective196")
     plays = get_legal_plays(state, dice)
@@ -418,7 +374,7 @@ def get_legal_plays_encoded(state: BoardState, dice, encoder=None):
 
 
 def _play_uses_die(play: Play, original: BoardState, die: int) -> bool:
-    """Check whether a single-move play corresponds to using *die*."""
+    """True if the single-move *play* uses *die*."""
     if len(play) != 1:
         return False
     src, dst = play[0]
@@ -433,15 +389,13 @@ def _play_uses_die(play: Play, original: BoardState, die: int) -> bool:
         return dst == expected_dst
 
     if dst == OFF:
-        # Compute distance from bear-off edge
         if player == WHITE:
             d = src + 1
         else:
             d = 24 - src
         if die == d:
-            return True  # exact bear-off with this die
-        # Over-bear: only allowed from farthest checker, and only
-        # if die > d. Check that src IS the farthest checker.
+            return True
+        # Over-bear: only from the farthest checker.
         if die > d:
             pts = original.points
             if player == WHITE:
@@ -463,6 +417,34 @@ def switch_turn(state: BoardState) -> BoardState:
     return s
 
 
+def pip_count(state: BoardState) -> Tuple[int, int]:
+    """(white_pips, black_pips). WHITE bears off past index 0 (pip = i+1),
+    BLACK past index 23 (pip = 24-i). A checker on the bar counts 25."""
+    wp = 25 * state.bar[WHITE]
+    bp = 25 * state.bar[BLACK]
+    for i, v in enumerate(state.points):
+        if v > 0:
+            wp += v * (i + 1)
+        elif v < 0:
+            bp += (-v) * (NUM_POINTS - i)
+    return wp, bp
+
+
+def is_race(state: BoardState) -> bool:
+    """True when no contact is possible: nobody on the bar and every
+    WHITE checker (moving toward index 0) below every BLACK checker."""
+    if state.bar[WHITE] or state.bar[BLACK]:
+        return False
+    w_max = -1
+    b_min = NUM_POINTS
+    for i, v in enumerate(state.points):
+        if v > 0:
+            w_max = i
+        elif v < 0 and b_min == NUM_POINTS:
+            b_min = i
+    return w_max < b_min
+
+
 def move_label(move: Move) -> str:
     """Human-readable label for a single move, e.g. '13/7' or 'bar/20'."""
     src, dst = move
@@ -477,19 +459,11 @@ def play_label(play: Play) -> str:
 
 
 def opening_roll(rng=None) -> Tuple[BoardState, Tuple[int, int]]:
-    """Standard backgammon opening: each player rolls one die. The
-    higher die wins and uses both dice as the first move; doublets are
-    rerolled (you cannot start a game with a doublet).
+    """Opening roll: each player rolls one die, the higher wins and
+    plays both. Doublets are rerolled.
 
-    Args:
-        rng: an object with a `randint(a, b)` method (a `random.Random`
-            instance, or the `random` module itself). Defaults to the
-            global `random` module.
-
-    Returns:
-        (state, dice) where state is the standard initial position with
-        `state.turn` set to the winner of the opening roll, and dice is
-        `(higher_die, lower_die)`.
+    `rng` needs `randint(a, b)` (default: the `random` module).
+    Returns `(state, (high, low))` with `state.turn` = the winner.
     """
     if rng is None:
         import random as _random

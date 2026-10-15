@@ -1,34 +1,38 @@
-# Reproduction environment (python 3.10-3.12). See also
+# Reproduction environment (python 3.10-3.13). See also
 # experiments/head_to_head/README.md "Requirements".
 #
-# Pins are the versions the banked results were actually produced under, not
-# aspirational ones -- see VERIFIED ENVIRONMENT below. An unpinned torch is a
-# real reproducibility hole in a repo whose headline artifacts are +-2 mEq
-# measurements, because numerics and RNG behaviour move between releases.
+# Pins = the environment the published results were produced under (see
+# Verified environment below).
 torch==2.13.0
 numpy==2.2.6
 gnubg-nn==1.1.0a8
 
+# Tests: `python -m pytest -q tests/`. markdown-it-py serves only
+# tests/test_readme_markdown.py, which skips its rendering check without it.
+pytest==9.1.1
+markdown-it-py==4.2.0
+
 # Optional. scipy is used only by play_models.compute_binomial_pvalue, which
 # falls back to a normal approximation when it is absent (and IS absent in the
 # environment below, so that fallback is the tested path). bgsage is imported
-# lazily by experiments/benchmarks/fixedpool_bench.py for cubeless modes only.
+# lazily, for Open Sage sides and benchmark rows only.
 # scipy
-# bgsage==1.3.20260723
+# bgsage==2.0.20260907
 
-# Plus, for the paper's gnubg-ext opponents and the mEMG judge:
+# Plus, for the paper's gnubg-ext opponents:
 #   GNU Backgammon 1.08.003 binary (weights md5 14184acc...) on PATH or GNUBG_CMD
 #
 # Package-manager gnubg versions vary: recent Debian/Ubuntu ship 1.08.003
 # (Ubuntu 26.04 does), older releases ship 1.06/1.07, whose nets differ.
 # The runtime preflight verifies version + weights md5 and refuses anything
-# but 1.08.003; set GNUBG_CMD if the /usr/games/gnubg default holds a
-# different build. The behavioural tests skip with the version they found
-# rather than failing on equity mismatches that look like a code regression.
+# but 1.08.003. Set GNUBG_CMD if the /usr/games/gnubg default holds a
+# different build. The behavioural tests skip when no gnubg is installed.
+# They fail when the installed one is not 1.08.003 with those weights, and
+# the message names what was found. GNUBG_ALLOW_VERSION_MISMATCH=1 turns
+# that failure into a skip.
 #
-# Verified environment (recorded 2026-08-26, the machine that produced the
-# cf5L chain): Python 3.10.12, torch 2.13.0+cu130 for training and
+# Verified environment: Python 3.10.12, torch 2.13.0+cu130 for training and
 # head-to-head, torch 2.13.0+cpu elsewhere, numpy 2.2.6, scipy absent,
-# GNU Backgammon 1.08.003. `torch==2.13.0` above resolves to whichever
-# build variant the index serves -- pip cannot express "+cu130 here, +cpu
-# there" -- so install the CUDA build explicitly for training.
+# GNU Backgammon 1.08.003. On Linux x86_64 `torch==2.13.0` from PyPI is
+# the CUDA (cu130) build; the CPU-only build needs
+# `--index-url https://download.pytorch.org/whl/cpu`.

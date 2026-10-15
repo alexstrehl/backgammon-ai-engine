@@ -1,51 +1,62 @@
-# Open Sage as an H-H baseline (optional dependency)
+# Open Sage as a head-to-head side
 
-Open Sage (`bgsage`) is an OPTIONAL opponent used only to reproduce the
-head-to-head tables.
+`pip install bgsage==2.0.20260907` (release
+[v2.0.20260907](https://github.com/markbgsage/bgsage/releases/tag/v2.0.20260907),
+commit `4b10c69318c3b80e2a7618232540b10a76217d20`, production model `stage11`:
+its 21 networks (24 slots), `backgame_pair_phased`, weights md5 over the 24 slot files in load order
+`84f8621f3e274f6d25f83c07da657a4f`, bearoff database md5
+`c1234d7b9a1c4cbce591bf4f93a3cb5f`). The rows need exactly this version;
+bgsage 1.x gives different rows.
 
-## Install (pinned for reproduction)
+| spec keyword | class | game modes |
+|---|---|---|
+| `opensage` | `OpenSageAgent` | cubeless money: Sage's `BgBotAnalyzer(eval_level, cubeful=False)` with its bearoff database, `cube_owner=None`; DMP: win probability from the production `MultiPlyStrategy` |
+| `opensage-native` | `OpenSageMobileAgent` | cubeful money, 0-ply and 1-ply: Sage's native C API (`bgsage_mobile_analyze`), nets loaded once |
+| `opensage-analyzer` | `OpenSageAnalyzerAgent` | cubeful money: Sage's `BgBotAnalyzer`, cube-aware `checker_play` plus `cube_action`; reloads its nets on every cube call |
 
-    pip install bgsage==1.3.20260723
+`opensage-native` and `opensage-analyzer` make the same decisions (0 of
+2,000 0-ply and 0 of 500 1-ply checker decisions, 0 of 1,500 cube decisions
+differ on the cubeful fixed pool); native calls that exceed the API's 1 s
+budget are answered by the analyzer. `opensage-analyzer` is needed only for
+2-ply (`--sage-plies 3`). The native library is built from the release
+source: `bash third_party_opponents/opensage/opensage_mobile_build.sh` (or `BGSAGE_MOBILE_LIB`).
 
-## Which agent / spec keyword
+`--sage-plies` is XG-numbered: 1 = 0-ply, 2 = 1-ply, 3 = 2-ply.
+`SAGE_UNPRUNED=1` disables the root move filter (production 5/0.08 becomes
+1000/10.0). It changes cubeless 1-ply decisions only. Cubeful 1-ply has no
+setting: checker play re-scores every candidate through the cube-aware tree,
+which scores every opponent reply with the full net; cube decisions pre-rank
+replies with PubEval and keep the top 15 when more than 16 are legal.
 
-| Spec keyword        | Class                   | Use |
-|---------------------|-------------------------|-----|
-| `opensage`          | `OpenSageAgent`         | cubeless-money / DMP (errors in cubeful mode) |
-| `opensage-analyzer` | `OpenSageAnalyzerAgent` | cubeful-money |
+Move generation: `bgsage.possible_moves` offers a one-die play when a
+two-dice play exists (e.g. bearing off with the 2 instead of hitting with
+the 1 and bearing off with the 2); 178 of 194,508 position-roll pairs in the
+differential against the repo's gnubg-validated generator. Every agent here
+picks from the repo's legal plays only.
 
-`--sage-plies` is XG-numbered: 1 = 0-ply (1P), 2 = 1-ply (2P).
+```bash
+bash third_party_opponents/opensage/opensage_mobile_build.sh
+python experiments/head_to_head/run.py \
+  --side1 best_models/cubeful_money_512_512_256_256.pt \
+  --side2 opensage-native --sage-plies 1 \
+  --game-mode cubeful-money --jacoby --log-runaway 256 \
+  --games 1000000 --workers 30 --save DIR
+```
 
-## Why two agents (cubeless vs cubeful)
+Cubeless money plays the analyzer's best-ranked legal move: on 2,000
+fixed-pool positions and 3,000 self-play decisions, 100% of picks equal
+the stock analyzer's at 0-ply and 1-ply. The analyzer runs one thread per
+process: it forces `parallel_threads` to at least 2 at 1-ply, but Sage's
+search uses threads only above 2 plies. The agent skips the analyzer's
+per-decision flush of its 1-ply position cache (lookups check board and
+depth, so values are unchanged; the flush is memory-bound with many
+workers per host). `cube_owner=None` keeps the 1-ply
+root filter on cubeless equity; a cube owner ranks it by Janowski equity.
 
-The two agents exist because Sage itself exposes two different play paths,
-and each of ours mirrors the corresponding native one:
+The speed benchmarks time Open Sage on the fixed pools only, calling its
+decision functions directly
+([third_party_opponents/opensage/opensage_bench/](../../third_party_opponents/opensage/opensage_bench/sage_bench.cpp)).
 
-- **Cubeless / DMP** (`OpenSageAgent`): Sage's lean `best_move_index` move
-  selection on the stage9 `MultiPlyStrategy` — its native cubeless money
-  objective, with no cube machinery in the loop.
-- **Cubeful money** (`OpenSageAnalyzerAgent`): Sage's own `BgBotAnalyzer`,
-  exactly as Sage's self-play generator drives it — cube-AWARE
-  `checker_play` (the move choice receives cube value/owner) plus native
-  `cube_action`.
-
-Fidelity of the cubeful agent was verified decision-for-decision against
-Sage's own self-play: 100% agreement on 1105 cube offers, 60 responses,
-and 1494 real checker moves over 40 replayed seeded games (forced-pass
-bookkeeping differs but outcomes are identical; the beaver flag flipped
-0/1165 cube decisions). Cube-aware checker play matters: replacing it
-with cube-blind (cubeless) move selection costs Sage ~7 mEq/game against
-PureTD, so the analyzer path is the fair representation of Sage's
-cubeful strength.
-
-## Reproduce the cubeful H-H cell
-
-    python experiments/head_to_head/run.py \
-      --side1 best_models/cubeful_money_512_512_256_256.pt \
-      --side2 opensage-analyzer --sage-plies 1 \
-      --game-mode cubeful-money --games 1000000 --workers 30 \
-      --save ~/hh_out/puretd_vs_opensage_analyzer_0ply   # raw .npz stays outside the repo; only summary CSVs are committed
-
-Runs may be split across machines and pooled with `--combine <dir>`;
-worker RNGs are entropy-seeded and the combiner rejects byte-identical
-duplicate streams (see `tests/test_rng_independence.py`).
+`--save` legs pool with `--combine DIR`; `--combine` refuses to pool across
+bgsage versions, SAGE_UNPRUNED settings or `sage_path` (cubeless money:
+`analyzer`; absent = `best_move_index`).

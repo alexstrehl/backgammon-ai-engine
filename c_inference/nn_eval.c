@@ -1,10 +1,10 @@
 /*
- * nn_eval.c -- Neural network inference for backgammon models.
+ * nn_eval.c -- Neural-net inference for backgammon models in plain C.
  *
- * Runs a trained model from pure C: loads BGNN binary format, forward
- * pass on CPU, no dependencies beyond stdlib and math. Linked into
- * libbg_nply.so for --c-engine training, and usable standalone as a
- * starting point for other projects.
+ * Loads the BGNN binary format (format 2 "BGNV", or the legacy format 1
+ * "BGNN"; nn_eval.h) and runs the forward pass on the CPU;
+ * stdlib and math.h only. Linked into libbg_nply.so (--c-engine) and
+ * libpuretd_<backend>.so (c_api/build.sh); usable standalone.
  */
 
 #include "nn_eval.h"
@@ -19,7 +19,7 @@ static inline float act_relu(float x)        { return x > 0.0f ? x : 0.0f; }
 static inline float act_sigmoid(float x)     { return 1.0f / (1.0f + expf(-x)); }
 static inline float act_tanh_(float x)       { return tanhf(x); }
 static inline float act_leaky_relu(float x)  { return x > 0.0f ? x : 0.01f * x; }
-/* Matches torch.nn.functional.hardsigmoid: 0 for x<=-3, 1 for x>=3, else x/6+1/2 */
+/* torch.nn.functional.hardsigmoid: 0 for x<=-3, 1 for x>=3, else x/6+1/2 */
 static inline float act_hardsigmoid(float x) {
     if (x <= -3.0f) return 0.0f;
     if (x >= 3.0f)  return 1.0f;
@@ -41,6 +41,21 @@ static act_fn get_activation(int act) {
 
 /* ── Load ──────────────────────────────────────────────────────── */
 
+/* Bad-magic message: the n bytes read, non-printable shown as '?'. */
+static void bad_magic(const char *path, const char *magic, size_t n) {
+    if (n < 4) {
+        fprintf(stderr, "nn_load: '%s' is not a BGNN/BGNV export "
+                "(%zu bytes, no 4-byte magic)\n", path, n);
+        return;
+    }
+    char shown[5];
+    for (int i = 0; i < 4; i++)
+        shown[i] = (magic[i] >= ' ' && magic[i] <= '~') ? magic[i] : '?';
+    shown[4] = '\0';
+    fprintf(stderr, "nn_load: '%s' is not a BGNN/BGNV export (magic %s)\n",
+            path, shown);
+}
+
 int nn_load(NNModel *model, const char *path) {
     memset(model, 0, sizeof(*model));
 
@@ -50,15 +65,58 @@ int nn_load(NNModel *model, const char *path) {
         return -1;
     }
 
-    /* Magic */
+    /* Magic: "BGNV" + version (format 2: the encoder name), or the
+       legacy "BGNN" (format 1, no name). */
     char magic[4];
-    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "BGNN", 4) != 0) {
-        fprintf(stderr, "nn_load: bad magic in '%s'\n", path);
+    size_t got = fread(magic, 1, 4, f);
+    if (got != 4) {
+        bad_magic(path, magic, got);
+        fclose(f);
+        return -1;
+    }
+    if (memcmp(magic, "BGNN", 4) == 0) {
+        model->format_version = NN_FORMAT_LEGACY;     /* encoder_name stays "" */
+    } else if (memcmp(magic, "BGNV", 4) == 0) {
+        int version;
+        if (fread(&version, 4, 1, f) != 1) {
+            fprintf(stderr, "nn_load: truncated header in '%s'\n", path);
+            fclose(f);
+            return -1;
+        }
+        if (version != NN_FORMAT_VERSION) {
+            fprintf(stderr, "nn_load: '%s' is BGNV format version %d; this reader "
+                    "knows version %d only (rebuild against a newer nn_eval.c)\n",
+                    path, version, NN_FORMAT_VERSION);
+            fclose(f);
+            return -1;
+        }
+        model->format_version = version;
+        char *name = model->encoder_name;
+        if (fread(name, 1, NN_ENCODER_NAME_MAX, f) != NN_ENCODER_NAME_MAX) {
+            fprintf(stderr, "nn_load: truncated header in '%s'\n", path);
+            fclose(f);
+            return -1;
+        }
+        /* 1..63 printable non-space ASCII characters, then NUL padding */
+        int len = 0;
+        while (len < NN_ENCODER_NAME_MAX && name[len]) len++;
+        int ok = len > 0 && len < NN_ENCODER_NAME_MAX;
+        for (int i = 0; ok && i < len; i++)
+            ok = name[i] > ' ' && name[i] <= '~';
+        for (int i = len; ok && i < NN_ENCODER_NAME_MAX; i++)
+            ok = name[i] == 0;
+        if (!ok) {
+            fprintf(stderr, "nn_load: bad encoder name field in '%s'\n", path);
+            fclose(f);
+            return -1;
+        }
+    } else {
+        bad_magic(path, magic, 4);
         fclose(f);
         return -1;
     }
 
-    /* Header */
+    /* Header (format 1's, after the format-2 prefix) */
     if (fread(&model->num_hidden, 4, 1, f) != 1 ||
         fread(&model->input_size, 4, 1, f) != 1 ||
         fread(&model->activation, 4, 1, f) != 1 ||
@@ -167,8 +225,8 @@ void nn_free(NNModel *model) {
 
 /* ── Forward pass ──────────────────────────────────────────────── */
 
-/* Run all layers; returns a pointer to the (sigmoid/linear-applied)
- * output layer values living in one of the model's scratch buffers. */
+/* Run all layers. Returns the output-layer values (activation applied),
+ * living in one of the model's scratch buffers. */
 static const float *forward_raw(const NNModel *model, const float *input) {
     act_fn activate = get_activation(model->activation);
     const float *in = input;
@@ -204,11 +262,48 @@ static const float *forward_raw(const NNModel *model, const float *input) {
     return in;
 }
 
-/* prob5: clamp nested-event inequalities then reduce to cubeless money
- * equity. Mirrors model.prob5_postprocess + model.prob5_to_equity. If
- * out != NULL, writes the 5 postprocessed probabilities. */
-static float prob5_reduce(const float *raw, float *out) {
-    float p0 = raw[0], p1 = raw[1], p2 = raw[2], p3 = raw[3], p4 = raw[4];
+/* gnubg 1.08 SanityCheck "impossible" rules on a perspective196 input:
+ * zero the P(wg), P(wbg), P(lg), P(lbg) the board rules out. Same code
+ * as bg_engine.c prob5_impossible_mask (prob_agent.prob5_impossible);
+ * parity: tests/test_prob5_sanity.py TestCCopiesParity. */
+static void prob5_sanity_zero(const float *x, float *p) {
+    /* s = 0: my side (gnubg side 1), 1: the opponent (gnubg side 0) */
+    int ac[2], back[2], cross[2], gcross[2];
+    for (int s = 0; s < 2; s++) {
+        const float *b = x + 98 * s;
+        ac[s] = cross[s] = back[s] = 0;
+        gcross[s] = 1;
+        for (int k = 0; k < 24; k++) {
+            const float *f = b + 4 * k;
+            if (f[0] == 0.0f) continue;
+            int c = (int)(f[0] + f[1] + f[2] + 2.0f * f[3] + 0.5f);
+            int i = s ? 23 - k : k;          /* gnubg point index */
+            if (i > back[s]) back[s] = i;
+            ac[s] += c;
+            cross[s] += (1 + i / 6) * c;
+            gcross[s] += (i / 6) * c;
+        }
+        int bar = (int)(2.0f * b[96] + 0.5f);
+        if (bar) {
+            back[s] = 24; ac[s] += bar; cross[s] += 5 * bar; gcross[s] += 4 * bar;
+        }
+    }
+    int race = back[0] + back[1] < 24;
+    if (ac[1] < 15 || (race && cross[0] > 8 * gcross[1])) p[1] = 0.0f;
+    if (ac[1] < 15 || (race && back[1] < 18)) p[2] = 0.0f;
+    if (ac[0] < 15 || (race && cross[1] > 8 * gcross[0] - 4)) p[3] = 0.0f;
+    if (ac[0] < 15 || (race && back[0] < 18)) p[4] = 0.0f;
+}
+
+/* prob5: SanityCheck zeroing if `sanity`, the nested-event clamps, then
+ * money equity. Mirrors prob_agent.prob5_sanity (sanity) or
+ * model.prob5_postprocess, then model.prob5_to_equity. `out`, if
+ * non-NULL, receives the 5 probs. */
+static float prob5_reduce(const float *x, const float *raw, int sanity,
+                          float *out) {
+    float q[5] = {raw[0], raw[1], raw[2], raw[3], raw[4]};
+    if (sanity) prob5_sanity_zero(x, q);
+    float p0 = q[0], p1 = q[1], p2 = q[2], p3 = q[3], p4 = q[4];
     if (p1 > p0) p1 = p0;            /* P(wg)  <= P(win)   */
     float lose = 1.0f - p0;
     if (p3 > lose) p3 = lose;        /* P(lg)  <= 1-P(win) */
@@ -221,7 +316,7 @@ static float prob5_reduce(const float *raw, float *out) {
 float nn_forward(const NNModel *model, const float *input) {
     const float *o = forward_raw(model, input);
     if (model->output_mode == NN_OUTPUT_PROB5)
-        return prob5_reduce(o, NULL);
+        return prob5_reduce(input, o, model->prob5_board_sanity, NULL);
     return o[0];
 }
 
@@ -232,5 +327,5 @@ float nn_forward_prob5(const NNModel *model, const float *input,
         return nn_forward(model, input);
     }
     const float *o = forward_raw(model, input);
-    return prob5_reduce(o, probs);
+    return prob5_reduce(input, o, model->prob5_board_sanity, probs);
 }

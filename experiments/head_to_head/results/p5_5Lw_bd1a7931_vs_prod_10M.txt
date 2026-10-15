@@ -1,0 +1,19 @@
+Pooled 40 run(s) -> 10000000 games (cubeless_prob5_768_512_256_256_256.pt vs cubeless_prob5_512_512_256_256.pt, cubeless-money)
+
+============================================================
+RESULTS
+============================================================
+Model1: 5018306 wins (50.2%)
+Model2: 4981694 wins (49.8%)
+
+Model1 win rate 95% CI (Wilson): [50.2%, 50.2%]
+p-value: 0.0000
+Verdict: Model1 is significantly stronger (p<0.05)
+
+Cubeless money equity (Model1), UNCAPPED mean: +0.0052 pts/game (+5.2 mEq/game)
+  95% CI (bootstrap): [+4.3, +6.0] mEq/game (±0.8)
+  Equity p-value (bootstrap): 0.0000
+  Equity verdict: Model1 significantly stronger (p<0.05)
+  Median equity:   +1000.0 mEq/game  [+1000.0, +1000.0]  p=0.0000
+  Trimmed mean (1%): +5.3 mEq/game  [+4.5, +6.2]  p=0.0000
+============================================================

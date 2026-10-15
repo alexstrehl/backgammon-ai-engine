@@ -1,23 +1,17 @@
 """
-bg_fast.py -- minimal Python wrapper for libbg_engine.so.
-
-Exposes one function for TDAgent's fast path:
+bg_fast.py -- ctypes wrapper for libbg_engine.so (C move generation +
+196-feature perspective encoding).
 
   get_legal_plays_encoded(state, dice, encoder=None)
     -> (features, next_states)
 
-where `features` is (N, 196) float32 (perspective-encoded successors,
-ready for the network) and `next_states` is a lazy view that
-materialises a Python BoardState only when accessed by index.
-Resulting states are already switch_turn'd to match the
-backgammon_engine convention (`.turn` = next player to act).
+`features` is (N, 196) float32; `next_states` is a lazy view that
+builds a Python BoardState on index access. Resulting states follow
+the backgammon_engine convention (`.turn` = next player to act).
 
-The shared library is built/loaded lazily on first import; an
-ImportError on failure lets callers fall back to backgammon_engine.
-
-The C encoder is the 196-feature perspective encoding; cubeful models
-append the small cube features in Python after the C encode call (see
-td_agent's fused cubeful path).
+The library is built if missing or stale at import. A failure raises
+ImportError so callers can fall back to backgammon_engine. Cubeful
+models append the cube features in Python after the C encode.
 """
 
 import ctypes
@@ -27,11 +21,12 @@ import subprocess
 import numpy as np
 
 from backgammon_engine import BoardState
+from bg_cstructs import (  # noqa: F401 -- re-exported
+    MAX_MOVES_PER_PLAY, MAX_PLAYS, NUM_POINTS, _CBoardState, _CMove, _CPlay,
+    _c_to_python, _python_to_c,
+)
 
 NUM_FEATURES = 196
-MAX_PLAYS = 4096  # keep in sync with bg_engine.h MAX_PLAYS
-MAX_MOVES_PER_PLAY = 4
-NUM_POINTS = 24
 
 
 # ── Library loading ─────────────────────────────────────────────────
@@ -41,10 +36,8 @@ def _find_or_build_library() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     lib_path = os.path.join(here, "libbg_engine.so")
     source = os.path.join(here, "bg_engine.c")
-    # Freshness is checked against EVERY input gcc reads, not just the .c.
-    # bg_engine.c includes bg_engine.h, and MAX_PLAYS is mirrored at the top
-    # of this file: a stale .so with a changed header is silently wrong
-    # behaviour, not a build error.
+    # Staleness must include the header: a .so built against an old
+    # bg_engine.h (e.g. MAX_PLAYS) is silently wrong, not a build error.
     deps = [source, os.path.join(here, "bg_engine.h")]
 
     if (
@@ -81,33 +74,6 @@ def _find_or_build_library() -> str:
 _lib = ctypes.CDLL(_find_or_build_library())
 
 
-# ── C struct definitions ────────────────────────────────────────────
-
-
-class _CBoardState(ctypes.Structure):
-    _fields_ = [
-        ("points", ctypes.c_int * NUM_POINTS),
-        ("bar", ctypes.c_int * 2),
-        ("off", ctypes.c_int * 2),
-        ("turn", ctypes.c_int),
-    ]
-
-
-class _CMove(ctypes.Structure):
-    _fields_ = [
-        ("src", ctypes.c_int),
-        ("dst", ctypes.c_int),
-    ]
-
-
-class _CPlay(ctypes.Structure):
-    _fields_ = [
-        ("moves", _CMove * MAX_MOVES_PER_PLAY),
-        ("num_moves", ctypes.c_int),
-        ("resulting_state", _CBoardState),
-    ]
-
-
 # ── Function signatures ─────────────────────────────────────────────
 
 
@@ -127,6 +93,10 @@ _lib.encode_state.argtypes = [
 ]
 _lib.encode_state.restype = None
 
+_lib.prob5_impossible_mask.argtypes = [
+    ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+_lib.prob5_impossible_mask.restype = ctypes.c_int
+
 _HAS_EXPAND21 = hasattr(_lib, "get_legal_plays_encoded_21")
 if _HAS_EXPAND21:
     _lib.get_legal_plays_encoded_21.argtypes = [
@@ -142,8 +112,7 @@ if _HAS_EXPAND21:
 
 # ── Pre-allocated buffers ───────────────────────────────────────────
 #
-# These are reused across calls. Callers must consume the result
-# (or copy what they need) before the next call.
+# Reused across calls: consume or copy the result before the next call.
 
 _play_buf = (_CPlay * MAX_PLAYS)()
 _feature_buf = np.zeros(MAX_PLAYS * NUM_FEATURES, dtype=np.float32)
@@ -151,36 +120,20 @@ _feature_buf_ptr = _feature_buf.ctypes.data_as(
     ctypes.POINTER(ctypes.c_float)
 )
 
-# Single-state encoding buffer (reused across calls).
 _single_feature_buf = np.zeros(NUM_FEATURES, dtype=np.float32)
 _single_feature_buf_ptr = _single_feature_buf.ctypes.data_as(
     ctypes.POINTER(ctypes.c_float)
 )
 
 
-# ── Python ↔ C state conversion (used internally) ──────────────────
-
-
-def _python_to_c(state: BoardState) -> _CBoardState:
-    c = _CBoardState()
-    pts = state.points
-    for i in range(NUM_POINTS):
-        c.points[i] = pts[i]
-    c.bar[0] = state.bar[0]
-    c.bar[1] = state.bar[1]
-    c.off[0] = state.off[0]
-    c.off[1] = state.off[1]
-    c.turn = state.turn
-    return c
-
-
-def _c_to_python(c_state: _CBoardState) -> BoardState:
-    return BoardState(
-        points=list(c_state.points),
-        bar=[c_state.bar[0], c_state.bar[1]],
-        off=[c_state.off[0], c_state.off[1]],
-        turn=c_state.turn,
-    )
+# `_play_buf` as flat int32: play i's resulting_state (points[24],
+# bar[2], off[2], turn) is `_play_ints[i * _PLAY_INTS + _STATE_COL:][:29]`.
+_PLAY_INTS = ctypes.sizeof(_CPlay) // 4
+_STATE_COL = _CPlay.resulting_state.offset // 4
+if (_PLAY_INTS * 4 != ctypes.sizeof(_CPlay)
+        or ctypes.sizeof(_CBoardState) != 29 * 4):
+    raise ImportError("bg_fast: c_int is not 4 bytes; use backgammon_engine")
+_play_ints = memoryview(_play_buf).cast("B").cast("i")
 
 
 # ── Public API ──────────────────────────────────────────────────────
@@ -190,12 +143,9 @@ _SUPPORTED_ENCODERS = frozenset({"perspective196"})
 
 
 class _LazyNextStates:
-    """List-like view over `_play_buf`. `view[i]` lazily materialises
-    the i'th resulting state as a Python BoardState — one conversion
-    per turn instead of N. Invalidated by the next
-    `get_legal_plays_encoded` call (shared buffer); callers must
-    consume synchronously.
-    """
+    """List-like view over `_play_buf`; `view[i]` converts the i'th
+    resulting state on demand. Invalidated by the next
+    `get_legal_plays_encoded` call (shared buffer)."""
 
     __slots__ = ("_count",)
 
@@ -211,17 +161,14 @@ class _LazyNextStates:
     def __getitem__(self, idx: int) -> BoardState:
         if idx < 0 or idx >= self._count:
             raise IndexError(idx)
-        return _c_to_python(_play_buf[idx].resulting_state)
+        o = idx * _PLAY_INTS + _STATE_COL
+        v = _play_ints[o:o + 29].tolist()
+        return BoardState(v[:24], v[24:26], v[26:28], v[28])
 
 
 def encode_state(state: BoardState, encoder=None) -> np.ndarray:
-    """Single-state perspective encoding via the C engine. Returns
-    a fresh (196,) float32 numpy array (a copy of the internal
-    buffer; safe to retain across calls).
-
-    `encoder` is validated against `_SUPPORTED_ENCODERS` (same as
-    `get_legal_plays_encoded`).
-    """
+    """Encode one state via the C engine. Returns a fresh (196,)
+    float32 array. `encoder`, if given, must be in `_SUPPORTED_ENCODERS`."""
     if encoder is not None:
         encoder_name = getattr(encoder, "name", None)
         if callable(encoder_name):
@@ -236,24 +183,27 @@ def encode_state(state: BoardState, encoder=None) -> np.ndarray:
     return _single_feature_buf.copy()
 
 
+def prob5_impossible(x: np.ndarray):
+    """C prob_agent.prob5_impossible on a C-contiguous (N, 196) float32
+    array: (N, 4) bool mask, or None when nothing is impossible."""
+    mask = np.empty((x.shape[0], 4), dtype=np.bool_)
+    if _lib.prob5_impossible_mask(x.ctypes.data, x.shape[0], mask.ctypes.data):
+        return mask
+    return None
+
+
 def get_legal_plays_encoded(state: BoardState, dice, encoder=None):
     """Move generation + perspective encoding in one C call.
 
-    Args:
-        state, dice: as for backgammon_engine.get_legal_plays_encoded.
-        encoder: optional. If supplied its `name` must be in
-                 `_SUPPORTED_ENCODERS` (currently {"perspective196"}).
-                 The C encoder is hard-coded so unsupported encoders
-                 raise ValueError rather than silently producing
-                 wrong features.
+    `encoder`, if given, must be in `_SUPPORTED_ENCODERS` (the C
+    encoder is fixed; anything else raises ValueError).
 
     Returns `(features, next_states)`:
-        features:    (N, 196) float32 (copy of internal buffer)
-        next_states: lazy list-like view (see `_LazyNextStates`)
+        features:    (N, 196) float32 (a copy)
+        next_states: lazy view (see `_LazyNextStates`)
 
-    Play info is not returned — the trainer discards it. Eval
-    scripts that need Plays go through TDAgent's explicit-actions
-    path.
+    Plays are not returned. Callers that need them use TDAgent's
+    explicit-actions path.
     """
     if encoder is not None:
         encoder_name = getattr(encoder, "name", None)
@@ -280,17 +230,14 @@ def get_legal_plays_encoded(state: BoardState, dice, encoder=None):
     if count == 0:
         return np.empty((0, NUM_FEATURES), dtype=np.float32), _LazyNextStates(0)
 
-    # Slice the feature buffer to (count, 196) and copy so the caller
-    # can hold onto it across subsequent calls.
     features = _feature_buf[: count * NUM_FEATURES].reshape(count, NUM_FEATURES).copy()
     return features, _LazyNextStates(count)
 
 
 # ── 1-ply inner expansion (all 21 opponent dice in one C call) ──────
 
-# Reusable buffers for expand_21. Sized for a generous worst case; the
-# C call returns -1 on overflow and the caller falls back to the
-# per-dice path. ~47 MB feats + small int buffers, allocated once.
+# Buffers for expand_21 (~47 MB, allocated once). On overflow the C
+# call returns -1 and the caller falls back to the per-dice path.
 _EXP21_MAX_ROWS = 60000
 _EXP21_MAX_REPLIES = 80000
 if _HAS_EXPAND21:
@@ -303,19 +250,18 @@ if _HAS_EXPAND21:
 
 
 def expand_21(next_state: BoardState):
-    """All-21-opponent-dice 1-ply inner expansion in one C call.
+    """1-ply inner expansion over all 21 opponent rolls in one C call.
 
     Returns `(base_feats, dice_counts, reply_gr, n_rows)`:
-        base_feats:  (n_rows, 196) float32 — copy of the non-terminal
-                     reply encodings, packed in reply order.
-        dice_counts: (21,) int32 — replies per dice bucket (>=1).
-        reply_gr:    (n_replies,) int32 — 0 for a non-terminal reply
-                     (consumes the next base_feats row), else 1/2/3 for
-                     a terminal reply (no row).
-        n_rows:      number of base_feats rows (== count of gr == 0).
+        base_feats:  (n_rows, 196) float32, non-terminal replies in
+                     reply order.
+        dice_counts: (21,) int32, replies per roll (>=1).
+        reply_gr:    (n_replies,) int32; 0 = non-terminal (takes the
+                     next base_feats row), 1/2/3 = terminal (no row).
+        n_rows:      number of base_feats rows.
 
-    Returns None if the C function is unavailable or a buffer overflows
-    (caller should fall back to the per-dice path).
+    Returns None if the C function is missing or a buffer overflowed
+    (fall back to the per-dice path).
     """
     if not _HAS_EXPAND21:
         return None
