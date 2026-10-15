@@ -32,7 +32,7 @@ def test_name_and_length(table):
     "my_away,opp_away,expected",
     [
         (1, 1, 0.50000),   # DMP
-        (1, 2, 0.67736),   # the Crawford value MATCHPLAY.md converged to
+        (1, 2, 0.67736),   # the Crawford value (training converged to it)
         (2, 1, 0.32264),
         (2, 2, 0.50000),
         (3, 3, 0.50000),
@@ -300,9 +300,9 @@ def test_default_met_is_gnubgs_default(table):
 
 @pytest.mark.slow
 def test_gnubg_nn_referee_uses_snowie_not_kazaross():
-    """The two instruments in MATCHPLAY.md score against DIFFERENT METs.
+    """The two match-play instruments score against DIFFERENT METs.
 
-    `eval_matchplay.py`'s `gnubg:` side goes through gnubg-nn,
+    `eval_matchplay.py` and `mine_cube_errors.py` go through gnubg-nn,
     whose MET is Snowie (verified exact below). `gnubg_eval_matchplay.py`
     drives the gnubg 1.08 CLI, whose default is Kazaross-XG2. The two
     disagree by up to 7.6 mMWC at 3-point scores.

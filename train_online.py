@@ -20,10 +20,8 @@ Examples:
         --save dmp_5000.pt --eval-vs-random 200
 """
 
-# Pin BLAS / PyTorch to a single thread BEFORE importing torch. Online
-# TD(0) is dominated by tiny single-sample forward passes; with 64
-# BLAS threads contending on every step the wall clock balloons by
-# ~10x for no benefit.
+# Pin BLAS / PyTorch to a single thread BEFORE importing torch:
+# single-sample forwards are slower with BLAS threads.
 import os
 if "OMP_NUM_THREADS" not in os.environ:
     os.environ["OMP_NUM_THREADS"] = "1"
@@ -68,7 +66,7 @@ def main():
     agent = TDAgent(net, device=args.device)
     mode = build_mode(args.game_mode, jacoby=args.jacoby)
 
-    # Equity output is unbounded; high lr causes gradient explosion -> NaN.
+    # Equity output is unbounded. High lr causes gradient explosion -> NaN.
     # Probability output is sigmoid-bounded so 0.1 is fine.
     if net.output_mode == "equity" and args.lr > 0.05:
         print(

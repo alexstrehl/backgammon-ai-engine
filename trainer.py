@@ -6,68 +6,49 @@ training loop. The Agent owns its representation (forward pass,
 target shape, loss).
 
 Two methods:
-  - `train`: round-based batch TD(0). Adam by default. Supports
-    parallel collection via `workers=N`.
-  - `train_online`: classical online TD(0), one update per
-    transition. Pair with SGD via `optimizer_cls=torch.optim.SGD`.
+  - `train`: round-based batch TD(0). Adam by default. Parallel
+    collection via `workers=N`; the C collectors (money: bgc_collect,
+    match play: bgc_collect_match), and for match play the lockstep
+    GPU collector (vectorized_matchplay.py) and the GPU eval server
+    (gpu_eval_server.py).
+  - `train_online`: online TD(0), one update per transition. Pair
+    with SGD via `optimizer_cls=torch.optim.SGD`.
 
-`collect_episode` is also exposed as a free function for tests and
-external callers.
+`collect_episode` is also a free function for tests and external
+callers.
 """
 
+import atexit
 import math
 import multiprocessing as mp
 import os
 import random
+import shutil
+import sys
+import tempfile
 import time
 from collections import OrderedDict
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 
 from agents import Agent
 from backgammon_engine import BoardState, opening_roll, switch_turn
+from cuda_graph_step import (ENV as GRAPH_ENV, GraphedTrainStep, mode_from_env,
+                             env_explicit as graph_env_explicit,
+                             env_label as graph_env_label,
+                             resolve_mode as resolve_graph_mode)
 from encoding import CubePerspective
 from modes import GameMode, cube_perspective
+from pool_guard import (PoolWatch, WorkerDied, announce_restart,
+                        max_pool_restarts, shutdown_pool, GuardedPool)
 
 
-# Safety bound on self-play episode length, in PLIES (turns), not
-# samples. Neither episode loop below has any natural termination
-# guarantee: they run `while not mode.is_episode_over(state)`, and a
-# degenerate policy can produce games that never reach a terminal
-# state (mutual hitting / recirculation, or a bear-in the net refuses
-# to complete). Such an episode spins at full turn throughput forever
-# while its sample lists grow without bound -- the master blocks on the
-# round barrier (pool.map get()) and worker RSS climbs until the OOM
-# killer fires.
-#
-# Healthy play is ~65-340 plies, so 1500 never fires on a healthy run
-# while still bounding a runaway episode to a few thousand samples.
+# Safety bound on self-play episode length, in plies (turns), for the
+# money collectors. Match play has its own per-game bound (0 = none,
+# the default; see Trainer.train's `max_episode_plies`).
 DEFAULT_MAX_EPISODE_PLIES = 1500
-
-# VRAM preflight for the vectorized GPU collector. Each vectorized
-# worker process owns a full CUDA context (~420 MB); the estimate is
-# deliberately conservative -- a capped-but-running collector beats an
-# OOM forty minutes into a leg.
-VEC_PER_WORKER_BYTES = 420 * 2**20
-VEC_RESERVE_BYTES = 512 * 2**20   # master context / display / allocator slack
-
-
-def vectorized_vram_cap(requested_workers: int, free_bytes: int) -> int:
-    """How many vectorized GPU worker processes fit in `free_bytes`.
-
-    Pure function so the arithmetic is unit-testable without a GPU.
-    Returns min(requested, floor((free - reserve) / per_worker)),
-    clamped at >= 0. The CALLER decides what to do with 0 or 1 (fall
-    back to the CPU collector -- one worker forfeits lockstep batching).
-    """
-    if requested_workers <= 0:
-        return 0
-    budget = free_bytes - VEC_RESERVE_BYTES
-    if budget <= 0:
-        return 0
-    return min(requested_workers, int(budget // VEC_PER_WORKER_BYTES))
 
 
 # ── Episode collection (mode-agnostic, agent-driven) ──────────────────
@@ -78,57 +59,38 @@ def collect_episode(
     mode: GameMode,
     rng: random.Random,
     oneply: bool = False,
-    cube_targets_1ply: bool = False,
     max_episode_plies: int = DEFAULT_MAX_EPISODE_PLIES,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Play one self-play episode and return (encodings, targets).
 
-    Encodings are computed once per turn via `agent.encode_state` so
-    the training pass can skip re-encoding. Cubeless move selection
-    is always 0-ply; cubeful respects agent.oneply.
-
-    `max_episode_plies`: safety bound (see DEFAULT_MAX_EPISODE_PLIES).
-    An episode that exceeds it is DISCARDED -- the function returns
-    empty arrays. Discarding rather than truncating is deliberate: a
-    runaway episode's samples come from a degenerate region of state
-    space and would poison the pool, and truncate-and-bootstrap would
-    change TD semantics. Empty arrays are the discard signal; a
-    legitimate episode always emits at least one sample, so callers can
-    treat "empty" as "discarded". Pass <= 0 to disable the bound.
-    Applies to the money collectors and the cubeless body below; the
-    matchplay serial collector deliberately does NOT bound episode
-    length (matches are long and healthy; its vectorized path bounds
-    per GAME instead).
+    Cubeless move selection is always 0-ply. Cubeful respects
+    agent.oneply.
 
     Targets:
-      oneply=False: bootstrap from the value already computed during
-                    selection (with_target=True), or terminal target
-                    at episode end.
-      oneply=True:  `agent.value_oneply_checker(state)` at every turn —
-                    enumerates all 21 dice for a low-variance estimate.
-                    Terminal handling is folded into the average
-                    (winning moves contribute their value), so no
-                    special terminal-target override is needed.
+      oneply=False: the bootstrap value computed during selection, or
+                    the terminal target at episode end.
+      oneply=True:  `agent.value_oneply_checker(state)` every turn
+                    (average over all 21 dice; terminal moves are
+                    folded into the average).
 
-    Cubeful modes: if `mode.initial_match_state()` returns a
-    MatchState, dispatches to the cubeful collector which also
-    generates cube-decision samples.
+    Cubeful modes (`mode.initial_match_state()` is a MatchState)
+    dispatch to the cubeful collector, which also emits cube-decision
+    samples; match play (a MatchState with match_length > 0) to the
+    match collector.
+
+    `max_episode_plies` (money modes): an episode exceeding it is
+    DISCARDED (empty arrays returned), not truncated. A legitimate
+    episode always emits at least one sample, so empty means discarded.
+    <= 0 disables the bound. The match collector ignores it.
     """
     initial_match_state = mode.initial_match_state()
+    if initial_match_state is not None and initial_match_state.is_matchplay:
+        return _collect_episode_matchplay(
+            agent, mode, rng, initial_match_state, oneply=oneply,
+        )
     if initial_match_state is not None:
-        if initial_match_state.is_matchplay:
-            return _collect_episode_matchplay(
-                agent, mode, rng, initial_match_state, oneply=oneply,
-                cube_targets_1ply=cube_targets_1ply,
-            )
-        if getattr(mode, "take_decision_state", False):
-            return _collect_episode_cubeful_money_take(
-                agent, mode, rng, initial_match_state,
-                oneply=oneply, cube_targets_1ply=cube_targets_1ply,
-            )
         return _collect_episode_cubeful_money(
-            agent, mode, rng, initial_match_state,
-            oneply=oneply, cube_targets_1ply=cube_targets_1ply,
+            agent, mode, rng, initial_match_state, oneply=oneply,
             max_episode_plies=max_episode_plies,
         )
 
@@ -139,7 +101,7 @@ def collect_episode(
 
     while not mode.is_episode_over(state):
         if max_episode_plies > 0 and plies >= max_episode_plies:
-            # Runaway episode -- discard (see docstring).
+            # Runaway episode: discard.
             return (
                 np.empty((0, 0), dtype=np.float32),
                 np.empty((0,), dtype=np.float32),
@@ -148,9 +110,8 @@ def collect_episode(
         enc_list.append(agent.encode_state(state))
 
         if oneply:
-            # 1-ply target for the current state (checker decision).
+            # 1-ply target; 0-ply move selection.
             targets.append(agent.value_oneply_checker(state))
-            # Move selection at 0-ply (fast).
             result = agent.choose_checker_action(state, dice, with_target=False)
             if result is not None:
                 _, next_state = result
@@ -189,37 +150,118 @@ def collect_episode(
 # ── Cubeful episode collection (money only) ──────────────────────────
 
 
+class _CubeDecision(NamedTuple):
+    """Resolved cube-decision phase. enc/target: the cube-phase sample.
+    match_state: after the cube action (transfers on a take). dropped:
+    double/pass, the episode ends here."""
+    enc: np.ndarray
+    target: float
+    match_state: object
+    dropped: bool
+
+
+def _resolve_cube_decision(
+    agent,
+    state: BoardState,
+    match_state,
+    pre_persp,
+    do_double: bool,
+    takes: bool,
+    v_no_double: float,
+    v_double_take: float,
+) -> _CubeDecision:
+    """What the cube-decision phase emits. Every cubeful collector
+    resolves its cube phase here (the 1-ply generator below, driven by
+    both the CPU and the vectorized collector, and the CPU 0-ply
+    branch), so the emission semantics cannot drift between them.
+
+      double/take:  target = v_double_take, cube transfers. Always
+                    emitted (cube ownership is a live input).
+      double/pass:  target = +1.0, episode ends. Always emitted.
+      no double:    target = v_no_double.
+    """
+    player = state.turn
+    if do_double:
+        enc = agent._encode_cubeful(state, pre_persp, is_cube_action=True)
+        if takes:
+            return _CubeDecision(
+                enc, v_double_take, match_state.after_take(player), False,
+            )
+        return _CubeDecision(enc, 1.0, match_state, True)
+    enc = agent._encode_cubeful(state, pre_persp, is_cube_action=True)
+    return _CubeDecision(enc, v_no_double, match_state, False)
+
+
+def _cube_phase_oneply_gen(agent, state: BoardState, match_state):
+    """The cube-decision phase of both 1-ply cubeful-money collectors.
+
+    Yields one (2, n_feat) stack [no-double, double-take], receives the
+    two fp32 values, returns a _CubeDecision. The CPU collector drives
+    it against the agent's own net (_drive_cube_phase_local). The
+    vectorized collector delegates via `yield from` so its lockstep
+    driver batches the forward.
+
+    Cube targets are direct net evaluations (no dice to average over),
+    both in one forward(batch=2).
+    """
+    player = state.turn
+    pre_persp = cube_perspective(match_state.cube_owner, player)
+    x_nd = agent._encode_cubeful(state, pre_persp, is_cube_action=False)
+    x_dt = agent._encode_cubeful(
+        state, CubePerspective.THEIRS, is_cube_action=False,
+    )
+    values = yield np.stack([x_nd, x_dt])
+    values = np.asarray(values, dtype=np.float32).ravel()
+    v_no_double = float(values[0])
+    v_double_take = 2.0 * float(values[1])
+    do_double = agent._money_cube_decision(
+        v_no_double, v_double_take, pre_persp, match_state.jacoby,
+    )
+    takes = (v_double_take <= 1.0) if do_double else False
+    return _resolve_cube_decision(
+        agent, state, match_state, pre_persp,
+        do_double, takes, v_no_double, v_double_take,
+    )
+
+
+def _drive_cube_phase_local(agent, gen) -> _CubeDecision:
+    """Run _cube_phase_oneply_gen to completion with the agent's own
+    net doing the single forward."""
+    feats = next(gen)
+    t = agent._to_device(torch.from_numpy(feats))
+    with torch.no_grad():
+        values = agent.network(t).flatten()
+    try:
+        gen.send(values.cpu().numpy())
+    except StopIteration as e:
+        return e.value
+    raise RuntimeError("cube phase generator yielded more than once")
+
+
 def _collect_episode_cubeful_money(
     agent: Agent,
     mode: GameMode,
     rng: random.Random,
     match_state,
     oneply: bool = False,
-    cube_targets_1ply: bool = False,
     max_episode_plies: int = DEFAULT_MAX_EPISODE_PLIES,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Cubeful MONEY-game episode collector.
+    """Cubeful money-game episode collector.
 
-    The cube decision is a proper TD transition: each turn that is
-    eligible for doubling emits a cube-phase sample (is_cube_action=1)
-    whose target is the checker-phase value after the cube action
-    resolves:
-      - No double:   target = V(state, is_cube_action=0, same perspective)
-      - Double/pass: target = +1.0 (doubler wins 1 per unit)
-      - Double/take: target = 2 * V(state, is_cube_action=0, theirs)
+    Each turn eligible for doubling emits a cube-phase sample
+    (is_cube_action=1) whose target is the checker-phase value after
+    the cube action resolves:
+      - No double:   V(state, is_cube_action=0, same perspective)
+      - Double/pass: +1.0
+      - Double/take: 2 * V(state, is_cube_action=0, theirs)
 
-    The checker-phase sample (is_cube_action=0) follows as before, with
-    bootstrap = -V(opp view) or terminal game_result at episode end.
+    Then the checker-phase sample (is_cube_action=0) with bootstrap
+    -V(opp view), or the terminal target at episode end.
 
     All targets are per-unit equity (cube_value = 1).
 
-    `max_episode_plies`: see collect_episode. Exceeding it discards the
-    episode (returns empty arrays). Pass <= 0 to disable.
+    `max_episode_plies`: see collect_episode.
     """
-    from dataclasses import replace
-    from encoding import CubePerspective
-    from modes import CubeOwner, cube_perspective
-
     state, dice = opening_roll(rng)
     enc_list: List[np.ndarray] = []
     targets: List[float] = []
@@ -228,7 +270,7 @@ def _collect_episode_cubeful_money(
 
     while not mode.is_episode_over(state):
         if max_episode_plies > 0 and plies >= max_episode_plies:
-            # Runaway episode -- discard (see collect_episode docstring).
+            # Runaway episode: discard.
             return (
                 np.empty((0, 0), dtype=np.float32),
                 np.empty((0,), dtype=np.float32),
@@ -237,82 +279,30 @@ def _collect_episode_cubeful_money(
         player = state.turn
 
         # ── Cube decision phase (if eligible) ───────────────────────
-        oneply_no_double = None  # cached for checker-phase reuse
         if not is_opening and match_state.can_offer(player):
-            pre_persp = cube_perspective(match_state.cube_owner, player)
-
-            # Emit cube-phase sample: is_cube_action=True
-            enc_list.append(agent._encode_cubeful(
-                state, pre_persp, is_cube_action=True,
-            ))
-
             if oneply:
-                opponent = 1 - player
-                theirs_ms = replace(
-                    match_state, cube_owner=CubeOwner(opponent + 1),
-                )
-                if cube_targets_1ply:
-                    # EXPERIMENTAL: pure 1-ply cube targets. Conceptually
-                    # the deeper search (1-ply lookahead at cube decisions),
-                    # but empirically inflates slack at boundary positions
-                    # via a subtle bug in value_oneply_checker_cubeful, which
-                    # degrades cube performance vs the 0-ply-target default.
-                    v_no_double = agent.value_oneply_checker_cubeful(
-                        state, match_state,
-                    )
-                    oneply_no_double = v_no_double
-                    v_double_take = 2.0 * agent.value_oneply_checker_cubeful(
-                        state, theirs_ms,
-                    )
-                else:
-                    # Default: 0-ply cube targets while keeping 1-ply for
-                    # the checker phase. Avoids the 1-ply cube-target
-                    # inflation that produced r8_tmp's cube_mEMG regression.
-                    # Batched into one forward(batch=2) — saves one network
-                    # dispatch per cube-eligible turn.
-                    x_nd = agent._encode_cubeful(
-                        state, pre_persp, is_cube_action=False,
-                    )
-                    x_dt = agent._encode_cubeful(
-                        state, CubePerspective.THEIRS, is_cube_action=False,
-                    )
-                    t = torch.from_numpy(np.stack([x_nd, x_dt]))
-                    t = agent._to_device(t)
-                    with torch.no_grad():
-                        values = agent.network(t).flatten()
-                    v_no_double = float(values[0].item())
-                    v_double_take = 2.0 * float(values[1].item())
-                    # leave oneply_no_double = None so checker_target
-                    # below recomputes via 1-ply (don't reuse 0-ply v_nd)
-                do_double = agent._money_cube_decision(
-                    v_no_double, v_double_take, pre_persp, match_state.jacoby,
-                )
-                offer = None
+                # Shared with the vectorized collector, driven locally.
+                dec = _drive_cube_phase_local(agent, _cube_phase_oneply_gen(
+                    agent, state, match_state,
+                ))
             else:
+                pre_persp = cube_perspective(match_state.cube_owner, player)
                 offer = agent.offer_double(state, match_state)
                 do_double = offer.should_double
-                v_double_take = offer._cache["v_double_take_0ply"]
-                v_no_double = offer._cache["v_no_double_0ply"]
-
-            if do_double:
-                if oneply:
-                    takes = v_double_take <= 1.0
-                else:
-                    takes = agent.respond_to_double(
-                        state, match_state, hint=offer,
-                    )
-                if takes:
-                    # Cube target: stake doubles, cube transfers.
-                    targets.append(v_double_take)
-                    match_state = match_state.after_take(player)
-                    oneply_no_double = None
-                else:
-                    # Cube target: opponent drops, we win 1 per unit.
-                    targets.append(1.0)
-                    break
-            else:
-                # No double: cube target = checker-phase value.
-                targets.append(v_no_double)
+                takes = agent.respond_to_double(
+                    state, match_state, hint=offer,
+                ) if do_double else False
+                dec = _resolve_cube_decision(
+                    agent, state, match_state, pre_persp,
+                    do_double, takes,
+                    offer._cache["v_no_double_0ply"],
+                    offer._cache["v_double_take_0ply"],
+                )
+            enc_list.append(dec.enc)
+            targets.append(dec.target)
+            match_state = dec.match_state
+            if dec.dropped:
+                break
 
         # ── Checker decision phase ──────────────────────────────────
         post_persp = cube_perspective(match_state.cube_owner, player)
@@ -321,12 +311,9 @@ def _collect_episode_cubeful_money(
         ))
 
         if oneply:
-            if oneply_no_double is not None:
-                checker_target = oneply_no_double
-            else:
-                checker_target = agent.value_oneply_checker_cubeful(
-                    state, match_state,
-                )
+            checker_target = agent.value_oneply_checker_cubeful(
+                state, match_state,
+            )
             targets.append(checker_target)
             result = agent.choose_checker_action_cubeful(
                 state, dice, match_state,
@@ -378,36 +365,74 @@ def _collect_episode_cubeful_money(
 
 # ── Matchplay episode collection ───────────────────────────────────────
 
-# Boundary-sample weight. Keep the default 1: boundary rows fire only
-# on the winner's game-ending move (a conditioned branch of the
-# pre-move state), so any weight > 1 biases the weighted fixed point
-# upward near game ends -- upweighting is NOT fixed-point-neutral.
-#
-_BOUNDARY_UPWEIGHT = 1
+# Duplication factor for game-boundary samples in the matchplay
+# collector. The match-equity grounding (score-transition value) only
+# enters at game boundaries; upweighting accelerates its propagation
+# into the score-feature columns without changing the fixed point.
+# Boundary-sample weight. HISTORY: introduced as 3 with the
+# claim it accelerates match-equity propagation "without changing the
+# fixed point" -- that claim is FALSE and was the root cause of a TD
+# degradation seen in training. Boundary rows fire only on the
+# winner's game-ending move (a conditioned branch of the pre-move
+# state); the fixed-weights drift probe measured them at +13 mMWC on a
+# calibrated net, and tripling them biases the weighted fixed point
+# upward near game ends (0-ply TD from the oracle net: -2.1pp vs
+# parent at weight 3, exactly 0.0 at weight 1, n=20k). Default is now
+# the unbiased 1; the env override reproduces historical runs.
+_BOUNDARY_UPWEIGHT = int(os.environ.get("TRAINER_BOUNDARY_UPWEIGHT", "1"))
 
-# Cube-action exploration: eps of cube-eligible turns execute a random
-# double and a random take. The cube-phase target is the OPTIMAL-action
-# backup max(v_nd, min(v_dt, v_dp)) regardless of the executed action,
-# so targets stay unbiased -- but exploration reshapes the state
-# distribution. Default 0 -- and note --score-curriculum also defaults
-# to 0, so a default run gets score coverage only from naturally
-# reached scores: neither seeding nor cube exploration widens it. If a
-# net's cube policy ever collapses to never-double, cube-state coverage
-# starves; the env override is the escape hatch.
+# Cube-action exploration rate during matchplay collection. Without
+# it, a noise-level early cube policy can double nearly every game,
+# making every 2pt match a single doubled game — Crawford and
+# post-Crawford scores then never appear in the data and their values
+# (the implicit MET) never train. The cube-phase sample target is the
+# OPTIMAL-action backup max(v_nd, min(v_dt, v_dp)) regardless of the
+# executed action, so exploration diversifies trajectories without
+# corrupting the value definition.
+# Cube exploration (added with the boundary
+# upweight): eps of cube-eligible turns execute a random double and a
+# random take. Targets stay unbiased (optimal-action backup), but it
+# feeds --outcome-mix's z with a mis-cubing policy's outcomes and
+# reshapes the state distribution. Default 0
+# (author's call): the score curriculum handles score coverage, and a
+# calibrated net's greedy cube play generates doubled-cube states
+# naturally. Env override reproduces historical runs (0.25). If a
+# future net's cube policy collapses to never-double, cube-state
+# coverage starves again -- the override is the escape hatch.
 _CUBE_EXPLORATION_EPS = float(os.environ.get(
     "TRAINER_CUBE_EXPLORATION_EPS", "0.0"))
 
-def _curriculum_start(initial_match_state, rng, p):
+# Checker-move exploration rate. The collector was fully greedy on checker
+# play, so the TD leg only ever visited states its own argmax led to: a
+# closed loop whose 1-ply residual sits at ~3e-6 from the first round, with
+# no mechanism to discover the errors it is self-consistent about.
+# Exploration is target-safe for the same reason the cube version is: under
+# --oneply the checker target is value_oneply_checker_matchplay(state), a max
+# over successors computed from the STATE, so it is unchanged by which move
+# is executed. In the 0-ply path the bootstrap comes from the chosen
+# successor, so the collector backs up the GREEDY successor's value while
+# executing the explored one -- ordinary off-policy TD, not the random
+# policy's value.
+_MOVE_EXPLORATION_EPS = float(os.environ.get(
+    "TRAINER_MOVE_EXPLORATION_EPS", "0.0"))
+
+# Fraction of matchplay episodes that start directly at a later score
+# (uniform over reachable away-score pairs) so every score context
+# trains in parallel with the natural full-match distribution. The
+# original 2pt fix seeded only 1-away scores; at longer match lengths
+# the intermediate scores (e.g. (2,3) and (2,2) at 3pt) otherwise rely
+# on chained games and exploration passes to appear at all.
+_SCORE_CURRICULUM_P = float(os.environ.get(
+    "TRAINER_SCORE_CURRICULUM_P", "0.5"))
+
+
+def _curriculum_start(initial_match_state, rng):
     """Sample a curriculum start score for one matchplay episode:
-    with probability 1 - p the natural full-match start, otherwise a
-    uniformly random reachable away-score pair, so every score context
-    trains in parallel with the natural full-match distribution (at
-    longer match lengths the intermediate scores otherwise rely on
-    chained games to appear at all). 1-away scores split between the
-    Crawford game itself and the post-Crawford continuation; (1,1) is
-    always post-Crawford in a real match. `p` is
-    MatchplayMode.score_curriculum (--score-curriculum); p == 0 means
-    every episode starts at the natural full-match score."""
+    with probability 1 - _SCORE_CURRICULUM_P the natural full-match
+    start, otherwise a uniformly random reachable away-score pair.
+    1-away scores split between the Crawford game itself and the
+    post-Crawford continuation; (1,1) is always post-Crawford in a
+    real match."""
     from dataclasses import replace as _replace
     n = initial_match_state.match_length
     # Diagnostic override: pin EVERY episode's start score, e.g.
@@ -420,7 +445,7 @@ def _curriculum_start(initial_match_state, rng, p):
             initial_match_state, my_away=fmy, opp_away=fopp,
             crawford_done=(fmy == 1 or fopp == 1),
         )
-    if n <= 1 or p <= 0.0 or rng.random() >= p:
+    if n <= 1 or rng.random() >= _SCORE_CURRICULUM_P:
         return initial_match_state
     my, opp = rng.randint(1, n), rng.randint(1, n)
     while (my, opp) == (n, n):
@@ -535,14 +560,22 @@ def _td_move_rows(agent, state, dice, gms, eps, chosen_succ):
     """Self-consistency rows for the near-tied successors the chooser
     evaluated and did NOT play.
 
-    Only the successor actually played ever receives a TD row, and the
-    passed-over siblings are not wrong at random: argmin selects
-    whichever sibling is favourably erred, so V systematically
-    UNDERVALUES the skipped ones while a skipped sibling's own 1-ply
-    value is unbiased -- the correction exists, it just never becomes a
-    row. Emitting a row for a successor does NOT play it: the
-    trajectory is untouched -- unlike random exploration, which walks
-    off the near-optimal manifold and measured harmful.
+    The 1-ply target at `state` is an average over 21 dice of a max over
+    that dice's successors, so ONE target consumes ~540 successor reads
+    (measured on real self-play) while only the successor actually played
+    ever receives a row. Those read-only states are not wrong at random:
+    argmin selects whichever sibling is favourably erred, so the ones
+    passed over stay stale. Measured over 128 positions that
+    gnubg confirms at both 2 and 4 ply: V undervalues the skipped sibling
+    by +12.30 +/- 1.64 mMWC, while that sibling's OWN 1-ply value is
+    statistically unbiased against rollout truth (+0.36 +/- 2.27). So the
+    correction we need already exists -- it just never becomes a row.
+
+    Emitting a row for a successor does NOT play it. The trajectory is
+    untouched, which is what separates this from --move-explore-eps:
+    random exploration walks off the near-optimal manifold (measured
+    harmful, monotone in temperature, two bases), whereas the untrained
+    mass IS the near-optimal siblings.
 
     Membership uses the cheap 0-ply values the chooser ranks on, so the
     set matches what actually decided the move; that is a selection rule,
@@ -609,7 +642,7 @@ def _oracle_move_rows(oracle, agent, state, dice, gms, eps, plies=0,
           V_student(a_oracle_best) - eps (every move the student rates
           competitive with the oracle's choice -- including inflated
           favorites the oracle rates far below best, the reads that
-          actually drive wrong argmaxes).
+          actually drive wrong argmaxes; targeted-probe diagnosis).
     Membership uses cheap 0-ply values on both sides; that is a
     selection rule, not a target.
 
@@ -709,7 +742,6 @@ def _collect_episode_matchplay(
     initial_match_state,
     oneply: bool = False,
     start: Optional[tuple] = None,
-    cube_targets_1ply: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Matchplay episode collector. One episode = one full MATCH:
     games chain via MatchState.start_game/after_game until
@@ -737,13 +769,15 @@ def _collect_episode_matchplay(
     """
     from modes import cube_perspective  # noqa: F401  (parity with money collector)
 
+    from dataclasses import replace as _replace
+
     enc_list: List[np.ndarray] = []
     targets: List[float] = []
+    viewers: List[int] = []  # sample viewer (player), for outcome_mix
     match_state = initial_match_state
 
     # Score curriculum (see _curriculum_start).
-    match_state = _curriculum_start(
-        initial_match_state, rng, getattr(mode, "score_curriculum", 0.0))
+    match_state = _curriculum_start(initial_match_state, rng)
 
     # Targeted-training entry: start=(state0, gms0) begins the FIRST
     # game mid-board at that exact position (cube phase live on the
@@ -758,9 +792,16 @@ def _collect_episode_matchplay(
     # Supervised oracle mode: acting stays with `agent`; every target
     # below is REPLACED by the oracle value of the encoded state.
     oracle = None
-    # Act-only: the teacher supplies MOVES but no targets -- transfers
-    # the teacher's ranking via trajectories while the student keeps its
-    # own 1-ply TD targets, so no teacher calibration error is imported.
+    # Act-only: the teacher supplies MOVES but no targets. p5jan outplays the
+    # champion at checker by 5.84 mMWC yet distilling its VALUES damages the
+    # net (-1.85/-2.05), i.e. its ranking is better than its calibration. This
+    # mode transfers the ranking (via trajectories) and keeps the student's own
+    # 1-ply TD targets, so no calibration error is imported.
+    # Indices of the on-trajectory CHECKER rows, so --td-eps-only can drop
+    # them at the end. Recorded rather than skipped inline because targets
+    # are appended from several branches; filtering once at the end keeps
+    # enc_list/targets/viewers aligned by construction.
+    _traj_rows = []
     _act_only = bool(getattr(mode, "oracle_act_only", False))
     _oplies = int(getattr(mode, "oracle_plies", 0) or 0)
     _spec = getattr(mode, "oracle_spec", None)
@@ -793,31 +834,21 @@ def _collect_episode_matchplay(
                     ms_take_row = game_ms.after_take(player)
                     enc_list.append(agent._encode_matchplay(
                         state, ms_take_row, is_cube_action=False))
+                    viewers.append(player)
                     targets.append(_oracle_target(
                         oracle, state, ms_take_row, False,
                         plies=_oplies))
                 enc_list.append(agent._encode_matchplay(
                     state, game_ms, is_cube_action=True,
                 ))
+                viewers.append(player)
                 offer = agent.offer_double_matchplay(state, game_ms)
                 c = offer._cache
                 # Cube-phase target: optimal-action backup, independent
-                # of any exploration of the executed action below.
-                #
-                # DEPTH CONSISTENCY. offer_double_matchplay prices v_nd and
-                # v_dt with 0-ply reads; under --oneply the checker rows
-                # train toward a 21-dice enumeration, so composing cube
-                # targets from 0-ply reads trains the two channels toward
-                # different depths of the same quantity, and the
-                # inconsistency grows as checker training moves V. v_dp is
-                # an exact MET lookup and needs no re-pricing.
-                if cube_targets_1ply and oneply:
-                    v_nd = agent.value_oneply_checker_matchplay(state, game_ms)
-                    v_dt = agent.value_oneply_checker_matchplay(
-                        state, game_ms.after_take(player))
-                    v_cube_opt = max(v_nd, min(v_dt, c["v_dp"]))
-                else:
-                    v_cube_opt = max(c["v_nd"], min(c["v_dt"], c["v_dp"]))
+                # of any exploration of the executed action below. v_nd
+                # and v_dt are offer_double_matchplay's 0-ply reads (also
+                # under --oneply); v_dp is an exact MET lookup.
+                v_cube_opt = max(c["v_nd"], min(c["v_dt"], c["v_dp"]))
                 if oracle is not None and not _act_only:
                     v_cube_opt = _oracle_target(
                         oracle, state, game_ms, True, plies=_oplies)
@@ -863,6 +894,7 @@ def _collect_episode_matchplay(
                             for _ in range(_BOUNDARY_UPWEIGHT - 1):
                                 enc_list.append(enc_list[-1])
                                 targets.append(t)
+                                viewers.append(player)
                         game_done = True
                         continue
                 else:
@@ -881,6 +913,7 @@ def _collect_episode_matchplay(
                     for enc_row, tv in _rows:
                         enc_list.append(enc_row)
                         targets.append(tv)
+                        viewers.append(1 - player)
             # Teacher-forced acting (DAgger beta-mix). The teacher's move
             # is already computed as the eps-set anchor, so acting on it
             # costs nothing. beta=0 is pure student acting (the historical
@@ -894,9 +927,11 @@ def _collect_episode_matchplay(
             _act_p = float(getattr(mode, "oracle_act_prob", 0.0) or 0.0)
             force_teacher = (teacher_succ is not None and _act_p > 0.0
                              and rng.random() < _act_p)
+            _traj_rows.append(len(enc_list))
             enc_list.append(agent._encode_matchplay(
                 state, game_ms, is_cube_action=False,
             ))
+            viewers.append(player)
             t_oracle = (None if (oracle is None or _act_only)
                         else _oracle_target(oracle, state, game_ms, False,
                                             plies=_oplies))
@@ -906,6 +941,18 @@ def _collect_episode_matchplay(
             if force_teacher and result is not None:
                 # Same successor set; only which one we walk into changes.
                 result = (teacher_succ, result[1])
+            _mx = float(getattr(mode, "move_explore_eps", 0.0) or 0.0)
+            if _mx <= 0.0:
+                _mx = _MOVE_EXPLORATION_EPS
+            if (result is not None and _mx > 0.0 and not force_teacher
+                    and rng.random() < _mx):
+                # Execute a random legal move; keep the greedy successor's
+                # bootstrap so the target is still the optimal-action backup.
+                from backgammon_engine import get_legal_plays as _glp
+                _plays = _glp(state, dice)
+                if len(_plays) > 1:
+                    _, _rs = _plays[rng.randrange(len(_plays))]
+                    result = (_rs, result[1])
             if result is None:
                 # Forced pass: dice go to the opponent.
                 opp_view = switch_turn(state)
@@ -915,8 +962,7 @@ def _collect_episode_matchplay(
                     # Same convention: the 0-ply read below is
                     # conditioned on having danced; 1-ply rows keep
                     # the unconditional dice-average target.
-                    t = agent.value_oneply_checker_matchplay(
-                        state, game_ms)
+                    t = agent.value_oneply_checker_matchplay(state, game_ms)
                 else:
                     opp_cube_action = game_ms.can_offer(opp_view.turn)
                     v_opp = agent.evaluate_matchplay(
@@ -943,12 +989,12 @@ def _collect_episode_matchplay(
                         # terminal branches exactly, whereas the
                         # realized boundary is emitted only when the
                         # mover's roll won -- conditioning this row
-                        # class on winning is an upward bias the
+                        # class on winning (+20 mMWC vs T1 at
+                        # oracle-v2 weights), an upward bias the
                         # bootstrap transports match-wide. The money
                         # collector never overrides 1-ply targets at
                         # terminals.
-                        t = agent.value_oneply_checker_matchplay(
-                            state, game_ms)
+                        t = agent.value_oneply_checker_matchplay(state, game_ms)
                     elif match_state.match_over():
                         # The mover just won the match; the sample is
                         # encoded from the mover's perspective, so the
@@ -963,19 +1009,17 @@ def _collect_episode_matchplay(
                     for _ in range(_BOUNDARY_UPWEIGHT - 1):
                         enc_list.append(enc_list[-1])
                         targets.append(t)
+                        viewers.append(player)
                     game_done = True
                     continue
+                _te = float(getattr(mode, "td_move_eps", 0.0) or 0.0)
                 if t_oracle is not None:
                     targets.append(t_oracle)
                 elif oneply:
                     # 1-ply target: 21-dice enumeration with exact
                     # terminal (gammon-aware) pricing. Acting stays
                     # 0-ply via the chosen move above.
-                    targets.append(
-                        agent.value_oneply_checker_matchplay(
-                            state, game_ms,
-                        )
-                    )
+                    targets.append(agent.value_oneply_checker_matchplay(state, game_ms))
                 else:
                     targets.append(bootstrap)
                 # Self-consistency rows for the near-tied successors we
@@ -983,13 +1027,13 @@ def _collect_episode_matchplay(
                 # state's own target: enc_list runs one ahead of targets
                 # until that append, so inserting earlier would pair the
                 # state row with the wrong target.
-                _te = float(getattr(mode, "td_move_eps", 0.0) or 0.0)
                 if _te > 0.0 and oracle is None:
                     for _enc, _tv in _td_move_rows(
                         agent, state, dice, game_ms, _te, next_state,
                     ):
                         enc_list.append(_enc)
                         targets.append(_tv)
+                        viewers.append(1 - player)
                 state = next_state
 
             dice = (rng.randint(1, 6), rng.randint(1, 6))
@@ -1004,227 +1048,38 @@ def _collect_episode_matchplay(
             np.empty((0,), dtype=np.float32),
         )
     t_arr = np.asarray(targets, dtype=np.float32)
+    mix = getattr(mode, "outcome_mix", 0.0)
+    if mix > 0.0:
+        # Ground every target with the realized match outcome from the
+        # sample viewer's perspective. Away scores are WHITE's view.
+        assert len(viewers) == len(targets)
+        white_won = match_state.my_away <= 0
+        z = np.asarray(
+            [1.0 if (white_won if v == 0 else not white_won) else 0.0
+             for v in viewers],
+            dtype=np.float32,
+        )
+        t_arr = (1.0 - mix) * t_arr + mix * z
+    if bool(getattr(mode, "td_eps_only", False)) and _traj_rows:
+        # Keep the eps rows (successor -> its own 1-ply value), the cube
+        # rows and the game-boundary rows; drop the on-trajectory checker
+        # targets.
+        #
+        # NOT "unbootstrapped": T1 is computed from the network's own V, so
+        # the eps rows bootstrap too. This changes WHICH self-referential
+        # operator is iterated, nothing more. Worth distinguishing because
+        # every TD variant tried degrades a converged net with dose, which
+        # is what iterating toward a fixed point WORSE than the oracle-set
+        # weights looks like -- and batch loss already sits at ~1.6e-6
+        # (RMSE ~1.3 mMWC), i.e. V is near its own 1-ply fixed point with
+        # little left to learn.
+        _drop = set(_traj_rows)
+        _keep = [i for i in range(len(enc_list)) if i not in _drop]
+        enc_list = [enc_list[i] for i in _keep]
+        t_arr = t_arr[_keep]
     return (
         np.stack(enc_list),
         t_arr,
-    )
-
-
-# ── Take-decision-state collector (CubefulTakeEncoder) ────────────────
-
-
-def _collect_episode_cubeful_money_take(
-    agent: Agent,
-    mode: GameMode,
-    rng: random.Random,
-    match_state,
-    oneply: bool = False,
-    cube_targets_1ply: bool = False,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Cubeful MONEY-game collector with explicit take-decision state.
-
-    For agents that use a CubefulTakeEncoder: the take/pass decision
-    is a first-class node in the state graph (not an analytical
-    threshold). Each cube offer can produce up to two transitions:
-
-      (doubler, cube_offer, is_cube_action=1) → V(next state in doubler POV)
-      (responder, take_decision, is_cube_take_decision=1) → V(next state in responder POV)
-
-    Targets are the value of the actually-chosen next state (standard
-    one-step TD; no explicit max anywhere). The +1 ceiling on the
-    doubler's value-of-offering and the "too good" / Jacoby cases all
-    emerge implicitly because V(take_decision) ≥ −1 at convergence
-    (the responder always has the −1 pass alternative).
-
-    All targets are per-unit equity at the current cube_value (the −1
-    pass terminal is invariant under cube_value: absolute pass loss =
-    1 × cube, per-unit = 1).
-
-    Modes:
-      oneply=False (default): all values are 0-ply model evaluations;
-        decisions made by comparing model V at the relevant states.
-      oneply=True, cube_targets_1ply=False (default 1-ply training):
-        chequer targets come from `value_oneply_checker_cubeful`;
-        cube_offer and take_decision targets and decisions use 0-ply
-        model V at the relevant states. Mirrors the existing 1-ply
-        training default in `_collect_episode_cubeful_money` —
-        empirically 1-ply cube targets degrade cube_mEMG, so the
-        default keeps cube targets tied to the model's current V.
-      oneply=True, cube_targets_1ply=True: experimental, 1-ply
-        everywhere (chequer + cube + take_decision).
-    """
-    from modes import cube_perspective
-
-    state, dice = opening_roll(rng)
-    enc_list: List[np.ndarray] = []
-    targets: List[float] = []
-    is_opening = True  # no doubling on the opening roll
-
-    # When oneply=True, cache v_no_double_1ply from the cube phase so
-    # the checker phase can reuse it (avoid a redundant 21-dice
-    # enumeration on the same state).
-    oneply_no_double = None
-    pass_value = -1.0
-
-    while not mode.is_episode_over(state):
-        player = state.turn
-        oneply_no_double = None  # reset per-turn
-
-        # ── Cube decision phase (if eligible) ───────────────────────
-        if not is_opening and match_state.can_offer(player):
-            doubler_persp = cube_perspective(match_state.cube_owner, player)
-
-            # Doubler's offer transition: (state, doubler POV, is_cube_action=1)
-            enc_list.append(agent._encode_cubeful(
-                state, doubler_persp,
-                is_cube_action=True, is_cube_take_decision=False,
-            ))
-
-            responder = 1 - player
-            responder_view = switch_turn(state)
-            responder_persp = cube_perspective(
-                match_state.cube_owner, responder,
-            )
-
-            # Cube/take_decision values for the doubler's offer and the
-            # responder's take/pass: 0-ply by default, 1-ply only when
-            # the user explicitly opts in via cube_targets_1ply=True.
-            use_1ply_cube = oneply and cube_targets_1ply
-
-            if use_1ply_cube:
-                v_no_double = agent.value_oneply_checker_cubeful(
-                    state, match_state,
-                )
-                oneply_no_double = v_no_double  # reusable for chequer phase
-                post_take_ms = match_state.after_take(player)
-                v_doubler_post = agent.value_oneply_checker_cubeful(
-                    state, post_take_ms,
-                )
-                take_value = -2.0 * v_doubler_post
-                if take_value > pass_value:
-                    v_take_decision = take_value
-                    takes_at_init = True
-                else:
-                    v_take_decision = pass_value
-                    takes_at_init = False
-                v_offered = -v_take_decision
-            else:
-                # 0-ply cube/take_decision values from the model directly.
-                v_no_double = agent.evaluate_cubeful(
-                    state, doubler_persp, is_cube_action=False,
-                )
-                v_take_decision = agent.evaluate_cubeful(
-                    responder_view, responder_persp,
-                    is_cube_action=False, is_cube_take_decision=True,
-                )
-                v_offered = -v_take_decision
-                post_take_ms = None
-                takes_at_init = None
-                take_value = None
-
-            do_double = v_offered > v_no_double
-
-            if not do_double:
-                # No-double: target = v_no_double. Under oneply=True,
-                # cube_targets_1ply=False this is the 0-ply chequer V
-                # — the cube_offer state's target stays 0-ply while
-                # the next-emitted chequer transition target is 1-ply,
-                # matching the existing collector's default.
-                targets.append(v_no_double)
-            else:
-                # Double: target for the cube_offer state.
-                targets.append(v_offered)
-
-                # Take_decision transition: (responder POV, is_cube_take=1)
-                enc_list.append(agent._encode_cubeful(
-                    responder_view, responder_persp,
-                    is_cube_action=False, is_cube_take_decision=True,
-                ))
-
-                if use_1ply_cube:
-                    takes = takes_at_init
-                else:
-                    post_take_ms = match_state.after_take(player)
-                    doubler_persp_post = cube_perspective(
-                        post_take_ms.cube_owner, player,
-                    )
-                    v_doubler_post = agent.evaluate_cubeful(
-                        state, doubler_persp_post, is_cube_action=False,
-                    )
-                    take_value = -2.0 * v_doubler_post
-                    takes = take_value > pass_value
-
-                if takes:
-                    targets.append(take_value)
-                    match_state = post_take_ms
-                    oneply_no_double = None  # cube changed, cache stale
-                else:
-                    targets.append(pass_value)
-                    break
-
-        # ── Checker decision phase ──────────────────────────────────
-        post_persp = cube_perspective(match_state.cube_owner, player)
-        enc_list.append(agent._encode_cubeful(
-            state, post_persp,
-            is_cube_action=False, is_cube_take_decision=False,
-        ))
-
-        if oneply:
-            if oneply_no_double is not None:
-                checker_target = oneply_no_double
-            else:
-                checker_target = agent.value_oneply_checker_cubeful(
-                    state, match_state,
-                )
-            targets.append(checker_target)
-            result = agent.choose_checker_action_cubeful(
-                state, dice, match_state,
-            )
-            if result is not None:
-                next_state, _bootstrap = result
-                if next_state.is_game_over():
-                    break
-                state = next_state
-            else:
-                state = switch_turn(state)
-        else:
-            result = agent.choose_checker_action_cubeful(
-                state, dice, match_state,
-            )
-            if result is not None:
-                next_state, bootstrap = result
-                if next_state.is_game_over():
-                    outcome = mode.make_terminal_outcome(
-                        next_state, match_state,
-                    )
-                    targets.append(agent.terminal_target(outcome))
-                    break
-                targets.append(bootstrap)
-                state = next_state
-            else:
-                opp_view = switch_turn(state)
-                opp_persp = cube_perspective(
-                    match_state.cube_owner, opp_view.turn,
-                )
-                opp_cube_action = match_state.can_offer(opp_view.turn)
-                v_opp = agent.evaluate_cubeful(
-                    opp_view, opp_persp,
-                    is_cube_action=opp_cube_action,
-                )
-                targets.append(-v_opp)
-                state = opp_view
-
-        dice = (rng.randint(1, 6), rng.randint(1, 6))
-        is_opening = False
-
-    if not enc_list:
-        return (
-            np.empty((0, 0), dtype=np.float32),
-            np.empty((0,), dtype=np.float32),
-        )
-    return (
-        np.stack(enc_list),
-        np.asarray(targets, dtype=np.float32),
     )
 
 
@@ -1256,6 +1111,471 @@ def _worker_met(met_path):
         hit = MatchEquityTable.from_xml(met_path)
         _WORKER_MET_CACHE[met_path] = hit
     return hit
+
+
+# ── C collector (--c-collect) ─────────────────────────────────────────
+#
+# Two C collectors share the --c-collect plumbing: bgc_collect for the
+# money modes (the default collector of train_batch.py's money runs) and
+# bgc_collect_match for match play (an explicit opt-in).
+
+
+def c_collect_tmpdir() -> str:
+    """A private temp dir for the C collector's weight exports, removed at
+    exit and on SIGTERM (which runs no atexit). The SIGTERM handler is
+    installed only when none is set; forked children re-raise without
+    touching the dir."""
+    import signal
+    d = tempfile.mkdtemp(prefix="bg_ccollect_")    # mode 0700
+    atexit.register(shutil.rmtree, d, ignore_errors=True)
+    owner = os.getpid()
+    try:
+        if signal.getsignal(signal.SIGTERM) is signal.SIG_DFL:
+            def _term(signum, frame):
+                if os.getpid() == owner:
+                    shutil.rmtree(d, ignore_errors=True)
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+            signal.signal(signal.SIGTERM, _term)
+    except ValueError:
+        pass    # not on the main thread
+    return d
+
+
+class _CWeights(NamedTuple):
+    """Stands in for the state_dict in the worker args on the C collector
+    path: the round's weights, exported once by the master
+    (export_weights.export_live) into its private dir, and the libpuretd
+    backend to open them with. Match play only: bgc_collect_match's RNG
+    mode (C_COLLECT_RNG_MODES) and its per-game ply bound (<= 0 unbounded,
+    the serial collector; > 0 the vectorized collector's
+    --max-episode-plies semantics); the money collector takes its bound
+    from the worker args."""
+    path: str
+    backend: str
+    rng_mode: int = 1
+    max_plies: int = 0
+
+
+# The encoders bgc_collect writes rows for: the C API encoder table's
+# entries with collect set (c_api/puretd.c BGC_BASES / BGC_CUBE_BLOCKS,
+# read by puretd_py.encoder_info; tests/test_c_collect.py checks the two
+# agree). Listed here so the preconditions need no library.
+C_COLLECT_ENCODERS = ("perspective196", "cubeful_perspective196")
+
+# The encoders bgc_collect_match writes rows for:
+# the C API encoder table's match-block entries with collect set (read by
+# puretd_py.encoder_info; tests/test_c_collect_match_trainer.py checks the
+# two agree).
+C_COLLECT_MATCH_ENCODERS = ("matchplay1h64met_perspective196",
+                            "matchplay1h64met6_perspective196")
+
+# --c-collect-rng -> bgc_match_collect_opts.rng_mode. "serial" (0): all of a
+# worker's episodes on one random.Random(seed), as _collect_worker plays them
+# (the parity oracle). "vectorized" (1): one Random(base.randint(0, 2**31-1))
+# per episode from base = Random(seed), as vectorized_matchplay_worker plays
+# them -- the production leg's mode, so a C round plays the vectorized
+# recipe's matches for the same --seed and W.
+C_COLLECT_RNG_MODES = {"serial": 0, "vectorized": 1}
+
+# c_api.puretd_py.BACKENDS, the libpuretd_<backend>.so builds (the test
+# checks they agree): train_batch.py's --c-collect-backend choices without
+# importing the C API binding (and bg_fast) into every training run.
+C_COLLECT_BACKENDS = ("torch", "simd", "cblas", "ref")
+
+# puretd.h BGC_KIND_MATCH: the kind bgc_open gives a
+# matchplay export. The start-up probe and every worker refuse another.
+_C_KIND_MATCH = 4
+
+_ALL_MET_SCOPES = frozenset(("cube", "terminal", "boundary"))
+
+
+def _is_match_mode(mode) -> bool:
+    """True when `mode` plays matches (a MatchState with match_length > 0)."""
+    ims = mode.initial_match_state()
+    return ims is not None and ims.is_matchplay
+
+
+def c_collect_rng_mode(rng) -> int:
+    """bgc_match_collect_opts.rng_mode of a --c-collect-rng value
+    ('serial', 'vectorized', or the int 0 / 1); ValueError otherwise."""
+    if isinstance(rng, str):
+        if rng in C_COLLECT_RNG_MODES:
+            return C_COLLECT_RNG_MODES[rng]
+    elif not isinstance(rng, bool) and rng in (0, 1):
+        return int(rng)
+    raise ValueError(f"c_collect_rng must be one of "
+                     f"{sorted(C_COLLECT_RNG_MODES)} (got {rng!r})")
+
+
+def _c_curriculum_force() -> Tuple[int, int]:
+    """TRAINER_CURRICULUM_FORCE as (my, opp) aways; (0, 0) when unset --
+    bgc_match_collect_opts.force_my/force_opp. Read per call, as
+    _curriculum_start reads it. ValueError when it does not parse."""
+    f = os.environ.get("TRAINER_CURRICULUM_FORCE")
+    if not f:
+        return 0, 0
+    fmy, fopp = (int(x) for x in f.split(","))
+    return fmy, fopp
+
+
+def _c_mode_kind(mode) -> Optional[int]:
+    """The puretd engine kind that plays `mode` in bgc_collect (the kind
+    decides the mode: PROB = dmp, EQUITY = cubeless money, CUBEFUL =
+    cubeful money), or None when no kind does."""
+    from modes import CubefulMoneyMode, CubelessMoneyMode, DMPMode
+    from c_api import puretd_py as P
+    return {DMPMode: P.KIND_PROB, CubelessMoneyMode: P.KIND_EQUITY,
+            CubefulMoneyMode: P.KIND_CUBEFUL}.get(type(mode))
+
+
+def _c_net_kind(net) -> Optional[int]:
+    """The kind bgc_open gives an export of `net` (c_api/puretd.c), for
+    the encoders bgc_collect writes; None otherwise. bgc_open's rule on
+    the encoder's facts (encoding.get_encoder): the net's width must be
+    the encoder's, a cubeful encoder with an equity output is CUBEFUL, a
+    cubeless one is PROB / EQUITY by output mode."""
+    from c_api import puretd_py as P
+    from encoding import CubefulEncoder, get_encoder
+    from model import ProbNetwork
+    if isinstance(net, ProbNetwork):
+        return P.KIND_PROB5
+    enc = getattr(net, "encoder_name", "perspective196")
+    if enc not in C_COLLECT_ENCODERS:
+        return None
+    encoder = get_encoder(enc)
+    out = getattr(net, "output_mode", "probability")
+    if getattr(net, "input_size", encoder.num_features) != encoder.num_features:
+        return None                     # bgc_open refuses the width mismatch
+    if isinstance(encoder, CubefulEncoder):
+        return P.KIND_CUBEFUL if out == "equity" else None
+    return {"probability": P.KIND_PROB, "equity": P.KIND_EQUITY}.get(out)
+
+
+def c_collect_fallbacks(net, mode, oneply=True, oneply_acting=False,
+                        boltzmann_temp=0.0, met_path=None, met_scopes=None,
+                        vectorized_collect=False,
+                        gpu_eval_server=False, oracle_eval_server=False,
+                        bf16_collect=False) -> List[str]:
+    """Why the C collector cannot collect this configuration: one reason
+    per unmet precondition, [] when it can. Needs no library.
+
+    Match play (a match mode, or a match-play net in any mode):
+    bgc_collect_match's preconditions (_c_collect_match_fallbacks); an
+    explicit --c-collect with any reason is an ERROR naming all of them.
+    Money modes: bgc_collect's (_c_collect_money_fallbacks);
+    Trainer.train prints each as a NOTE and keeps the Python collector.
+    `met_scopes` None = all three (TDAgent's default)."""
+    enc = getattr(net, "encoder_name", None) or ""
+    if _is_match_mode(mode) or enc.startswith("matchplay"):
+        return _c_collect_match_fallbacks(
+            net, mode, oneply=oneply, oneply_acting=oneply_acting,
+            boltzmann_temp=boltzmann_temp, met_path=met_path,
+            met_scopes=met_scopes,
+            vectorized_collect=vectorized_collect,
+            gpu_eval_server=gpu_eval_server,
+            oracle_eval_server=oracle_eval_server)
+    return _c_collect_money_fallbacks(
+        net, mode, oneply_acting=oneply_acting, boltzmann_temp=boltzmann_temp,
+        bf16_collect=bf16_collect)
+
+
+def _c_collect_money_fallbacks(net, mode, oneply_acting=False,
+                               boltzmann_temp=0.0,
+                               bf16_collect=False) -> List[str]:
+    """bgc_collect's unmet preconditions."""
+    reasons = []
+    if boltzmann_temp != 0:
+        reasons.append(
+            f"--boltzmann-temp {boltzmann_temp:g} (the C collector plays "
+            f"argmin; torch.multinomial sampling has no C twin)")
+    if oneply_acting:
+        reasons.append("--oneply-acting (the C collector plays at 0-ply)")
+    if bf16_collect:
+        reasons.append("--bf16-collect (a Python-collector forward option)")
+    enc = getattr(net, "encoder_name", "perspective196")
+    out = getattr(net, "output_mode", "probability")
+    mode_kind = _c_mode_kind(mode)
+    if mode_kind is None:
+        reasons.append(f"game mode {type(mode).__name__} has no C collector")
+    elif enc not in C_COLLECT_ENCODERS:
+        reasons.append(
+            f"encoder {enc!r} (the C collector writes "
+            f"{' / '.join(C_COLLECT_ENCODERS)} rows only)")
+    elif _c_net_kind(net) != mode_kind:
+        from modes import DMPMode
+        if type(mode) is DMPMode and out == "equity":
+            reasons.append(
+                "dmp with an equity-output net (the engine kind decides the "
+                "mode: an equity net collects cubeless money in C, terminal "
+                "target 1/2/3 instead of dmp's 1)")
+        else:
+            reasons.append(
+                f"{type(mode).__name__} with a {getattr(net, 'input_size', '?')}"
+                f"-input {out} {enc} net (no matching C engine kind)")
+    return reasons
+
+
+def _c_collect_match_fallbacks(net, mode, oneply=True, oneply_acting=False,
+                               boltzmann_temp=0.0, met_path=None,
+                               met_scopes=None,
+                               vectorized_collect=False,
+                               gpu_eval_server=False,
+                               oracle_eval_server=False) -> List[str]:
+    """bgc_collect_match's unmet preconditions (what stays on Python). An
+    explicit --c-collect with any reason is an ERROR naming all of them,
+    raised before any process starts (Trainer.train, train_batch.py):
+    falling back to the serial Python collector would be a 4-10x cliff
+    that a long leg shows only as slow rounds.
+
+    Served in C, so no reason: 0-ply targets (oneply False), the score
+    curriculum (TRAINER_SCORE_CURRICULUM_P, TRAINER_CURRICULUM_FORCE), cube
+    exploration, boundary upweight, --outcome-mix, --max-episode-plies,
+    --pipeline-collect, --workers 1, --bf16-collect (no matchplay forward reads the bf16 net)."""
+    from met import DEFAULT_MET
+    from model import TDNetwork
+    from modes import MatchplayMode
+    reasons = []
+    ims = mode.initial_match_state()
+    is_match = (isinstance(mode, MatchplayMode) and ims is not None
+                and ims.is_matchplay)
+    if not is_match:
+        reasons.append(f"game mode {type(mode).__name__} is not match play "
+                       f"(bgc_collect_match plays matches only)")
+    if vectorized_collect:
+        reasons.append("--vectorized-collect (two collectors for the same "
+                       "rounds: pick one)")
+    if gpu_eval_server:
+        reasons.append("--gpu-eval-server (routes the Python collector's "
+                       "forwards; the C collector forwards in-process)")
+    if oracle_eval_server:
+        reasons.append("--oracle-eval-server (an --oracle-targets option)")
+    if boltzmann_temp != 0:
+        reasons.append(f"--boltzmann-temp {boltzmann_temp:g} (the C "
+                       f"collector plays the argmin; Boltzmann sampling has "
+                       f"no C twin)")
+    if oneply_acting:
+        reasons.append("--oneply-acting (the C collector acts at 0 ply)")
+    k = int(getattr(mode, "oneply_act_k", 0) or 0)
+    if k > 0:
+        reasons.append(f"--td-oneply-act {k} (1-ply acting stays on Python)")
+    if getattr(mode, "oracle_spec", None):
+        reasons.append("--oracle-targets (oracle targets stay on Python)")
+    if (getattr(mode, "oracle_act_only", False)
+            or float(getattr(mode, "oracle_act_prob", 0.0) or 0.0) > 0.0):
+        reasons.append("--oracle-act-only / --oracle-act-prob (teacher "
+                       "acting stays on Python)")
+    te = float(getattr(mode, "td_move_eps", 0.0) or 0.0)
+    if te > 0.0:
+        reasons.append(f"--td-move-eps {te:g} (successor rows stay on "
+                       f"Python)")
+    if getattr(mode, "td_eps_only", False):
+        reasons.append("--td-eps-only (a --td-move-eps option)")
+    mx = float(getattr(mode, "move_explore_eps", 0.0) or 0.0)
+    if mx > 0.0 or _MOVE_EXPLORATION_EPS > 0.0:
+        reasons.append(f"--move-explore-eps {mx:g} / "
+                       f"TRAINER_MOVE_EXPLORATION_EPS "
+                       f"{_MOVE_EXPLORATION_EPS:g} (checker exploration "
+                       f"stays on Python)")
+    met = None
+    if not met_path:
+        reasons.append("no --met (the net's implicit MET, memoised forwards "
+                       "on the initial board, is not served in C; pass "
+                       "--met auto)")
+    else:
+        scopes = (frozenset(met_scopes) if met_scopes is not None
+                  else _ALL_MET_SCOPES)
+        if scopes != _ALL_MET_SCOPES:
+            reasons.append(f"--met-scope {','.join(sorted(scopes))} (the C "
+                           f"collector grounds all three scopes; the others "
+                           f"would be the net's implicit MET)")
+        env_met = os.environ.get("BG_MET_PATH")
+        enc_met = env_met or DEFAULT_MET
+        if os.path.realpath(enc_met) != os.path.realpath(met_path):
+            src = (f"BG_MET_PATH={env_met}" if env_met
+                   else f"the default {DEFAULT_MET}")
+            reasons.append(f"the encoder MET ({src}) is not the grounding "
+                           f"MET (--met {met_path}); the C engine takes one "
+                           f"table for both")
+        try:
+            met = _worker_met(met_path)
+        except Exception as e:  # noqa: BLE001 - reported, not raised
+            reasons.append(f"--met {met_path} cannot be read ({e})")
+    if is_match and met is not None and ims.match_length > met.length:
+        reasons.append(f"--match-length {ims.match_length} is above the "
+                       f"{met.length}-point MET {met_path}")
+    if os.environ.get("TRAINER_CURRICULUM_FORCE"):
+        try:
+            fmy, fopp = _c_curriculum_force()
+            ok = fmy >= 1 and fopp >= 1
+        except ValueError:
+            ok = False
+        if not ok:
+            reasons.append(
+                f"TRAINER_CURRICULUM_FORCE="
+                f"{os.environ['TRAINER_CURRICULUM_FORCE']!r} (the C "
+                f"collector takes two away scores >= 1, 'my,opp')")
+    enc = getattr(net, "encoder_name", None)
+    if enc not in C_COLLECT_MATCH_ENCODERS:
+        reasons.append(f"encoder {enc!r} (the C collector writes "
+                       f"{' / '.join(C_COLLECT_MATCH_ENCODERS)} rows only)")
+    else:
+        from encoding import get_encoder
+        n_feat = get_encoder(enc).num_features
+        if getattr(net, "input_size", None) != n_feat:
+            reasons.append(f"a {getattr(net, 'input_size', '?')}-input net "
+                           f"with the {n_feat}-column encoder {enc}")
+    if getattr(net, "output_mode", "probability") != "probability":
+        reasons.append(f"output mode {net.output_mode!r} (match play nets "
+                       f"output P(win match), 'probability')")
+    if not (isinstance(net, TDNetwork)
+            and type(net).forward is TDNetwork.forward):
+        reasons.append(f"a {type(net).__name__} (the C engine runs the plain "
+                       f"TDNetwork MLP of the BGNN export)")
+    return reasons
+
+
+def c_collect_error(reasons: Sequence[str]) -> str:
+    """The error an explicit match-play --c-collect raises for
+    c_collect_fallbacks()."""
+    n = len(reasons)
+    return (f"--c-collect cannot collect this configuration in C ({n} "
+            f"reason{'' if n == 1 else 's'}): " + "; ".join(reasons)
+            + ". Drop --c-collect to collect with the Python collector.")
+
+
+def c_collect_library(backend: str) -> Optional[str]:
+    """None when libpuretd_<backend>.so loads -- built on demand when it is
+    missing or its ABI is stale (puretd_py.ready_lib; one NOTE says so) --
+    and the binding has the matchplay collector (Engine.set_met /
+    Engine.collect_match; this tree's binding always
+    does, the money collector needs only the library); else why not, for
+    the caller's NOTE (the default money collector falls back) or error
+    (an explicit --c-collect)."""
+    from c_api import puretd_py as P
+    if backend not in P.BACKENDS:
+        return (f"unknown backend {backend!r} (one of "
+                f"{', '.join(P.BACKENDS)})")
+    why = P.ready_lib(backend)
+    if why:
+        return why
+    missing = [m for m in ("set_met", "collect_match")
+               if not hasattr(P.Engine, m)]
+    if missing:
+        return ("c_api/puretd_py.py has no "
+                + " / ".join(f"Engine.{m}" for m in missing)
+                + ": the C matchplay collector is not in this tree")
+    return None
+
+
+def _c_collect(weights: _CWeights, mode, num_episodes, seed, oneply,
+               max_episode_plies):
+    """The money _collect_worker episode loop in C: `num_episodes`
+    episodes on one random.Random(seed) stream through bgc_collect. Same
+    (enc, tgt, n_discarded) result; an empty one has shape
+    (0, input_size). The engine is opened per call: bgc_open has no
+    weight reload and the open costs < 0.5 ms."""
+    from c_api.puretd_py import Engine
+    eng = Engine(weights.path, weights.backend)
+    try:
+        if eng.kind != _c_mode_kind(mode):
+            raise RuntimeError(
+                f"C collector: engine kind {eng.kind} of {weights.path} does "
+                f"not play {type(mode).__name__}")
+        return eng.collect(None, seed, num_episodes, oneply=oneply,
+                           jacoby=getattr(mode, "jacoby", True),
+                           max_plies=max_episode_plies)
+    finally:
+        eng.close()
+
+
+def _c_match_opts(mode, oneply, rng_mode, max_plies) -> dict:
+    """bgc_match_collect_opts for one collection call,
+    from THIS process's trainer constants -- a spawn worker reads the same
+    env as the master, and they are what the serial collector would read
+    here -- and the pickled mode. A boundary upweight below 1 duplicates
+    nothing, as 1 (range(w - 1) is empty)."""
+    fmy, fopp = _c_curriculum_force()
+    return {
+        "match_length": int(mode.initial_match_state().match_length),
+        "oneply": int(bool(oneply)),
+        "curriculum_p": float(_SCORE_CURRICULUM_P),
+        "force_my": int(fmy),
+        "force_opp": int(fopp),
+        "cube_explore_eps": float(_CUBE_EXPLORATION_EPS),
+        "boundary_upweight": max(1, int(_BOUNDARY_UPWEIGHT)),
+        "outcome_mix": float(getattr(mode, "outcome_mix", 0.0) or 0.0),
+        "max_plies": int(max_plies),
+        "rng_mode": int(rng_mode),
+    }
+
+
+def _c_open_match_engine(path, backend, met_path):
+    """Engine(path, backend), refused unless it is a matchplay engine, with
+    the grounding MET set (_worker_met(met_path): the table the Python
+    worker would ground on; the encoder MET is the same file, checked by
+    c_collect_fallbacks)."""
+    from c_api import puretd_py as P
+    eng = P.Engine(path, backend)
+    try:
+        kind = getattr(P, "KIND_MATCH", _C_KIND_MATCH)
+        if eng.kind != kind:
+            raise RuntimeError(
+                f"C collector: {path} opens as engine kind {eng.kind} "
+                f"({eng.encoder}, {eng.input_size} inputs), not the "
+                f"matchplay kind {kind}")
+        eng.set_met(_worker_met(met_path))
+    except BaseException:
+        eng.close()
+        raise
+    return eng
+
+
+def _c_collect_match(weights: _CWeights, mode, num_episodes, seed, oneply,
+                     met_path):
+    """_collect_worker's episode loop in C: `num_episodes` matches through
+    bgc_collect_match on `seed`'s streams (weights.rng_mode). Returns
+    (enc, tgt, n_discarded), rows in episode order; an empty result has
+    shape (0, input_size) / (0,), which the master skips like the Python
+    worker's (0, 0). The engine is opened per call: bgc_open has no weight
+    reload, the weights change every round, and an open costs < 1 ms.
+
+    BG_C_COLLECT_TIMING=1 (benchmarks): one line per call with this
+    process's wall time for it (open, collect, close) and its rates."""
+    from c_api import puretd_py as P
+    t0 = time.perf_counter()
+    eng = _c_open_match_engine(weights.path, weights.backend, met_path)
+    try:
+        opts = _c_match_opts(mode, oneply, weights.rng_mode,
+                             weights.max_plies)
+        # The binding's ctypes struct when it has the helper
+        # (puretd_py.match_collect_opts, same field names), else the dict.
+        _mk = getattr(P, "match_collect_opts", None)
+        if _mk is not None:
+            opts = _mk(**opts)
+        enc, tgt, n_disc = eng.collect_match(opts, int(seed),
+                                             int(num_episodes))
+    finally:
+        eng.close()
+    if os.environ.get("BG_C_COLLECT_TIMING") == "1":
+        dt = max(time.perf_counter() - t0, 1e-9)
+        print(f"C collect timing: pid {os.getpid()} episodes {num_episodes} "
+              f"rows {len(enc)} s {dt:.3f} ep/s {num_episodes / dt:.3f} "
+              f"rows/s {len(enc) / dt:.0f}", flush=True)
+    return enc, tgt, int(n_disc)
+
+
+def _dump_round(dump_dir, round_idx, enc, tgt, worker_rows, worker_seeds,
+                n_discarded, collector):
+    """BG_COLLECT_DUMP: one round's pool as `round_NNNN.npz` (1-based) with
+    the rows of each worker result, the master's seed draws, the discard
+    count and which collector ran (c / vectorized / serial / single)."""
+    np.savez(os.path.join(dump_dir, f"round_{round_idx + 1:04d}.npz"),
+             enc=enc, tgt=tgt,
+             worker_rows=np.asarray(worker_rows, dtype=np.int64),
+             worker_seeds=np.asarray(worker_seeds, dtype=np.int64),
+             n_discarded=np.int64(n_discarded),
+             collector=np.str_(collector))
 
 
 # Set once per worker process by `_worker_init` when the GPU inference
@@ -1337,38 +1657,42 @@ def _worker_init(handles, kind="student"):
 
 def _collect_worker(args):
     """Worker subprocess: rebuild the agent from a state_dict, play
-    `num_episodes` episodes, return
-    (encodings, targets, n_discarded) — the concatenated numpy arrays
-    plus the count of episodes discarded for exceeding
-    `max_episode_plies` (money paths only; the matchplay collector is
-    unbounded). The GameMode instance is pickled directly into
-    `args` — simpler and more general than name-based dispatch,
-    because modes can carry config (e.g. CubefulMoneyMode.jacoby).
+    `num_episodes` episodes, return the concatenated (encodings, targets)
+    numpy arrays -- for the money modes also n_discarded (episodes over
+    `max_episode_plies`), (enc, tgt, n_discarded); the match collector
+    never discards. The GameMode instance is pickled into `args` (modes
+    carry config, e.g. CubefulMoneyMode.jacoby).
+
+    A `_CWeights` in the state_dict slot (--c-collect) plays the episodes
+    in C instead (`_c_collect_match` for match play, `_c_collect` for the
+    money modes) and returns (encodings, targets, n_discarded).
+
+    The args tuple must stay in sync with `_build_worker_args` in
+    Trainer.train: 14 fields, then `activation` and `max_episode_plies`,
+    both defaulted so a shorter tuple still unpacks. `activation` must be
+    carried: it is not a parameter tensor, so load_state_dict cannot catch
+    a mismatch, and with --gpu-eval-server the worker's local net must be
+    the same function as the server's.
 
     Set env LEAK_DIAG=1 to log RSS at entry/exit (for leak hunts).
-    NOTE: the args tuple arity must stay in sync with
-    `_build_worker_args` in Trainer.train.
     """
     os.environ["OMP_NUM_THREADS"] = "1"
     torch.set_num_threads(1)
 
-    # The 15 leading fields are the money-line layout (pinned by
-    # tests/test_vectorized_collect.py and test_cuda_oneply_release.py);
-    # the matchplay fields are appended and defaulted so a money-layout
-    # tuple still unpacks. `activation` must be carried: the worker's
-    # local net has to be the SAME FUNCTION as the master's, and with
-    # --gpu-eval-server also the same function as the server's (which
-    # does carry it). Defaulting to relu here while the server honoured
-    # a tanh checkpoint mixed two different networks' values into one
-    # episode's targets.
     (state_dict, hidden_sizes, input_size, output_mode, encoder_name,
-     activation, mode, num_episodes, seed, oneply, oneply_acting,
-     boltzmann_temp, bf16_inference, c_engine,
-     max_episode_plies) = args[:15]
-    # Matchplay extras (defaulted for money-layout tuples):
-    cube_targets_1ply = args[15] if len(args) > 15 else False
-    met_path = args[16] if len(args) > 16 else None
-    met_scopes = args[17] if len(args) > 17 else None
+     mode, num_episodes, seed, oneply, oneply_acting, boltzmann_temp,
+     bf16_inference, met_path, met_scopes) = args[:14]
+    activation = args[14] if len(args) > 14 else "relu"
+    max_episode_plies = (args[15] if len(args) > 15
+                         else DEFAULT_MAX_EPISODE_PLIES)
+    is_match = _is_match_mode(mode)
+
+    if isinstance(state_dict, _CWeights):
+        if is_match:
+            return _c_collect_match(state_dict, mode, num_episodes, seed,
+                                    oneply, met_path)
+        return _c_collect(state_dict, mode, num_episodes, seed, oneply,
+                          max_episode_plies)
 
     diag = os.environ.get("LEAK_DIAG") == "1"
 
@@ -1394,10 +1718,20 @@ def _collect_worker(args):
         activation=activation,
     )
     net.load_state_dict(state_dict)
+    # Expert iteration: when the mode asks for it, the COLLECTOR acts with
+    # 1-ply move selection (top-K filtered) instead of the raw 0-ply read.
+    # 1-ply selection measures +2.00pp over 0-ply on identical weights
+    # (12k matches, z=+4.38), so this generates trajectories from the
+    # stronger policy while the targets stay what they were -- the network
+    # then learns to reproduce choices it currently cannot make at 0 ply.
+    # K=3 was measured to match FULL 1-ply selection (101/128 on the
+    # gnubg-confirmed set) at 5.2x less compute.
+    _oa = int(getattr(mode, "oneply_act_k", 0) or 0)
     agent = TDAgent(
         net, oneply=oneply_acting, boltzmann_temp=boltzmann_temp,
         bf16_inference=bf16_inference, met=_worker_met(met_path),
         met_scopes=met_scopes,
+        oneply_moves=(_oa > 0), oneply_moves_k=_oa,
     )
     # GPU eval server: route this agent's matchplay forwards through the
     # slot claimed in `_worker_init`. No-op unless the server is active.
@@ -1408,22 +1742,6 @@ def _collect_worker(args):
         agent._remote_eval = _WORKER_REMOTE_EVAL
         agent._remote_eval_moves = _WORKER_ROUTE_MOVES
 
-    # C engine: replaces the 1-ply cubeful TARGET forward with libbg_nply
-    # (OpenBLAS sgemm). Move selection stays PyTorch. No-op unless oneply.
-    # Weights are this round's, so the per-process .bin export is current.
-    #
-    # enable_c_engine returns False when libbg_nply.so is missing, and
-    # upstream IGNORES that -- so a run with --c-engine set silently degrades
-    # to PyTorch and an A/B can be PyTorch on both arms. Fail loudly.
-    if c_engine and oneply:
-        import c_engine.bg_nply as _cn
-        if not _cn.enable_c_engine(agent):
-            raise RuntimeError(
-                "--c-engine requested but libbg_nply is unavailable; "
-                "build it with `bash c_engine/build_nply.sh` "
-                "(needs a CBLAS exporting cblas_sgemm)"
-            )
-
     rng = random.Random(seed)
 
     enc_chunks: List[np.ndarray] = []
@@ -1432,28 +1750,26 @@ def _collect_worker(args):
     for _ in range(num_episodes):
         encs, tgts = collect_episode(
             agent, mode, rng, oneply=oneply,
-            cube_targets_1ply=cube_targets_1ply,
             max_episode_plies=max_episode_plies,
         )
         if len(encs) > 0:
             enc_chunks.append(encs)
             tgt_chunks.append(tgts)
         else:
-            # Empty == discarded overlong episode (a legitimate episode
-            # always emits at least one sample).
+            # Empty means discarded (a real episode has >= 1 sample).
             n_discarded += 1
     if not enc_chunks:
         result = (
             np.empty((0, 0), dtype=np.float32),
             np.empty((0,), dtype=np.float32),
-            n_discarded,
         )
     else:
         result = (
             np.concatenate(enc_chunks, axis=0),
             np.concatenate(tgt_chunks, axis=0),
-            n_discarded,
         )
+    if not is_match:
+        result = result + (n_discarded,)
 
     if diag:
         rss_out = _rss_kb()
@@ -1465,19 +1781,12 @@ def _collect_worker(args):
     return result
 
 
-
 # ── Trainer class ─────────────────────────────────────────────────────
 
 
 def _unique_ckpt_path(path: str) -> str:
-    """Return `path`, or the first free `..._rN` variant if it already exists.
-
-    Periodic checkpoints are named from an episode counter local to a single
-    invocation. Resuming a partially-finished leg restarts that counter, so
-    without this a resumed run silently overwrites the earlier run's
-    checkpoints -- and the surviving file is then labelled with FEWER episodes
-    than it actually contains, which is worse than losing it: it will be banked
-    and compared under the wrong label.
+    """Return `path`, or the first free `..._rN` variant if it exists
+    (a resumed run must not overwrite the earlier run's checkpoints).
     """
     if not os.path.exists(path):
         return path
@@ -1489,8 +1798,8 @@ def _unique_ckpt_path(path: str) -> str:
 
 
 class Trainer:
-    """Owns the optimizer + training loop. Bare agents (no optimizer)
-    can be used for play / collection without constructing a Trainer.
+    """Owns the optimizer and training loop. Agents play and collect
+    without one.
     """
 
     def __init__(
@@ -1503,13 +1812,10 @@ class Trainer:
     ):
         """
         Args:
-            agent: must expose `agent.network` so the optimizer can
-                be constructed over its parameters.
+            agent: must expose `agent.network`.
             lr: learning rate.
-            optimizer_cls: defaults to Adam. For online TD(0) prefer
-                `torch.optim.SGD`.
-            optimizer_kwargs: forwarded to the optimizer (e.g.
-                `{"momentum": 0.9}`).
+            optimizer_cls: default Adam; SGD for online TD(0).
+            optimizer_kwargs: forwarded to the optimizer.
             grad_clip: max gradient norm. None disables clipping.
         """
         self.agent = agent
@@ -1525,11 +1831,19 @@ class Trainer:
         states_or_encoded: Union[Sequence[BoardState], np.ndarray],
         targets: Sequence,
     ) -> float:
-        """Forward + loss + backward + optimizer step on a batch.
-        Accepts either a list of BoardStates (slow path: agent
-        encodes them) or a pre-encoded numpy array (fast path:
-        skips encoding). Returns the scalar loss.
+        """One optimizer step on a batch of BoardStates (agent encodes
+        them) or a pre-encoded numpy array. Returns the scalar loss.
         """
+        return self.train_step_nosync(states_or_encoded, targets).item()
+
+    def train_step_nosync(
+        self,
+        states_or_encoded: Union[Sequence[BoardState], np.ndarray],
+        targets: Sequence,
+    ) -> torch.Tensor:
+        """train_step returning the detached loss tensor: no `.item()`
+        host sync per batch. The batch loop reads its losses back once
+        per round (same values)."""
         if isinstance(states_or_encoded, np.ndarray):
             pred = self.agent.forward_encoded(states_or_encoded)
         else:
@@ -1548,15 +1862,32 @@ class Trainer:
         memo = getattr(self.agent, "_new_game_memo", None)
         if memo:
             memo.clear()
-        return loss.item()
+        return loss.detach()
+
+    def train_step_dev(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """train_step on tensors already on the agent's device; returns
+        the detached loss tensor (no host sync). See BG_POOL_ON_DEVICE."""
+        pred = self.agent.network(x)
+        loss = self.agent.loss(pred, y)
+        self.optimizer.zero_grad()
+        loss.backward()
+        if self.grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(
+                self.agent.network.parameters(), self.grad_clip,
+            )
+        self.optimizer.step()
+        memo = getattr(self.agent, "_new_game_memo", None)
+        if memo:
+            memo.clear()
+        return loss.detach()
 
     def eval_loss(
         self,
         states_or_encoded: Union[Sequence[BoardState], np.ndarray],
         targets: Sequence,
     ) -> float:
-        """Loss on a batch without stepping. Used for held-out
-        validation. Same input dispatch as train_step.
+        """Loss on a batch without stepping (held-out validation).
+        Same inputs as train_step.
         """
         with torch.no_grad():
             if isinstance(states_or_encoded, np.ndarray):
@@ -1587,108 +1918,152 @@ class Trainer:
         save_path: Optional[str] = None,
         save_every: int = 0,
         metrics_out: Optional[dict] = None,
-        cube_targets_1ply: bool = False,
         pipeline_collect: bool = False,
-        c_engine: bool = False,
-        met_path: Optional[str] = None,
+        max_episode_plies: Optional[int] = None,
         vectorized_collect: bool = False,
         vectorized_batch: int = 32,
-        vectorized_device: str = "cuda",
-        max_episode_plies: int = 0,
+        train_params: Optional[dict] = None,
+        c_collect: bool = False,
+        c_collect_backend: str = "simd",
+        c_collect_auto: bool = False,
+        met_path: Optional[str] = None,
         met_scopes=None,
+        vectorized_device: str = "cuda",
         gpu_eval_server: bool = False,
         oracle_eval_server: bool = False,
         gpu_eval_device: str = "cuda",
         gpu_eval_route_moves: bool = False,
         gpu_eval_deterministic: bool = False,
+        episode_offset: int = 0,
+        c_collect_rng: str = "vectorized",
     ) -> List[float]:
         """Round-based batch TD(0). A round collects
         `episodes_per_round` episodes, then trains `epochs_per_round`
         shuffled passes over the round's pool in `batch_size` batches.
 
-        `log_every` is in rounds. `workers > 1` distributes per-round
-        collection across N subprocesses; the training step always
-        runs in the master. `oneply=True` uses 1-ply lookahead targets
-        (lower variance, slower per turn).
+        `log_every` is in rounds. `workers > 1` collects in N
+        subprocesses. The training step runs in the master.
+        `oneply=True` uses 1-ply lookahead targets.
 
-        `end_lr`: if set, linearly anneals the optimizer LR from its
-        starting value down to `end_lr` over `num_episodes`. The
-        starting LR is read from the optimizer at entry.
+        `end_lr`: linearly anneal the LR from its starting value to
+        `end_lr` over `num_episodes`. With `end_lr` None and
+        `warmup_cycles` 0 the LR is never touched.
 
-        `warmup_cycles`: if > 0, ramps the (annealed) LR from
-        `lr * 0.1` up to the full scheduled LR over the first
-        `warmup_cycles` rounds. For task transfers (DMP -> cubeless,
-        cubeless -> cubeful), where a freshly-initialised head sits on
-        a trained trunk; not for expansions.
-        Composes with `end_lr` (multiplicative).
+        `warmup_cycles`: ramp the LR from `lr * 0.1` to the scheduled
+        LR over the first N rounds. Multiplies with `end_lr`.
 
-        `pipeline_collect`: when True (and workers > 1), overlap the
-        worker collection of round N+1 with the master training step
-        of round N. Workers for round N+1 see weights from end of
-        round N-1 (one-round stale targets); the staleness is
-        negligible at typical 1-ply LRs (1e-6 to 1e-5) but should be
-        validated when changing recipes. Reproducibility is preserved
-        (the rng.randint() sequence for worker seeds is unchanged).
-        No effect with workers <= 1.
+        `pipeline_collect`: overlap collection of round N+1 with the
+        training step of round N. Workers then see one-round-stale
+        weights. Worker seeds are unchanged. No effect with
+        workers <= 1.
 
-        `vectorized_collect`: OPT-IN. Matchplay + `--oneply` only.
-        Lockstep generator driver (`vectorized_matchplay.py`): each
-        worker runs `vectorized_batch` matches concurrently, batching
-        their pending forwards into one GPU call per step. Inactive
-        (printed WARN) unless every precondition holds: matchplay,
-        oneply, workers > 1, vectorized_batch >= 1, a usable
-        `vectorized_device`, enough FREE VRAM for `workers` driver
-        contexts (`vectorized_matchplay.vram_reason`), boltzmann_temp
-        == 0. Keep `episodes_per_round >= workers * vectorized_batch`
-        for throughput (NOTE printed). Disables `pipeline_collect`
-        (both want the GPU). Data is equivalent to the serial path
-        (`tests/test_vectorized_matchplay.py`).
+        `max_episode_plies`: None = the mode's default. Money modes
+        (DEFAULT_MAX_EPISODE_PLIES): an episode exceeding it is discarded
+        and counted in the round log line. Match play (0 = unbounded):
+        a per-GAME bound of the vectorized and C collectors only, a match
+        exceeding it is discarded whole; the serial Python match
+        collector ignores it (and says so when --vectorized-collect falls
+        back to it).
 
-        `max_episode_plies`: safety bound on self-play episode length
-        (see DEFAULT_MAX_EPISODE_PLIES). Money paths (single-process,
-        parallel, pipelined, and the money GPU collector) DISCARD and
-        count episodes exceeding it -- a degenerate policy otherwise
-        hangs the round barrier while worker RSS grows until the OOM
-        killer fires. On the MATCHPLAY vectorized path it is a per-GAME
-        turn bound (a runaway game in lockstep pins a driver slot); the
-        matchplay serial collector deliberately does not bound episode
-        length, and the matchplay-vec INACTIVE fallback says so loudly.
-        0 disables everywhere.
+        `train_params`: provenance dict stamped into periodic
+        checkpoints (model.save). The final save is the caller's
+        responsibility. `train_params["c_collect"]`, when present, is set
+        to whether the C collector actually collects.
 
-        `c_engine` (money + oneply): replace the 1-ply cubeful TARGET
-        forward with the libbg_nply C engine in each worker (move
-        selection stays PyTorch). Hard-errors if the .so is missing.
+        `c_collect`: collect in C on the `c_collect_backend` libpuretd
+        build. The master exports each round's weights once to a private
+        dir (c_collect_tmpdir), the worker args carry a `_CWeights` in the
+        state_dict slot, and the master's seed draws are the Python
+        path's, so a C round consumes the run RNG as a Python round does.
+        With workers <= 1 the master collects one worker's share on a
+        seed drawn from the run RNG (the Python single-process path plays
+        on the run RNG itself, so the episodes differ). Works with
+        `pipeline_collect`, `save_every` and the pool restart.
+          Money modes: bgc_collect, the episodes the Python collector
+        plays for the seed. Each
+        c_collect_fallbacks() reason prints a NOTE and keeps the Python
+        collector; a missing library is built on demand
+        (c_collect_library). `c_collect_auto`: True when `c_collect` is
+        train_batch.py's default rather than an explicit --c-collect; a
+        library that cannot be built or loaded then falls back with a
+        NOTE instead of raising. `c_collect` with `vectorized_collect` is
+        an error.
+          Match play: bgc_collect_match, an explicit opt-in.
+        ERRORS, before any process starts, naming every reason of
+        c_collect_fallbacks(), and when the library cannot be loaded or
+        built or the start-up probe (export, open, kind and encoder check,
+        set_met) fails. `c_collect_rng`: 'vectorized' (default; the
+        production leg, per-episode streams as
+        vectorized_matchplay_worker) or 'serial' (one stream per worker as
+        _collect_worker: the parity oracle).
 
-        `gpu_eval_server`: OPT-IN, the OTHER way to put matchplay
-        1-ply collection on the GPU: ONE server process holds the only
-        CUDA context and N pure-CPU workers ship feature matrices to it
-        over per-worker shared memory. VRAM grows with the fused
-        batch's width, not the worker count (far below vectorized, but
-        NOT flat); the cost is a queue round-trip per forward. Routes
-        `TDAgent.value_oneply_checker_matchplay` (96% of collected
-        rows); add `gpu_eval_route_moves` to also route
-        `choose_checker_action_matchplay` (4% of rows but 50% of
-        forwards, so it roughly doubles the request rate). Never routes
-        `evaluate_matchplay`, which is always batch-1 and would lose to
-        IPC. HARD errors (not warnings) on `pipeline_collect`,
-        `vectorized_collect`, and TRAINER_MAXTASKSPERCHILD; warns and
-        falls back to the serial collector on any soft precondition
-        (matchplay, oneply, workers > 1, a usable `gpu_eval_device`).
+        `vectorized_collect`: match play + `oneply` only, opt-in. Replaces
+        the per-worker serial collector with the lockstep generator
+        driver in `vectorized_matchplay.py`: each worker runs
+        `vectorized_batch` matches concurrently and batches their pending
+        forwards into one GPU call per step on `vectorized_device`.
+        Inactive (with a printed WARN naming every reason) unless every
+        precondition holds (see the block below). Disables
+        `pipeline_collect`. The collected data is equivalent to the
+        serial path (tests/test_vectorized_matchplay.py).
 
-        `gpu_eval_deterministic`: run one request per GPU call instead
-        of fusing whatever is concurrently pending. Fusion makes a
-        routed run NOT bitwise reproducible -- which requests share a
-        GEMM depends on wall-clock arrival order, fp32 reductions are
-        batch-composition sensitive, and a last-ulp difference can flip
-        a `min()` tie over candidate moves and change the trajectory.
-        With this flag routed collection is bit-exact against the
-        unrouted collector at any worker count, and a seeded rerun
-        reproduces. Costs cross-slot fusion (worth ~1.67 requests per
-        call at W=8, more at high W).
+        `gpu_eval_server`: match play + `oneply`, opt-in; the OTHER way to
+        put 1-ply collection on the GPU: ONE server process
+        (gpu_eval_server.py) holds the only CUDA context and N CPU workers
+        ship feature matrices to it over per-worker shared memory. Routes
+        `TDAgent.value_oneply_checker_matchplay`; `gpu_eval_route_moves`
+        also routes `choose_checker_action_matchplay`. HARD errors with
+        `pipeline_collect`, `vectorized_collect` and
+        TRAINER_MAXTASKSPERCHILD; WARN + the serial collector on a soft
+        precondition. `gpu_eval_deterministic`: one request per GPU call
+        (bit-exact against the unrouted collector) instead of fusing the
+        concurrently pending ones (not bitwise reproducible).
+        `oracle_eval_server`: the same server hosting the --oracle-targets
+        teacher (frozen) instead of the student.
+
+        `met_path`, `met_scopes`: match play only (collect_episode,
+        TDAgent).
+
+        `episode_offset`: episodes already done before this run (a
+        `--resume-episodes` crash recovery). Affects checkpoint NAMES
+        and the SIGTERM save's episode count only, so `_ep{N}` stays
+        the global count; the LR schedule is the caller's business.
+
+        SIGTERM/SIGINT save `{root}_ep{N}_sigterm.pt` / `_sigint.pt`
+        (weights after exactly N episodes, a round boundary) and reap
+        the pool before exiting -- see the handler below.
+
+        A dead collection worker (pool_guard.PoolWatch) rebuilds the pool
+        and redoes the round, at most BG_MAX_POOL_RESTARTS times; the GPU
+        eval server path fails the round instead (EvalServer.map_watched).
+
+        `BG_TRAIN_CUDA_GRAPH` (cuda_graph_step.py; unset = on on a cuda
+        device, 0 = the eager step) replays full batches of the train step
+        from a CUDA graph; `BG_POOL_ON_DEVICE=1` keeps the round's pool on
+        the cuda device with the eager step (implied by the graph). Both
+        give checkpoints and losses bitwise equal to the host-pool step
+        (tests/test_train_step_bitwise.py).
+
+        `BG_COLLECT_DUMP=<dir>` (a test hook, any collector): save each
+        round's pool as `round_NNNN.npz` -- enc, tgt, worker_rows (rows per
+        worker result, in worker order), worker_seeds (the master's seed
+        draws; empty for the single-process Python path, which plays on
+        the run RNG), n_discarded and collector. `BG_ROUND_PHASES=1`: one
+        line per round with the master's time by phase.
 
         Returns a flat list of per-batch losses.
         """
         mode.validate_agent(self.agent)
+        is_match = _is_match_mode(mode)
+        if max_episode_plies is None:
+            max_episode_plies = 0 if is_match else DEFAULT_MAX_EPISODE_PLIES
+        if c_collect and vectorized_collect and not is_match:
+            # Match play names it among the C collector's reasons below.
+            raise ValueError(
+                "--c-collect and --vectorized-collect are mutually exclusive "
+                "(two collectors for the same rounds). Drop one of the two "
+                "flags."
+            )
 
         # ── GPU eval server: HARD incompatibilities ───────────────────
         # These raise rather than warn-and-downgrade. Each is a
@@ -1736,81 +2111,159 @@ class Trainer:
                 "SGD with batch TD may be unstable, Adam recommended.",
                 stacklevel=2,
             )
+
+        # ── C collector (--c-collect): preconditions, library, probe ──
+        # All before any process starts: the preconditions, the library
+        # (built on demand), then one probe open of this net's export (a
+        # kind / encoder / width / MET failure surfaces here, not inside
+        # pool.map).
+        c_active = False
+        c_dir = None            # private 0700 dir of the per-round exports
+        c_files = {}            # round index -> exported weights file
+        c_rng_mode = None
+        c_label = "--c-collect (default)" if c_collect_auto else "--c-collect"
+        if c_collect and is_match:
+            # An explicit match-play --c-collect never falls back: every
+            # unmet precondition is named in ONE error (the fallback would
+            # be the serial collector, a 4-10x cliff).
+            c_rng_mode = c_collect_rng_mode(c_collect_rng)
+            _c_reasons = c_collect_fallbacks(
+                self.agent.network, mode, oneply=oneply,
+                oneply_acting=oneply_acting, boltzmann_temp=boltzmann_temp,
+                met_path=met_path, met_scopes=met_scopes,
+                vectorized_collect=vectorized_collect,
+                gpu_eval_server=gpu_eval_server,
+                oracle_eval_server=oracle_eval_server)
+            if _c_reasons:
+                raise ValueError(c_collect_error(_c_reasons))
+            _why = c_collect_library(c_collect_backend)
+            if _why is not None:
+                raise RuntimeError(f"--c-collect: {_why}")
+            import export_weights
+            from c_api import puretd_py as _P
+            c_dir = c_collect_tmpdir()
+            try:
+                _probe = os.path.join(c_dir, "w_probe.bin")
+                export_weights.export_live(self.agent.network, _probe)
+                _eng = _c_open_match_engine(_probe, c_collect_backend, met_path)
+                try:
+                    _c_desc = _eng.describe
+                    _c_enc, _c_in = _eng.encoder, _eng.input_size
+                finally:
+                    _eng.close()
+                os.remove(_probe)
+                _n_net = getattr(self.agent.network, "input_size", None)
+                _net_enc = getattr(self.agent.network, "encoder_name", None)
+                if _c_enc != _net_enc or _c_in != _n_net:
+                    raise RuntimeError(
+                        f"--c-collect: the export opens as encoder {_c_enc} "
+                        f"with {_c_in} inputs; the net is a {_n_net}-input "
+                        f"{_net_enc}")
+                _info = _P.encoder_info(_c_enc, c_collect_backend)
+                if not (_info and _info.get("collect")):
+                    raise RuntimeError(
+                        f"--c-collect: the C API encoder table has no "
+                        f"collector for {_c_enc} (encoder_info: {_info}); "
+                        f"bgc_collect_match would return "
+                        f"BGC_COLLECT_UNSUPPORTED")
+            except BaseException:
+                shutil.rmtree(c_dir, ignore_errors=True)
+                raise
+            c_active = True
+            print(f"C collection: ON (bgc_collect_match on {_c_desc}, "
+                  f"W={max(workers, 1)}, rng={c_collect_rng})", flush=True)
+            print(f"  C collection: {_c_enc}, "
+                  f"{'1-ply' if oneply else '0-ply'} targets, 0-ply play, "
+                  f"max_episode_plies={max_episode_plies}, MET {met_path}; "
+                  f"weights exported once per round to {c_dir}", flush=True)
+            if workers <= 1:
+                print("  NOTE: --c-collect with --workers 1: the master "
+                      "collects each round in C on one seed drawn from the "
+                      "run RNG, as a one-worker pool would (the Python "
+                      "single-process path plays on the run RNG itself, so "
+                      "the episodes differ).", flush=True)
+            elif pipeline_collect:
+                print("  NOTE: --pipeline-collect with --c-collect: round "
+                      "N+1 is collected on the weights from before round N's "
+                      "train step (one-round-stale targets) -- a recipe "
+                      "change, not the gate/leg setting).", flush=True)
+            if bf16_collect:
+                print("  NOTE: --bf16-collect has no effect here (no "
+                      "matchplay forward reads the bf16 net; the C forward "
+                      "is fp32).", flush=True)
+        elif c_collect:
+            # Money modes: a reason is a NOTE and the Python collector.
+            reasons = c_collect_fallbacks(
+                self.agent.network, mode, oneply_acting=oneply_acting,
+                boltzmann_temp=boltzmann_temp, bf16_collect=bf16_collect)
+            for why in reasons:
+                print(f"  NOTE: {c_label}: {why}; falling back to the "
+                      f"Python collector.", flush=True)
+            c_active = not reasons
+            if c_active:
+                why = c_collect_library(c_collect_backend)
+                if why is not None:
+                    if not c_collect_auto:
+                        raise RuntimeError(f"--c-collect: {why}")
+                    print(f"  NOTE: {c_label}: {why}; falling back to the "
+                          f"Python collector.", flush=True)
+                    c_active = False
+            if c_active:
+                import export_weights
+                from c_api.puretd_py import Engine
+                c_dir = c_collect_tmpdir()
+                try:
+                    probe = os.path.join(c_dir, "w_probe.bin")
+                    export_weights.export_live(self.agent.network, probe)
+                    eng = Engine(probe, c_collect_backend)
+                    kind, n_in, desc = eng.kind, eng.input_size, eng.describe
+                    c_enc = eng.encoder
+                    eng.close()
+                    os.remove(probe)
+                    n_net = getattr(self.agent.network, "input_size", 196)
+                    net_enc = getattr(self.agent.network, "encoder_name",
+                                      "perspective196")
+                    if (kind != _c_mode_kind(mode) or n_in != n_net
+                            or c_enc != net_enc):
+                        raise RuntimeError(
+                            f"C collector: the export opens as kind {kind} "
+                            f"with {n_in} inputs, encoder {c_enc}; "
+                            f"{type(mode).__name__} with this {n_net}-input "
+                            f"{net_enc} net needs kind {_c_mode_kind(mode)}")
+                except BaseException:
+                    shutil.rmtree(c_dir, ignore_errors=True)
+                    raise
+                print(f"C collection: ON ("
+                      + ("the default, --no-c-collect for the Python "
+                         "collector; " if c_collect_auto else "")
+                      + f"bgc_collect on {desc}, "
+                      f"{max(workers, 1)} process(es), "
+                      f"{'1-ply' if oneply else '0-ply'} targets, 0-ply play, "
+                      f"max_episode_plies={max_episode_plies}; weights "
+                      f"exported once per round to {c_dir})", flush=True)
+        if metrics_out is not None:
+            metrics_out["c_collect"] = c_active
+            if c_dir is not None:
+                metrics_out["c_collect_dir"] = c_dir
+        if train_params is not None and "c_collect" in train_params:
+            # Provenance: what collected, not what was asked for.
+            train_params["c_collect"] = c_active
+
+        # BG_COLLECT_DUMP=<dir> (test hook): each round's pool, per-worker
+        # row counts and seeds (round_NNNN.npz; see the docstring).
+        _dump_dir = os.environ.get("BG_COLLECT_DUMP") or None
+        if _dump_dir:
+            os.makedirs(_dump_dir, exist_ok=True)
+
         # ── Vectorized (lockstep GPU) collection preconditions ────────
         # Opt-in only; every failed precondition is named rather than
         # silently ignored, because falling back to the CPU path with a
         # flag set looks identical in the logs otherwise.
         vec_active = False
-        money_vec_active = False
-        vec_workers = workers
-        _ims_vc = mode.initial_match_state()
-        _mode_is_matchplay = _ims_vc is not None and _ims_vc.is_matchplay
-        if vectorized_collect and not _mode_is_matchplay:
-            # ── Money-line GPU collector (vectorized_collect.py) ──────
-            # Lockstep generators; one local CUDA call per step per
-            # worker. Eligibility + VRAM preflight run BEFORE pool
-            # creation: pool tasks rotate across processes, so a
-            # per-round task cap would NOT cap CUDA contexts. The pool
-            # itself is sized to the capped worker count.
-            if oneply_acting:
-                # The vectorized generators implement 0-ply move
-                # SELECTION only; silently ignoring --oneply-acting
-                # would play a different policy than asked for and
-                # change the data distribution, so refuse outright.
-                raise ValueError(
-                    "--vectorized-collect does not support --oneply-acting "
-                    "(the vectorized collector does 1-ply TARGETS with "
-                    "0-ply move selection). Drop one of the two flags."
-                )
-            money_vec_active = bool(
-                workers > 1 and oneply and torch.cuda.is_available()
-            )
-            if not money_vec_active:
-                reasons = []
-                if not oneply:
-                    reasons.append("--oneply is required (1-ply targets)")
-                if workers <= 1:
-                    reasons.append("--workers must be > 1")
-                if not torch.cuda.is_available():
-                    reasons.append("CUDA is unavailable")
-                print(
-                    "WARNING: --vectorized-collect requested but INACTIVE: "
-                    + "; ".join(reasons)
-                    + ". Falling back to the standard collector."
-                )
-            else:
-                free_b, total_b = torch.cuda.mem_get_info()
-                vec_workers = vectorized_vram_cap(workers, free_b)
-                if vec_workers < 2:
-                    print(
-                        f"  WARN: --vectorized-collect IGNORED (VRAM "
-                        f"preflight: {free_b / 2**20:.0f} MB free supports "
-                        f"{vec_workers} worker context(s), need >= 2) -- "
-                        f"falling back to the CPU collector", flush=True,
-                    )
-                    money_vec_active = False
-                    vec_workers = workers
-                elif vec_workers < workers:
-                    print(
-                        f"  NOTE: VRAM preflight capped vectorized workers "
-                        f"{workers} -> {vec_workers} "
-                        f"({free_b / 2**20:.0f} MB free, "
-                        f"~{VEC_PER_WORKER_BYTES / 2**20:.0f} MB/context + "
-                        f"{VEC_RESERVE_BYTES / 2**20:.0f} MB reserve). "
-                        f"Pool is sized to the cap.", flush=True,
-                    )
-            if money_vec_active and pipeline_collect:
-                print(
-                    "  NOTE: --pipeline-collect disabled (worker drivers "
-                    "and the master training step would contend for the "
-                    "same GPU)."
-                )
-        elif vectorized_collect:
+        if vectorized_collect:
             import vectorized_matchplay as _vm
-            _ims = mode.initial_match_state()
-            _is_matchplay = _ims is not None and _ims.is_matchplay
             reasons = []
-            if not _is_matchplay:
+            if not is_match:
                 reasons.append("mode is not matchplay")
             if not oneply:
                 reasons.append("--oneply is required (1-ply targets)")
@@ -1840,6 +2293,24 @@ class Trainer:
             _vram = _vm.vram_reason(vectorized_device, workers)
             if _vram:
                 reasons.append(_vram)
+            if (float(getattr(mode, "move_explore_eps", 0.0) or 0.0) > 0.0
+                    or _MOVE_EXPLORATION_EPS > 0.0):
+                # Also catches the TRAINER_MOVE_EXPLORATION_EPS env form:
+                # the collector falls back to it when the mode field is 0
+                # (see the acting block), so checking only the field let
+                # the vectorized path drop exploration silently AND desync
+                # the RNG stream from the serial mirror.
+                reasons.append(
+                    "--move-explore-eps / TRAINER_MOVE_EXPLORATION_EPS is "
+                    "implemented in the standard collector only (the "
+                    "vectorized path would silently ignore it)"
+                )
+            if int(getattr(mode, "oneply_act_k", 0) or 0) > 0:
+                reasons.append(
+                    "--td-oneply-act acts with 1-ply move selection, which "
+                    "the generator mirror does not implement; the vectorized "
+                    "path would silently act 0-ply instead"
+                )
             if float(getattr(mode, "td_move_eps", 0.0) or 0.0) > 0.0:
                 reasons.append(
                     "--td-move-eps is implemented in the standard collector "
@@ -1852,7 +2323,7 @@ class Trainer:
                     + "; ".join(reasons)
                     + ". Falling back to the standard collector."
                 )
-                if max_episode_plies > 0:
+                if is_match and max_episode_plies > 0:
                     # The ply bound lives in the vectorized collector
                     # only, so falling back silently drops it -- and the
                     # difference is total (every episode kept vs. every
@@ -1871,6 +2342,30 @@ class Trainer:
                     f"batch={vectorized_batch} games/worker, "
                     f"device={vectorized_device}, workers={workers}"
                 )
+                # MPS state is run provenance: it moves throughput by
+                # up to 1.56x without moving the numbers, so a log that
+                # does not record it cannot explain its own ep/s.
+                if _vm.mps_active():
+                    print(
+                        f"  CUDA MPS: ON (pipe dir {_vm.mps_pipe_dir()}) "
+                        f"-- the {workers} driver contexts share one GPU "
+                        f"scheduler."
+                        + ("  Worth ~0% at 1-ply (each trip already "
+                           "carries ~350-400 rows); harmless."
+                           if oneply else "")
+                    )
+                elif not oneply and workers >= _vm.MPS_MIN_WORKERS:
+                    print(
+                        f"  NOTE: CUDA MPS is OFF and this is the regime "
+                        f"where it pays: 0-ply trips are small (~8 rows "
+                        f"per slot-yield), so {workers} driver contexts "
+                        f"time-slice instead of overlapping. Measured "
+                        f"230 -> 356 ep/s (+56%) at W=32 on a 5090; "
+                        f"+8% at W=16, so the gain scales with workers. "
+                        f"Throughput only -- targets are unchanged. "
+                        f"Start it with ./mps.sh start (HOST-WIDE "
+                        f"daemon: not on a shared box)."
+                    )
                 if pipeline_collect:
                     print(
                         "  NOTE: --pipeline-collect disabled (worker "
@@ -1906,6 +2401,11 @@ class Trainer:
                         "batch for the benchmarked throughput."
                     )
 
+        # The train-step env vars, read (and validated) before any process
+        # starts (a bad BG_TRAIN_CUDA_GRAPH value fails here).
+        graph_env = mode_from_env()
+        pool_dev_env = os.environ.get("BG_POOL_ON_DEVICE") == "1"
+
         rng = random.Random(seed)
         losses: List[float] = []
         start_lr = self.optimizer.param_groups[0]["lr"]
@@ -1918,26 +2418,11 @@ class Trainer:
         if next_save is not None:
             print(f"Checkpoint every {save_every} episodes -> {save_path} (with _ep{{N}} suffix)")
 
-        # Worker pool created once for the whole run (avoids per-round
-        # subprocess startup cost). None means single-process.
-        #
-        # We use the "spawn" start method, not the Linux default "fork".
-        # With fork, replacement workers (and the initial workers
-        # themselves) inherit the master's RSS at the moment of fork via
-        # copy-on-write — and because the master's peak RSS scales with
-        # pool size (pool_enc + sh_enc + pool.map deserialization
-        # buffers), a replacement worker spawned mid-training starts at
-        # multiple GB, and at 128 workers a single anomalous-pool round
-        # can push combined RSS over a terabyte. Spawn gives every
-        # worker a pristine interpreter that only re-imports torch and
-        # the model modules, so per-worker RSS is bounded by the
-        # worker's own workload, not the master's history.
-        #
-        # TRAINER_MAXTASKSPERCHILD env var recycles workers after N
-        # calls — useful if you observe residual per-worker growth over
-        # a long run (glibc arena fragmentation, torch allocator cache).
-        # With spawn, recycled workers start pristine, so this is now a
-        # real knob rather than a diagnostic stub.
+        # One worker pool for the whole run; None means single-process.
+        # "spawn", not "fork": forked workers inherit the master's RSS
+        # (copy-on-write at fork time, so a replacement worker spawned
+        # mid-training starts at the master's multi-GB peak).
+        # TRAINER_MAXTASKSPERCHILD=N recycles workers after N calls.
         _mt = os.environ.get("TRAINER_MAXTASKSPERCHILD")
         maxtasks = int(_mt) if _mt else None
         _ctx = mp.get_context("spawn")
@@ -1949,9 +2434,8 @@ class Trainer:
         eval_srv = None
         if gpu_eval_server:
             import gpu_eval_server as _ges
-            _ims = mode.initial_match_state()
             reasons = []
-            if not (_ims is not None and _ims.is_matchplay):
+            if not is_match:
                 reasons.append("mode is not matchplay")
             if not oneply:
                 reasons.append("--oneply is required (1-ply targets)")
@@ -2063,22 +2547,138 @@ class Trainer:
                     "teacher is frozen — no weight pushes."
                 )
 
-        if workers <= 1:
-            pool = None
-        elif eval_srv is not None:
-            # maxtasksperchild is FORCED None here: slots are claimed
-            # once per process and never returned. The env var was
-            # already rejected above, so this is belt-and-braces.
-            pool = _ctx.Pool(
-                processes=workers, maxtasksperchild=None,
-                initializer=_worker_init,
-                initargs=(eval_srv.client_handles(), _srv_kind),
-            )
-        else:
-            pool = _ctx.Pool(
-                processes=(vec_workers if money_vec_active else workers),
-                maxtasksperchild=maxtasks,
-            )
+        def _new_pool():
+            """The run's collection pool (pool_guard.GuardedPool: worker
+            exit codes for PoolWatch's message, faulthandler in every
+            worker), or None for single-process collection."""
+            if workers <= 1:
+                return None
+            if eval_srv is not None:
+                # maxtasksperchild is FORCED None here: slots are claimed
+                # once per process and never returned. The env var was
+                # already rejected above, so this is belt-and-braces.
+                return GuardedPool(
+                    processes=workers, initializer=_worker_init,
+                    initargs=(eval_srv.client_handles(), _srv_kind),
+                    maxtasksperchild=None, context=_ctx,
+                )
+            return GuardedPool(processes=workers, maxtasksperchild=maxtasks,
+                               context=_ctx)
+
+        pool = _new_pool()
+        # Dead-worker detection and recovery (pool_guard). `pool` and
+        # `watch` are rebound on a restart; the closures below read them
+        # at call time, so they always see the live ones.
+        watch = PoolWatch(pool) if pool is not None else None
+        pool_restarts = 0
+        restart_limit = max_pool_restarts()
+
+        # SIGTERM/SIGINT: the `finally` below cleans up correctly, but a
+        # signal never reaches it -- the default disposition kills this
+        # process outright, so `finally` and atexit are both skipped. The
+        # eval server is a separate spawn()ed process, so it survives,
+        # reparents to init and keeps its VRAM, pinned host memory and
+        # /dev/shm slots. Without a server the same default disposition
+        # orphans the spawn-pool workers and loses everything since the
+        # last --save-every checkpoint.
+        #
+        # So on SIGTERM/SIGINT (installed on every run, server or not):
+        #   1. If the master is between rounds or collecting, the weights
+        #      are exactly "trained on `_sig['done']` episodes" -- save
+        #      them NOW as `{root}_ep{N}_sig{term,int}.pt` (never
+        #      clobbering; a `.1`, `.2` ... suffix is added if taken).
+        #      If it is mid-train-step, the signal is DEFERRED to the end
+        #      of that round (seconds), so N is always a round boundary
+        #      and never a half-trained round. A second signal while
+        #      deferred exits at once WITHOUT saving (escape hatch).
+        #   2. Tear down: pool first, or the workers block forever on a
+        #      dead server's semaphores; then the server; then the C
+        #      export dir; then os._exit so the `finally` cannot re-join
+        #      an already-terminated pool.
+        # Only this (main) process ever saves; workers never see this
+        # handler (spawn children start with default dispositions).
+        _prev_sig_handlers = {}
+        _sig = {"busy": False, "pending": None, "done": 0, "lr": None}
+        _sched_start = self.optimizer.param_groups[0]["lr"]
+
+        def _sched_lr(n_eps):
+            # The un-warmed-up schedule value at `n_eps` episodes into
+            # THIS run: what a resume from that point should start at.
+            if end_lr is None:
+                return _sched_start
+            return _sched_start + (end_lr - _sched_start) * (
+                n_eps / max(num_episodes, 1))
+
+        def _teardown_and_exit(signum, save):
+            if save:
+                n = _sig["done"]
+                n_glob = episode_offset + n
+                lr_next = _sched_lr(n)
+                if save_path:
+                    root, ext = os.path.splitext(save_path)
+                    tag = "sigint" if signum == _signal.SIGINT else "sigterm"
+                    base = f"{root}_ep{n_glob}_{tag}"
+                    path, k = f"{base}{ext or '.pt'}", 0
+                    while os.path.exists(path):
+                        k += 1
+                        path = f"{base}.{k}{ext or '.pt'}"
+                    try:
+                        self.agent.network.save(path, train_params={
+                            "signal": tag,
+                            "episodes_done": n_glob,
+                            "episodes_done_this_run": n,
+                            "optimizer_lr": _sig["lr"],
+                            "lr_at_episodes_done": lr_next,
+                        })
+                        print(
+                            f"  -> signal {signum}: checkpoint saved: {path} "
+                            f"| episodes done {n_glob} "
+                            f"(this run {n}/{num_episodes}) "
+                            f"| optimizer lr {_sig['lr']} "
+                            f"| resume lr (schedule at this-run ep {n}) "
+                            f"{lr_next:.6g}",
+                            flush=True)
+                    except Exception as e:  # never skip the teardown
+                        print(f"  -> signal {signum}: SAVE FAILED: {e!r}",
+                              flush=True)
+                else:
+                    print(f"  -> signal {signum}: no --save path, nothing "
+                          f"saved (episodes done {n_glob})", flush=True)
+            try:
+                shutdown_pool(pool)
+            except Exception:
+                pass
+            try:
+                if eval_srv is not None:
+                    eval_srv.stop()
+            except Exception:
+                pass
+            # os._exit skips `finally` and atexit: remove the C exports here.
+            if c_dir is not None:
+                shutil.rmtree(c_dir, ignore_errors=True)
+            sys.stdout.flush()
+            os._exit(128 + signum)
+
+        def _shutdown_on_signal(signum, _frame):
+            if _sig["pending"] is not None:
+                print(f"  -> signal {signum} again: exiting WITHOUT save",
+                      flush=True)
+                _teardown_and_exit(signum, save=False)
+            if _sig["busy"]:
+                _sig["pending"] = signum
+                print(f"  -> signal {signum}: deferring save to end of "
+                      f"this round's train step", flush=True)
+                return
+            _teardown_and_exit(signum, save=True)
+
+        import signal as _signal
+        for _s in (_signal.SIGTERM, _signal.SIGINT):
+            try:
+                _prev_sig_handlers[_s] = _signal.signal(
+                    _s, _shutdown_on_signal)
+            except (ValueError, OSError):
+                # Not the main thread: the `finally` is the only path.
+                pass
 
         # Master-side leak diagnostic: RSS at pool creation + per-round
         # delta. Uses the same /proc/self/statm trick as the worker.
@@ -2105,91 +2705,258 @@ class Trainer:
         encoder_name = getattr(net, "encoder_name", "perspective196")
         activation = getattr(net, "activation", "relu")
 
-        # Helper: build worker_args for a given round_size using current
-        # net weights. Called either eagerly (pipeline pre-submit) or
-        # lazily (sync path).
-        def _build_worker_args(round_size: int):
-            splits = _split_episodes(round_size, workers)
-            # .clone() is REQUIRED, not defensive. On a CPU net `.cpu()` is a
-            # no-op returning a VIEW of the live parameter, so the tensors
-            # handed to map_async are pickled by the pool's task thread WHILE
-            # optimizer.step() mutates them — workers can receive torn
-            # weights. Not reachable on --device cuda (there .cpu() genuinely
-            # copies). Cost is one ~2MB copy per round.
-            state_dict = {
-                k: v.detach().cpu().clone()
-                for k, v in net.state_dict().items()
-            }
-            return [
-                (state_dict, hidden_sizes, input_size, output_mode,
-                 encoder_name, activation,
-                 mode, n_eps, rng.randint(0, 2**31 - 1),
-                 oneply, oneply_acting, boltzmann_temp,
-                 bf16_collect, c_engine, max_episode_plies,
-                 cube_targets_1ply, met_path, met_scopes)
-                for n_eps in splits
-            ]
+        def _c_export(round_idx: int) -> str:
+            """Round `round_idx`'s weights as BGNN, exported once for all
+            its workers: written as .tmp and renamed, so no worker ever
+            opens a partial file, and a retried round (pool restart)
+            replaces its file atomically."""
+            path = os.path.join(c_dir, f"w_{round_idx + 1:05d}.bin")
+            export_weights.export_live(net, path + ".tmp")
+            os.replace(path + ".tmp", path)
+            c_files[round_idx] = path
+            return path
 
-        # Twin of _build_worker_args for the vectorized path. Keeps the
-        # same leading 14 fields (so the two stay reviewable side by
-        # side) and consumes rng.randint identically, so worker seeding
-        # is unchanged; appends (B, device, max_episode_plies).
-        def _build_vec_args(round_size: int):
+        def _c_release(round_idx: int) -> None:
+            """Remove round `round_idx`'s file once its collection returned.
+            Pipelined, the next round's file (submitted before this round
+            finished) stays: at most two exist at a time."""
+            path = c_files.pop(round_idx, None)
+            if path is not None:
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+
+        def _c_weights(round_idx: int) -> _CWeights:
+            return _CWeights(
+                _c_export(round_idx), c_collect_backend,
+                c_rng_mode if c_rng_mode is not None else 1,
+                max_episode_plies if is_match else 0)
+
+        # Worker seeds by round index, for BG_COLLECT_DUMP (popped when
+        # the round is collected).
+        round_seeds = {}
+
+        # Worker args for one round, with the current weights. Arity must
+        # stay in sync with `_collect_worker`.
+        def _build_worker_args(round_size: int, round_idx: int):
             splits = _split_episodes(round_size, workers)
-            # .clone() REQUIRED — same torn-weights hazard as
-            # _build_worker_args above.
-            state_dict = {
-                k: v.detach().cpu().clone()
-                for k, v in net.state_dict().items()
-            }
+            if c_active:
+                state_dict = _c_weights(round_idx)
+            else:
+                # .clone() is REQUIRED: on a CPU net `.cpu()` returns a
+                # view of the live parameter, which map_async pickles
+                # WHILE optimizer.step() mutates it (torn weights).
+                state_dict = {
+                    k: v.detach().cpu().clone()
+                    for k, v in net.state_dict().items()
+                }
+            seeds = [rng.randint(0, 2**31 - 1) for _ in splits]
+            round_seeds[round_idx] = seeds
             return [
                 (state_dict, hidden_sizes, input_size, output_mode,
                  encoder_name,
-                 mode, n_eps, rng.randint(0, 2**31 - 1),
+                 mode, n_eps, seed,
                  oneply, oneply_acting, boltzmann_temp,
-                 bf16_collect, cube_targets_1ply, met_path,
-                 vectorized_batch, vectorized_device, max_episode_plies,
-                 met_scopes, activation)
-                for n_eps in splits
+                 bf16_collect, met_path,
+                 met_scopes, activation, max_episode_plies)
+                for n_eps, seed in zip(splits, seeds)
             ]
 
-        # Money-line twin for vectorized_collect.py. NOTE: the tuple
-        # arity/order must stay in sync with `vectorized_collect_worker`
-        # (it hardcodes "cuda": the money eligibility above requires
-        # torch.cuda.is_available()).
-        def _build_vec_args_money(round_size: int):
-            splits = _split_episodes(round_size, vec_workers)
-            # .clone() REQUIRED — same torn-weights hazard as
-            # _build_worker_args above.
+        # Twin of _build_worker_args for the vectorized match path (arity:
+        # `VecArgs` in vectorized_matchplay.py). Keeps the same leading 13
+        # fields and consumes rng.randint identically, so worker seeding is
+        # unchanged; appends (B, device, max_episode_plies, met_scopes,
+        # activation).
+        def _build_vec_args(round_size: int, round_idx: int):
+            splits = _split_episodes(round_size, workers)
             state_dict = {
                 k: v.detach().cpu().clone()
                 for k, v in net.state_dict().items()
             }
+            seeds = [rng.randint(0, 2**31 - 1) for _ in splits]
+            round_seeds[round_idx] = seeds
             return [
                 (state_dict, hidden_sizes, input_size, output_mode,
-                 encoder_name, activation,
-                 mode, n_eps, rng.randint(0, 2**31 - 1),
+                 encoder_name,
+                 mode, n_eps, seed,
                  oneply, oneply_acting, boltzmann_temp,
-                 bf16_collect,
-                 vectorized_batch, "cuda",
-                 max_episode_plies)
-                for n_eps in splits
+                 bf16_collect, met_path,
+                 vectorized_batch, vectorized_device, max_episode_plies,
+                 met_scopes, activation)
+                for n_eps, seed in zip(splits, seeds)
             ]
 
-        # Pipeline pre-roll: if pipelining and we have a worker pool,
-        # start round 0's collect before entering the loop. The loop
-        # will then wait for "pending" results at the top of each
-        # iteration and submit the NEXT round's collect before training.
-        # No-op when pool is None or pipeline_collect is False.
-        use_pipeline = (pipeline_collect and pool is not None
-                        and not vec_active and not money_vec_active)
-        pending = None
-        pending_round_size = 0
+        # BG_ROUND_PHASES=1: one line per round with the master's time by
+        # phase, in seconds; also kept in metrics_out["round_phases"].
+        phases_on = os.environ.get("BG_ROUND_PHASES") == "1"
+        ph = {}
+
+        # Pipeline pre-roll: start round 0's collect before the loop.
+        use_pipeline = pipeline_collect and pool is not None and not vec_active
         if use_pipeline:
-            pending_round_size = min(episodes_per_round, num_episodes)
+            print("  pipelined collection: ON (round N+1 collects during "
+                  "round N's training step)", flush=True)
+        if c_active and not is_match:
+            if pool is not None:
+                transport, how = "pipe", "pickled through the pool pipe"
+            else:
+                transport = "in-process"
+                how = "in-process (one collector, no transport)"
+            print(f"  C collection rows: {how}", flush=True)
+            if metrics_out is not None:
+                metrics_out["c_collect_transport"] = transport
+        pending = None
+        if use_pipeline:
             pending = pool.map_async(
-                _collect_worker, _build_worker_args(pending_round_size),
+                _collect_worker,
+                _build_worker_args(min(episodes_per_round, num_episodes), 0),
             )
+
+        def _collect_round(round_size, round_idx, pending):
+            """One round's collection -> (enc_chunks, tgt_chunks,
+            n_discarded, pending, worker_rows). Raises WorkerDied
+            (pool_guard) instead of hanging on a dead worker; the caller
+            rebuilds the pool and calls it again. worker_rows: the rows
+            of each worker's result, in worker order (BG_COLLECT_DUMP)."""
+            enc_chunks: List[np.ndarray] = []
+            tgt_chunks: List[np.ndarray] = []
+            worker_rows: List[int] = []
+
+            def _take(results) -> int:
+                # Keep each worker's (enc, tgt) chunk; count discards. A
+                # result is (enc, tgt) (the Python match worker) or
+                # (enc, tgt, n_discarded) (C, vectorized, money).
+                discarded = 0
+                for res in results:
+                    w_enc, w_tgt = res[0], res[1]
+                    worker_rows.append(len(w_enc))
+                    if len(w_enc) > 0:
+                        enc_chunks.append(w_enc)
+                        tgt_chunks.append(w_tgt)
+                    if len(res) > 2:
+                        discarded += res[2]
+                return discarded
+
+            n_discarded = 0
+            if c_active and pool is None:
+                # Single-process C: one worker's share on a seed drawn
+                # from the run RNG, as a one-worker pool would.
+                weights = _c_weights(round_idx)
+                round_seeds[round_idx] = [rng.randint(0, 2**31 - 1)]
+                if is_match:
+                    res = _c_collect_match(
+                        weights, mode, round_size, round_seeds[round_idx][0],
+                        oneply, met_path)
+                else:
+                    res = _c_collect(
+                        weights, mode, round_size, round_seeds[round_idx][0],
+                        oneply, max_episode_plies)
+                n_discarded = _take([res])
+            elif vec_active:
+                # Lockstep GPU drivers: (enc, tgt, n_discarded) per worker.
+                from vectorized_matchplay import vectorized_matchplay_worker
+                n_discarded = _take(watch.map(
+                    vectorized_matchplay_worker,
+                    _build_vec_args(round_size, round_idx),
+                ))
+            elif pool is None:
+                # Single-process: the master agent collects, so its bf16
+                # copy is re-synced to the current weights each round and
+                # its matchplay new-game memo (net-answered entries)
+                # invalidated, per the documented invariant.
+                if hasattr(self.agent, "clear_matchplay_memo"):
+                    self.agent.clear_matchplay_memo()
+                if bf16_collect:
+                    if not self.agent.bf16_inference:
+                        self.agent.bf16_inference = True
+                    self.agent.refresh_bf16_inference()
+                n_rows = 0
+                for _ in range(round_size):
+                    encs, tgts = collect_episode(
+                        self.agent, mode, rng, oneply=oneply,
+                        max_episode_plies=max_episode_plies,
+                    )
+                    if len(encs) > 0:
+                        enc_chunks.append(encs)
+                        tgt_chunks.append(tgts)
+                        n_rows += len(encs)
+                    else:
+                        n_discarded += 1
+                worker_rows.append(n_rows)
+            elif use_pipeline:
+                if pending is None:
+                    # First round after a pool restart: resubmit this round.
+                    pending = watch.map_async(
+                        _collect_worker,
+                        _build_worker_args(round_size, round_idx))
+                # Pipelined: submit the NEXT round's collect BEFORE
+                # training (its workers see one-round-stale weights).
+                next_pending = None
+                _t_submit = time.perf_counter()
+                if round_idx + 1 < num_rounds:
+                    next_round_size = min(
+                        episodes_per_round,
+                        num_episodes - (episodes_played + round_size),
+                    )
+                    next_pending = watch.map_async(
+                        _collect_worker,
+                        _build_worker_args(next_round_size, round_idx + 1),
+                    )
+                ph["submit"] = time.perf_counter() - _t_submit
+                n_discarded = _take(watch.get(pending))
+                pending = next_pending
+            elif eval_srv is not None:
+                # The GPU server must hold THIS round's weights before any
+                # worker issues a forward: workers also build a local net
+                # from the same state_dict (for the paths that stay local),
+                # and a version skew between the two is a correctness bug.
+                if _srv_kind == "student":
+                    eval_srv.update_weights(net.state_dict())
+                # The round's map is POLLED (`map_watched`): a SIGKILLed
+                # worker or a dead server otherwise stalls the master
+                # indefinitely (the replacement worker finds no free slot).
+                n_discarded = _take(eval_srv.map_watched(
+                    pool, _collect_worker,
+                    _build_worker_args(round_size, round_idx)))
+            else:
+                # Parallel, synchronous.
+                n_discarded = _take(watch.map(
+                    _collect_worker, _build_worker_args(round_size, round_idx),
+                ))
+
+            return enc_chunks, tgt_chunks, n_discarded, pending, worker_rows
+
+        # BG_TRAIN_CUDA_GRAPH (unset or 1 = on on a cuda device, the
+        # default; 0 = off): replay full batches of the train step from a
+        # CUDA graph (cuda_graph_step.py). Bitwise equal to train_step_dev;
+        # implies the on-device pool. BG_POOL_ON_DEVICE=1: the on-device
+        # pool with the eager step (train_step_dev).
+        on_cuda = str(self.agent.device).startswith("cuda")
+        graph_step = None
+        if graph_env is not None:
+            if not on_cuda:
+                _graph_mode, why = None, f"device is {self.agent.device}"
+            else:
+                _graph_mode, why = resolve_graph_mode(self, graph_env)
+            if why is None:
+                graph_step = GraphedTrainStep(
+                    self, batch_size, input_size, mode=_graph_mode)
+                print(f"  NOTE: {graph_env_label()}: full "
+                      f"batches replay a CUDA graph of the train step (mode "
+                      f"{_graph_mode}); the pool is kept on {self.agent.device}.",
+                      flush=True)
+            elif on_cuda or graph_env_explicit():
+                # The default stays quiet off cuda.
+                print(f"  NOTE: {GRAPH_ENV} ignored ({why}); eager train "
+                      f"step.", flush=True)
+        pool_on_dev = (pool_dev_env or graph_step is not None) and on_cuda
+        if pool_dev_env and graph_step is None:
+            print(f"  NOTE: BG_POOL_ON_DEVICE=1: "
+                  + (f"the pool is kept on {self.agent.device} (eager "
+                     f"train step)." if on_cuda else
+                     f"ignored (device is {self.agent.device})."),
+                  flush=True)
 
         try:
             num_rounds = math.ceil(num_episodes / episodes_per_round)
@@ -2215,158 +2982,59 @@ class Trainer:
                 if end_lr is not None or warmup_cycles > 0:
                     for pg in self.optimizer.param_groups:
                         pg["lr"] = current_lr
+                _sig["lr"] = self.optimizer.param_groups[0]["lr"]
 
                 # ── Collect this round into (encodings, targets) ───
+                ph.clear()
                 _t_collect_start = time.perf_counter()
-                enc_chunks: List[np.ndarray] = []
-                tgt_chunks: List[np.ndarray] = []
-                n_discarded = 0
-
-                if vec_active:
-                    # Lockstep GPU drivers. Own unpack branch: the
-                    # vectorized worker returns a 3-tuple (the extra
-                    # field is the ply-guard discard count).
-                    from vectorized_matchplay import (
-                        vectorized_matchplay_worker,
+                collector = ("c" if c_active else "vectorized" if vec_active
+                             else "single" if pool is None else "serial")
+                while True:
+                    try:
+                        (enc_chunks, tgt_chunks, n_discarded,
+                         pending, worker_rows) = _collect_round(
+                            round_size, round_idx, pending)
+                        break
+                    except WorkerDied as err:
+                        # Rebuild the pool and redo the round (new worker
+                        # seeds; a C round re-exports its weights).
+                        pool_restarts += 1
+                        if pool_restarts > restart_limit:
+                            raise SystemExit(
+                                f"ERROR: {err} in round {round_idx + 1}; "
+                                f"giving up after {restart_limit} pool "
+                                f"restart(s) (BG_MAX_POOL_RESTARTS). Resume "
+                                f"from the last checkpoint.") from err
+                        announce_restart(err, pool_restarts, restart_limit,
+                                         round_idx)
+                        shutdown_pool(pool)
+                        pool = _new_pool()
+                        watch = PoolWatch(pool)
+                        pending = None   # its tasks died with the old pool
+                if c_active:
+                    _c_release(round_idx)
+                seeds_used = round_seeds.pop(round_idx, [])
+                if n_discarded and is_match:
+                    print(
+                        f"  round {round_idx}: {n_discarded}/"
+                        f"{round_size} episodes DISCARDED "
+                        f"(exceeded {max_episode_plies} plies/game)"
                     )
-                    for w_enc, w_tgt, w_disc in pool.map(
-                        vectorized_matchplay_worker,
-                        _build_vec_args(round_size),
-                    ):
-                        n_discarded += w_disc
-                        if len(w_enc) > 0:
-                            enc_chunks.append(w_enc)
-                            tgt_chunks.append(w_tgt)
-                    if n_discarded:
-                        print(
-                            f"  round {round_idx}: {n_discarded}/"
-                            f"{round_size} episodes DISCARDED "
-                            f"(exceeded {max_episode_plies} plies/game)"
-                        )
-                elif money_vec_active:
-                    # Money GPU collection: each worker drives
-                    # `vectorized_batch` games in lockstep and batches
-                    # their forwards into one local GPU call. Returns
-                    # the same (enc, tgt, n_discarded) 3-tuple as
-                    # _collect_worker, so accounting below is shared.
-                    from vectorized_collect import vectorized_collect_worker
-                    for w_enc, w_tgt, w_disc in pool.map(
-                        vectorized_collect_worker,
-                        _build_vec_args_money(round_size),
-                    ):
-                        if len(w_enc) > 0:
-                            enc_chunks.append(w_enc)
-                            tgt_chunks.append(w_tgt)
-                        n_discarded += w_disc
-                elif pool is None:
-                    # Single-process: master agent does the collection,
-                    # so its bf16 inference copy (if enabled) must be
-                    # re-synced to the current fp32 weights each round —
-                    # and its matchplay new-game memo (net-answered
-                    # entries) invalidated, per the documented invariant.
-                    if hasattr(self.agent, "clear_matchplay_memo"):
-                        self.agent.clear_matchplay_memo()
-                    if bf16_collect:
-                        if not self.agent.bf16_inference:
-                            self.agent.bf16_inference = True
-                        self.agent.refresh_bf16_inference()
-                    # Same for the C engine: it holds a weight COPY, so it
-                    # must be re-exported each round or targets would come
-                    # from the previous round's net.
-                    if c_engine and oneply:
-                        import c_engine.bg_nply as _cn
-                        if not _cn.enable_c_engine(self.agent):
-                            raise RuntimeError(
-                                "--c-engine requested but libbg_nply is "
-                                "unavailable; build with "
-                                "`bash c_engine/build_nply.sh`"
-                            )
-                    for _ in range(round_size):
-                        encs, tgts = collect_episode(
-                            self.agent, mode, rng, oneply=oneply,
-                            cube_targets_1ply=cube_targets_1ply,
-                            max_episode_plies=max_episode_plies,
-                        )
-                        if len(encs) > 0:
-                            enc_chunks.append(encs)
-                            tgt_chunks.append(tgts)
-                        else:
-                            # Empty == discarded overlong episode.
-                            n_discarded += 1
-                elif use_pipeline:
-                    # Pipelined: this round's collect was started in the
-                    # previous iteration (or pre-loop for round 0). Submit
-                    # the NEXT round's collect BEFORE training, so workers
-                    # run in parallel with the master's GPU train step.
-                    # The next round's workers see CURRENT weights (V_N
-                    # before this iter trains), making their targets one
-                    # round stale relative to a strict sync schedule.
-                    next_pending = None
-                    next_round_size = 0
-                    if round_idx + 1 < num_rounds:
-                        next_round_size = min(
-                            episodes_per_round,
-                            num_episodes - (episodes_played + round_size),
-                        )
-                        next_pending = pool.map_async(
-                            _collect_worker, _build_worker_args(next_round_size),
-                        )
-                    for _row in pending.get():
-                        w_enc, w_tgt = _row[0], _row[1]
-                        if len(w_enc) > 0:
-                            enc_chunks.append(w_enc)
-                            tgt_chunks.append(w_tgt)
-                        # 3rd field (discard count) is absent on legacy
-                        # 2-tuples (e.g. test fakes) -- treat as 0.
-                        n_discarded += _row[2] if len(_row) > 2 else 0
-                    pending = next_pending
-                    pending_round_size = next_round_size
-                else:
-                    # Non-pipelined parallel: submit and wait synchronously.
-                    # The GPU server must hold THIS round's weights before
-                    # any worker issues a forward: workers also build a
-                    # local net from the same state_dict (for the paths
-                    # that stay local), and a version skew between the two
-                    # is a correctness bug, not just a staleness one.
-                    if eval_srv is not None and _srv_kind == "student":
-                        eval_srv.update_weights(net.state_dict())
-                    # With the server active the round's map is POLLED
-                    # (`map_watched`) rather than blocking: a SIGKILLed
-                    # pool worker or a dead server otherwise stalls the
-                    # master indefinitely, and because `pool.map` never
-                    # returns, the `finally` never runs and /dev/shm is
-                    # never unlinked either.
-                    _results = (
-                        eval_srv.map_watched(
-                            pool, _collect_worker,
-                            _build_worker_args(round_size),
-                        )
-                        if eval_srv is not None
-                        else pool.map(
-                            _collect_worker, _build_worker_args(round_size),
-                        )
-                    )
-                    for _row in _results:
-                        w_enc, w_tgt = _row[0], _row[1]
-                        if len(w_enc) > 0:
-                            enc_chunks.append(w_enc)
-                            tgt_chunks.append(w_tgt)
-                        # 3rd field (discard count) is absent on legacy
-                        # 2-tuples (e.g. test fakes) -- treat as 0.
-                        n_discarded += _row[2] if len(_row) > 2 else 0
 
                 episodes_played += round_size
+                # From here to the end of the round the weights are
+                # mid-update: a signal is deferred, not acted on.
+                _sig["busy"] = True
+                _collect_dt = time.perf_counter() - _t_collect_start
                 if metrics_out is not None:
                     metrics_out.setdefault("collection_times", []).append(
-                        time.perf_counter() - _t_collect_start
-                    )
+                        _collect_dt)
                     metrics_out.setdefault("round_sizes", []).append(round_size)
                     metrics_out.setdefault("discarded", []).append(n_discarded)
                 if not enc_chunks:
-                    # Nothing usable this round. If that is because every
-                    # episode ran away, say so loudly -- otherwise the run
-                    # would spin here producing no training signal at all.
-                    if n_discarded:
+                    # Nothing usable this round; say so if every episode
+                    # ran away.
+                    if n_discarded and not is_match:
                         print(
                             f"Round {round_idx + 1:4d}/{num_rounds} "
                             f"| episodes {episodes_played}/{num_episodes} "
@@ -2376,32 +3044,97 @@ class Trainer:
                             f"no usable samples this round",
                             flush=True,
                         )
+                    if _dump_dir:
+                        _dump_round(_dump_dir, round_idx,
+                                    np.empty((0, input_size), np.float32),
+                                    np.empty((0,), np.float32), worker_rows,
+                                    seeds_used, n_discarded, collector)
+                    _sig["done"] = episodes_played
+                    _sig["busy"] = False
+                    if _sig["pending"] is not None:
+                        _teardown_and_exit(_sig["pending"], save=True)
                     continue
 
+                _t = time.perf_counter()
                 pool_enc = np.concatenate(enc_chunks, axis=0)
                 pool_tgt = np.concatenate(tgt_chunks, axis=0)
+                ph["assemble"] = time.perf_counter() - _t
+                _t = time.perf_counter()
+                if _dump_dir:
+                    _dump_round(_dump_dir, round_idx, pool_enc, pool_tgt,
+                                worker_rows, seeds_used, n_discarded,
+                                collector)
+                ph["dump"] = time.perf_counter() - _t
                 _t_train_start = time.perf_counter()
-                # Release the per-worker chunks — pool_enc/pool_tgt own
-                # a copy. Without this, chunks + pool arrays are both
-                # live during the training step (≈2× pool bytes, and
-                # pool bytes scale with pool size, so on an anomalous-
-                # length round this was a GB-class redundant footprint).
+                # Release the per-worker chunks: pool_enc/pool_tgt own a
+                # copy, and keeping both doubles the round's footprint.
                 enc_chunks = None
                 tgt_chunks = None
                 n = len(pool_enc)
 
-                # Fancy-index per batch: a materialized `pool_enc[perm]`
-                # would double peak RSS for the round, and the per-batch
-                # op cost is negligible next to forward/backward.
+                # Fancy-index per batch (a materialized `pool_enc[perm]`
+                # would double peak RSS). Both paths read the losses back
+                # once per pass, not per batch.
+                if pool_on_dev:
+                    # On-device pool (BG_POOL_ON_DEVICE=1 or the graph):
+                    # one H2D copy per round, the same shuffle (numpy, same
+                    # seed draw), the batch gathered on the device. Same
+                    # values into the same kernels: bitwise equal to the
+                    # host-pool loop (tests/test_train_step_bitwise.py).
+                    _dev = self.agent.device
+                    pool_enc_t = torch.from_numpy(pool_enc).to(
+                        _dev, dtype=torch.float32)
+                    pool_tgt_t = torch.as_tensor(
+                        pool_tgt, dtype=torch.float32).to(_dev)
+                    # The device owns the round now; the host copy (~2.9
+                    # GB at 11pt epr 4000) is not read again.
+                    pool_enc = pool_tgt = None
+                    if phases_on:
+                        torch.cuda.synchronize(_dev)
+                ph["h2d"] = time.perf_counter() - _t_train_start
+                ph["perm"] = ph["steps"] = 0.0
                 for _epoch in range(epochs_per_round):
+                    _t = time.perf_counter()
                     perm = np.arange(n)
                     rng_np = np.random.default_rng(rng.randint(0, 2**31 - 1))
                     rng_np.shuffle(perm)
-                    for start in range(0, n, batch_size):
-                        idx = perm[start:start + batch_size]
-                        batch_e = pool_enc[idx]
-                        batch_t = pool_tgt[idx]
-                        losses.append(self.train_step(batch_e, batch_t))
+                    if pool_on_dev:
+                        perm_t = torch.from_numpy(perm).to(_dev)
+                    _t_steps = time.perf_counter()
+                    ph["perm"] += _t_steps - _t
+                    ph.setdefault("t_steps0", _t_steps)
+                    round_losses = []
+                    if pool_on_dev:
+                        for start in range(0, n, batch_size):
+                            idx_t = perm_t[start:start + batch_size]
+                            if graph_step is not None:
+                                round_losses.append(graph_step.step(
+                                    pool_enc_t, pool_tgt_t, idx_t))
+                            else:
+                                round_losses.append(self.train_step_dev(
+                                    pool_enc_t[idx_t], pool_tgt_t[idx_t]))
+                    else:
+                        for start in range(0, n, batch_size):
+                            idx = perm[start:start + batch_size]
+                            batch_e = pool_enc[idx]
+                            batch_t = pool_tgt[idx]
+                            round_losses.append(
+                                self.train_step_nosync(batch_e, batch_t))
+                    losses.extend(torch.stack(round_losses).tolist())
+                    ph["steps"] += time.perf_counter() - _t_steps
+                round_losses = None
+                if pool_on_dev:
+                    perm_t = idx_t = None
+                    pool_enc_t = pool_tgt_t = None
+                    # Give the pool's VRAM back between rounds. Kept in the
+                    # allocator's cache, the next round's pool (another row
+                    # count) is a second allocation beside it at the first
+                    # larger round; the collection workers share the card.
+                    torch.cuda.empty_cache()
+                    # As train_step after every step (replays skip it).
+                    memo = getattr(self.agent, "_new_game_memo", None)
+                    if memo:
+                        memo.clear()
 
                 if metrics_out is not None:
                     metrics_out.setdefault("train_times", []).append(
@@ -2414,24 +3147,52 @@ class Trainer:
                     discard_note = (
                         f" | discarded {n_discarded} overlong episodes"
                         f" (>{max_episode_plies} plies)"
-                        if n_discarded else ""
+                        if n_discarded and not is_match else ""
                     )
+                    # BG_ROUND_TIMING=1 appends the collect/train split.
+                    _rt = ""
+                    if os.environ.get("BG_ROUND_TIMING") == "1":
+                        _rt = (f" | collect {_t_train_start - _t_collect_start:.2f}s"
+                               f" train {time.perf_counter() - _t_train_start:.2f}s")
                     print(
                         f"Round {round_idx + 1:4d}/{num_rounds} "
                         f"| episodes {episodes_played}/{num_episodes} "
                         f"| pool {n:5d} "
+                        f"| lr {_sig['lr']:.6g} "
                         f"| recent batch loss {avg:.3e}"
-                        f"{discard_note}"
+                        + discard_note + _rt
                     )
+                if phases_on:
+                    ph.update(collect=_collect_dt, rows=n,
+                              t_collect0=_t_collect_start,
+                              mb=n * (input_size + 1) * 4 / 1e6,
+                              t_steps_end=time.perf_counter())
+                    print(f"  phases round {round_idx + 1}: "
+                          + " ".join(f"{k} {ph[k]:.4f}" for k in (
+                              "collect", "submit", "assemble", "dump",
+                              "h2d", "perm", "steps") if k in ph)
+                          + f" | rows {n} ({ph['mb']:.1f} MB)", flush=True)
+                    if metrics_out is not None:
+                        metrics_out.setdefault("round_phases", []).append(
+                            dict(ph))
 
                 if next_save is not None and episodes_played >= next_save:
                     root, ext = os.path.splitext(save_path)
                     ckpt_path = _unique_ckpt_path(
-                        f"{root}_ep{episodes_played}{ext or '.pt'}")
-                    self.agent.network.save(ckpt_path)
+                        f"{root}_ep{episode_offset + episodes_played}"
+                        f"{ext or '.pt'}")
+                    self.agent.network.save(
+                        ckpt_path, train_params=train_params)
                     print(f"  -> checkpoint saved: {ckpt_path}", flush=True)
                     while next_save <= episodes_played:
                         next_save += save_every
+
+                # Round fully trained (and checkpointed): weights are
+                # now exactly "after `episodes_played` episodes".
+                _sig["done"] = episodes_played
+                _sig["busy"] = False
+                if _sig["pending"] is not None:
+                    _teardown_and_exit(_sig["pending"], save=True)
 
                 if _diag_master:
                     rss_round_end = _master_rss_mb()
@@ -2443,14 +3204,31 @@ class Trainer:
                         flush=True,
                     )
         finally:
+            # Put the previous signal dispositions back before anything
+            # else, so a second signal during teardown behaves normally
+            # instead of re-entering a handler whose pool is already gone.
+            if _prev_sig_handlers:
+                for _s, _prev in _prev_sig_handlers.items():
+                    try:
+                        _signal.signal(_s, _prev)
+                    except (ValueError, OSError, TypeError):
+                        pass
             if pool is not None:
-                pool.close()
-                pool.join()
+                if sys.exc_info()[0] is None:
+                    pool.close()
+                    pool.join()
+                else:
+                    # A failed run may hold a dead or stuck worker: a plain
+                    # terminate()/join() can block forever (pool_guard).
+                    shutdown_pool(pool)
             # AFTER the pool is joined, never before: stop() unlinks the
             # shared-memory segments the workers have mapped, and pulling
             # them out from under a live worker is a segfault.
             if eval_srv is not None:
                 eval_srv.stop()
+            if c_dir is not None:
+                # After the pool: no worker reads a weights file any more.
+                shutil.rmtree(c_dir, ignore_errors=True)
 
         return losses
 
@@ -2464,12 +3242,10 @@ class Trainer:
         log_every: int = 100,
     ) -> List[float]:
         """Online TD(0): one update per transition via the agent's
-        `td_update` fast path. Reads `lr` from the Trainer's
-        optimizer but does not use it for the update — batch-of-1
-        updates don't benefit from optimizer state. Pair with SGD.
+        `td_update`. Uses the optimizer's `lr` but not the optimizer
+        itself. Pair with SGD.
 
-        Dispatches to the cubeful variant when the mode carries a
-        MatchState.
+        Cubeful modes dispatch to the cubeful variant.
 
         Returns a flat list of per-step squared TD errors.
         """
@@ -2520,11 +3296,9 @@ class Trainer:
         seed: Optional[int] = None,
         log_every: int = 100,
     ) -> List[float]:
-        """Online TD(0) for cubeful money games. Mirrors the cubeful
-        collector's D1/D3 per-turn sample generation, but does a
-        `td_update_encoded` on each sample as it's produced — so the
-        very next forward pass (checker selection after a take, or
-        the next turn's cube decision) uses the updated weights.
+        """Online TD(0) for cubeful money games. Same per-turn samples
+        as _collect_episode_cubeful_money, but each is applied with
+        `td_update_encoded` as soon as it is produced.
         """
         rng = random.Random(seed)
         lr = self.optimizer.param_groups[0]["lr"]
@@ -2566,7 +3340,7 @@ class Trainer:
                             )
                             break
                     else:
-                        # No double: cube target = checker-phase value.
+                        # No double: target = checker-phase value.
                         v_no_double = offer._cache[f"v_no_double_{ply_tag}"]
                         losses.append(
                             agent.td_update_encoded(

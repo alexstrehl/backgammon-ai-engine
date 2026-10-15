@@ -313,6 +313,21 @@ class TestMatchplayCollector:
             assert enc.shape[0] == targets.shape[0] > 0
             assert np.all(targets >= 0.0) and np.all(targets <= 1.0)
 
+    def test_outcome_mix_grounds_targets(self):
+        # mix=1.0: every target is the realized binary match outcome
+        # from the sample viewer's perspective.
+        agent = _agent()
+        mode = MatchplayMode(2, outcome_mix=1.0)
+        rng = random.Random(4)
+        for _ in range(3):
+            enc, targets = collect_episode(agent, mode, rng)
+            assert np.all(np.isin(targets, [0.0, 1.0]))
+            # both outcomes appear across viewers in a typical episode
+        # mix=0.3: targets stay inside [0,1] and are not all backups
+        mode = MatchplayMode(2, outcome_mix=0.3)
+        enc, targets = collect_episode(agent, mode, rng)
+        assert np.all(targets >= 0.0) and np.all(targets <= 1.0)
+
     def test_oneply_accepted(self):
         agent = _agent()
         mode = MatchplayMode(2)

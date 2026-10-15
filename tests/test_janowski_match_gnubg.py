@@ -16,8 +16,12 @@ encoders in gnubg_ids.py (anchored against gnubg's own output).
 
 Needs the pinned referee build: /usr/local/bin/gnubg (1.08.003, built
 with both bearoff databases). Skips cleanly without it.
+
+Runs on both implementations of the conversion (the `jm` fixture,
+tests/janowski_impl.py: janowski_match and its C port), on one gnubg pass.
 """
 
+import functools
 import os
 import random
 import re
@@ -32,7 +36,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from backgammon_engine import BoardState, opening_roll, pip_count, switch_turn
 from encoding import CubePerspective
 from gnubg_ids import ids_for
-from janowski_match import cubeful_mwc, ctx_for, dead_mwc, _me
+from janowski_impl import jm  # noqa: F401  (fixture: py / c implementation)
+from janowski_match import ctx_for, _me
 from met import default_met
 from modes import CubeOwner, MatchState, cube_perspective
 
@@ -158,14 +163,21 @@ def _drive_gnubg(rows):
     return parsed
 
 
+@functools.lru_cache(maxsize=None)
+def _pool_and_gnubg():
+    """The sampled pool and gnubg's records of it (one gnubg pass for both
+    implementations)."""
+    pool = _sample_pool()
+    return pool, _drive_gnubg(pool)
+
+
 @pytest.mark.skipif(not os.path.exists(PROD), reason="no prob5 checkpoint")
-def test_conversion_matches_gnubg():
+def test_conversion_matches_gnubg(jm):
     """Our Cl2CfMatch port must reproduce gnubg's dead AND cubeful
     MWCs on gnubg's own probabilities, across cube states, scores and
     position classes -- and the ND/DT/DP triple where a double is
     legal."""
-    pool = _sample_pool()
-    parsed = _drive_gnubg(pool)
+    pool, parsed = _pool_and_gnubg()
 
     checked = dead_max = cf_max = 0
     triple_checked = triple_max = 0
@@ -180,17 +192,17 @@ def test_conversion_matches_gnubg():
         ctx = ctx_for(gms, player)
         probs = rec["probs"]
 
-        d = dead_mwc(probs, ctx, MET)
+        d = jm.dead_mwc(probs, ctx, MET)
         dead_max = max(dead_max, abs(d - rec["mwc_dead"]))
-        v = cubeful_mwc(probs, persp, ctx, x, MET)
+        v = jm.cubeful_mwc(probs, persp, ctx, x, MET)
         cf_max = max(cf_max, abs(v - rec["mwc_cubeful"]))
         checked += 1
 
         trip = rec["cube_triple"]
         if trip:
             nd_key = ("No double" if "No double" in trip else "No redouble")
-            v_nd = cubeful_mwc(probs, persp, ctx, x, MET)
-            v_dt = cubeful_mwc(
+            v_nd = jm.cubeful_mwc(probs, persp, ctx, x, MET)
+            v_dt = jm.cubeful_mwc(
                 probs, CubePerspective.THEIRS,
                 ctx.with_cube(2 * ctx.cube), x, MET)
             v_dp = _me(MET, ctx, ctx.cube, True)

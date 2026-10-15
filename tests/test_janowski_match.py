@@ -4,6 +4,10 @@ Every number asserted here is DERIVED from the MET at test time, never
 hard-coded, so the tests hold under any table. The gnubg cross-check
 (same conversion vs the real binary's cubeful MWCs) is a separate,
 binary-dependent validation.
+
+The conversion tests run on both implementations (the `jm` fixture,
+tests/janowski_impl.py): janowski_match itself and its C port
+(c_api/puretd_janowski.c).
 """
 
 import os
@@ -16,10 +20,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from encoding import CubePerspective
-from janowski_match import (
-    MatchCtx, cube_decision, cubeful_mwc, ctx_for, dead_mwc, do_cubeful,
-    get_points, _me,
-)
+from janowski_impl import jm  # noqa: F401  (fixture: py / c implementation)
+from janowski_match import MatchCtx, ctx_for, _me
 from met import default_met
 from modes import CubeOwner, MatchState
 
@@ -67,7 +69,7 @@ def rand_ctx(rng, allow_crawford=False):
 # ── structural invariants ────────────────────────────────────────────
 
 
-def test_mirror_symmetry():
+def test_mirror_symmetry(jm):
     """V_me + V_opp(mirrored everything) == 1, all perspectives."""
     rng = random.Random(1)
     pairs = {CENTERED: CENTERED, MINE: THEIRS, THEIRS: MINE}
@@ -76,12 +78,12 @@ def test_mirror_symmetry():
         probs = rand_nested(rng)
         x = rng.uniform(0.0, 1.0)
         for persp, mpersp in pairs.items():
-            a = cubeful_mwc(probs, persp, ctx, x, MET)
-            b = cubeful_mwc(mirror(probs), mpersp, ctx.flip(), x, MET)
+            a = jm.cubeful_mwc(probs, persp, ctx, x, MET)
+            b = jm.cubeful_mwc(mirror(probs), mpersp, ctx.flip(), x, MET)
             assert a + b == pytest.approx(1.0, abs=1e-9), (ctx, persp)
 
 
-def test_dead_gates_return_dead():
+def test_dead_gates_return_dead(jm):
     """Crawford, cube >= both aways, and 2a2a are pure dead cube."""
     rng = random.Random(2)
     dead_ctxs = [
@@ -91,26 +93,26 @@ def test_dead_gates_return_dead():
         MatchCtx(1, 1, True, False, 1),    # 1a1a
     ]
     for ctx in dead_ctxs:
-        assert not do_cubeful(ctx)
+        assert not jm.do_cubeful(ctx)
         for _ in range(20):
             probs = rand_nested(rng)
-            d = dead_mwc(probs, ctx, MET)
+            d = jm.dead_mwc(probs, ctx, MET)
             for persp in (CENTERED, MINE, THEIRS):
-                assert cubeful_mwc(probs, persp, ctx, 0.68, MET) == \
+                assert jm.cubeful_mwc(probs, persp, ctx, 0.68, MET) == \
                     pytest.approx(d, abs=1e-12)
 
 
-def test_dmp_reduces_to_pwin():
+def test_dmp_reduces_to_pwin(jm):
     """At 1-away/1-away the cubeful MWC is exactly P(win)."""
     ctx = MatchCtx(1, 1, True, False, 1)
     for p in (0.1, 0.4, 0.5, 0.9):
         probs = nested(p, wg=p * 0.3, lg=(1 - p) * 0.3)
         for persp in (CENTERED, MINE, THEIRS):
-            assert cubeful_mwc(probs, persp, ctx, 0.68, MET) == \
+            assert jm.cubeful_mwc(probs, persp, ctx, 0.68, MET) == \
                 pytest.approx(p, abs=1e-12)
 
 
-def test_monotone_and_bounded_in_p():
+def test_monotone_and_bounded_in_p(jm):
     """Fixed rates, sweeping p: cubeful MWC is non-decreasing and
     stays inside [min, max] of the endpoint MWCs."""
     rng = random.Random(3)
@@ -122,21 +124,21 @@ def test_monotone_and_bounded_in_p():
             last = -1.0
             for p in np.linspace(0.001, 0.999, 101):
                 probs = nested(p, wg=g_w * p, lg=g_l * (1 - p))
-                v = cubeful_mwc(probs, persp, ctx, x, MET)
+                v = jm.cubeful_mwc(probs, persp, ctx, x, MET)
                 assert v >= last - 1e-9
                 assert -1e-9 <= v <= 1.0 + 1e-9
                 last = v
 
 
-def test_continuity_at_kinks():
+def test_continuity_at_kinks(jm):
     """The piecewise-live curve is continuous across its kinks."""
     rng = random.Random(4)
     for _ in range(60):
         ctx = rand_ctx(rng)
-        if not do_cubeful(ctx):
+        if not jm.do_cubeful(ctx):
             continue
         rates = (0.2, 0.02, 0.15, 0.01)
-        cp_me, cp_opp = get_points(rates, ctx, MET)
+        cp_me, cp_opp = jm.get_points(rates, ctx, MET)
         for kink in (cp_me, 1.0 - cp_opp):
             if not (0.01 < kink < 0.99):
                 continue
@@ -148,8 +150,8 @@ def test_continuity_at_kinks():
                         lg=(rates[2] + rates[3]) * (1 - p),
                         lbg=rates[3] * (1 - p),
                     )
-                lo = cubeful_mwc(probs_at(kink - 1e-6), persp, ctx, 1.0, MET)
-                hi = cubeful_mwc(probs_at(kink + 1e-6), persp, ctx, 1.0, MET)
+                lo = jm.cubeful_mwc(probs_at(kink - 1e-6), persp, ctx, 1.0, MET)
+                hi = jm.cubeful_mwc(probs_at(kink + 1e-6), persp, ctx, 1.0, MET)
                 assert abs(hi - lo) < 1e-4
 
 
@@ -166,7 +168,7 @@ def _ms(my, opp, length=None, cube=1, owner=CubeOwner.CENTERED,
     )
 
 
-def test_2a2a_doctrine():
+def test_2a2a_doctrine(jm):
     """2a2a: double on any clear advantage; take up to the 1a2a MWC.
 
     Derivation from the table (gammonless): the cube-2 branches end
@@ -177,26 +179,26 @@ def test_2a2a_doctrine():
     w1 = _me(MET, ctx_for(ms, 0), 1, True)     # -> Crawford 1a2a
     # Double point: p where min(p, w1) crosses the dead line.
     for p, expect in ((0.52, True), (0.48, False)):
-        d = cube_decision(nested(p), ms, 0, 0.68, MET)
+        d = jm.cube_decision(nested(p), ms, 0, 0.68, MET)
         assert d["should_double"] == expect, (p, d)
     # Take while v_dp > v_dt = p, i.e. p < w1.
-    d = cube_decision(nested(w1 - 0.02), ms, 0, 0.68, MET)
+    d = jm.cube_decision(nested(w1 - 0.02), ms, 0, 0.68, MET)
     assert d["take"]
-    d = cube_decision(nested(w1 + 0.02), ms, 0, 0.68, MET)
+    d = jm.cube_decision(nested(w1 + 0.02), ms, 0, 0.68, MET)
     assert not d["take"]
 
 
-def test_post_crawford_trailer_always_doubles():
+def test_post_crawford_trailer_always_doubles(jm):
     """Post-Crawford trailer: doubling dominates at any p."""
     ms = _ms(2, 1, length=3, crawford_done=True)
     assert ms.can_offer(0)
     for p in (0.3, 0.5, 0.7):
-        d = cube_decision(nested(p, wg=0.15 * p, lg=0.15 * (1 - p)),
+        d = jm.cube_decision(nested(p, wg=0.15 * p, lg=0.15 * (1 - p)),
                           ms, 0, 0.68, MET)
         assert d["should_double"], (p, d)
 
 
-def test_post_crawford_free_drop():
+def test_post_crawford_free_drop(jm):
     """Leader 1-away facing the mandatory double at 2-away
     post-Crawford: pass iff behind in the game (the free drop --
     passing burns one of the trailer's even points)."""
@@ -204,28 +206,28 @@ def test_post_crawford_free_drop():
     # scoring 1 point -> 1a1a post-Crawford = 0.5. v_dt: cube 2 ends
     # the match either way -> v_dt = p_trailer (gammonless).
     ms = _ms(2, 1, length=3, crawford_done=True)
-    d = cube_decision(nested(0.55), ms, 0, 0.68, MET)
+    d = jm.cube_decision(nested(0.55), ms, 0, 0.68, MET)
     assert not d["take"]        # trailer 55% -> leader passes
-    d = cube_decision(nested(0.45), ms, 0, 0.68, MET)
+    d = jm.cube_decision(nested(0.45), ms, 0, 0.68, MET)
     assert d["take"]            # trailer 45% -> leader takes
 
 
-def test_3a3a_thresholds_sane():
+def test_3a3a_thresholds_sane(jm):
     """3a3a centered cube-1: the double and cash points land in the
     conventional bands (soft check; exact values vary by table)."""
     ms = _ms(3, 3)
     grid = np.linspace(0.30, 0.95, 400)
     dbl = [p for p in grid
-           if cube_decision(nested(p), ms, 0, 0.68, MET)["should_double"]]
+           if jm.cube_decision(nested(p), ms, 0, 0.68, MET)["should_double"]]
     take = [p for p in grid
-            if cube_decision(nested(p), ms, 0, 0.68, MET)["take"]]
+            if jm.cube_decision(nested(p), ms, 0, 0.68, MET)["take"]]
     assert dbl, "no doubling point found at 3a3a"
     assert 0.5 < dbl[0] < 0.8, dbl[0]          # double point
     assert take, "no take region at 3a3a"
     assert 0.6 < take[-1] < 0.85, take[-1]     # cash point
 
 
-def test_money_limit_cash_point():
+def test_money_limit_cash_point(jm):
     """25a25a (deep match ~ money): the live cash point approaches
     Janowski's money live CP = (L + 1) / (W + L + 0.5)."""
     ctx = MatchCtx(25, 25, False, False, 1)
@@ -233,24 +235,24 @@ def test_money_limit_cash_point():
     W = 1.0 + g[0] + g[1]
     L = 1.0 + g[2] + g[3]
     cp_money = (L + 1.0) / (W + L + 0.5)
-    cp_me, cp_opp = get_points(g, ctx, MET)
+    cp_me, cp_opp = jm.get_points(g, ctx, MET)
     assert cp_me == pytest.approx(cp_money, abs=0.03)
     assert cp_opp == pytest.approx(cp_money, abs=0.03)
 
 
-def test_cube_decision_matches_manual_composition():
+def test_cube_decision_matches_manual_composition(jm):
     """cube_decision == the three cubeful_mwc calls it is built from."""
     rng = random.Random(5)
     for _ in range(40):
         my, opp = rng.randint(2, 5), rng.randint(2, 5)
         ms = _ms(my, opp, length=max(my, opp) + 1)
         probs = rand_nested(rng)
-        d = cube_decision(probs, ms, 0, 0.68, MET)
+        d = jm.cube_decision(probs, ms, 0, 0.68, MET)
         ctx = ctx_for(ms, 0)
         assert d["v_nd"] == pytest.approx(
-            cubeful_mwc(probs, CENTERED, ctx, 0.68, MET))
+            jm.cubeful_mwc(probs, CENTERED, ctx, 0.68, MET))
         assert d["v_dt"] == pytest.approx(
-            cubeful_mwc(probs, THEIRS, ctx.with_cube(2), 0.68, MET))
+            jm.cubeful_mwc(probs, THEIRS, ctx.with_cube(2), 0.68, MET))
         assert d["v_dp"] == pytest.approx(_me(MET, ctx, 1, True))
 
 

@@ -2,10 +2,10 @@
 """
 train_batch.py -- Batch TD(0) self-play training for backgammon.
 
-Round-based: each "round" collects `episodes_per_round` self-play
-episodes, shuffles them, and trains for `epochs_per_round` passes in
-fixed-size batches via the agent's predict / loss primitives. Default
-optimizer is Adam.
+Round-based: each round collects `episodes_per_round` self-play
+episodes, shuffles them, and trains `epochs_per_round` passes in
+fixed-size batches. Default optimizer is Adam. Thin CLI over
+trainer.Trainer.train; shared flags live in train_cli.py.
 
 Examples:
 
@@ -21,10 +21,8 @@ Examples:
         --save money_60k.pt --eval-vs-random 200
 """
 
-# Pin BLAS / PyTorch threads BEFORE importing torch. Even with batch
-# training, the network is small enough that thread contention can
-# dominate, and parallel-worker collection wants each worker subprocess
-# to be single-threaded.
+# Pin BLAS / PyTorch threads BEFORE importing torch: collection workers
+# must be single-threaded.
 import os
 if "OMP_NUM_THREADS" not in os.environ:
     os.environ["OMP_NUM_THREADS"] = "1"
@@ -37,80 +35,87 @@ torch.set_num_threads(1)
 
 from td_agent import TDAgent
 from train_cli import (
-    add_common_args, apply_cubeful_money_upgrades, build_mode, build_network,
-    eval_vs_random, resolve_save_path,
+    add_common_args, apply_cubeful_money_upgrades,
+    build_mode, build_network, eval_vs_random, resolve_save_path,
 )
-from trainer import DEFAULT_MAX_EPISODE_PLIES, Trainer
+from trainer import (C_COLLECT_BACKENDS, C_COLLECT_RNG_MODES,
+                     DEFAULT_MAX_EPISODE_PLIES, Trainer, c_collect_error,
+                     c_collect_fallbacks, c_collect_library)
 
 
-def resolve_cuda_oneply_collector(args):
-    """Route `--oneply --device cuda` to the vectorized GPU collector.
+def c_collect_default_fallbacks(args, net, mode):
+    """Why the DEFAULT C collector (money modes) cannot collect this run:
+    the preconditions (trainer.c_collect_fallbacks), else a libpuretd that
+    cannot be built or loaded (built on demand here). [] when it can, or
+    when the default does not apply (match play, an explicit --c-collect
+    or --no-c-collect decides on its own). Needs the built network and
+    mode; resolve_collector takes the result."""
+    if (args.game_mode == "matchplay" or getattr(args, "c_collect", False)
+            or args.no_c_collect):
+        return []
+    reasons = c_collect_fallbacks(
+        net, mode, oneply_acting=args.oneply_acting,
+        boltzmann_temp=args.boltzmann_temp, bf16_collect=args.bf16_collect)
+    if not reasons:
+        why = c_collect_library(args.c_collect_backend or "simd")
+        if why is not None:
+            reasons = [why]
+    return reasons
 
-    Returns the list of notes to print (pure-ish: mutates only
-    args.vectorized_collect; no I/O), so the routing table is unit-
-    testable without a GPU or a parser.
+
+def resolve_collector(args, c_fallbacks=None):
+    """Pick the collector: the C collector or the Python collector.
+
+    `c_fallbacks`: c_collect_default_fallbacks(), the reasons the default
+    C collector cannot collect this run (None: not known, the C collector
+    is assumed to apply).
+
+    Mutates only args.c_collect / args.c_collect_auto and returns the
+    notes to print: one per fallback reason, then at most one routing
+    note.
 
     Rules:
-      * explicit --vectorized-collect and --no-vectorized-collect
-        together is an error;
-      * AUTO-enable only for --oneply --device cuda, and only when the
-        user chose no other collector accelerator (--c-engine /
-        --bf16-collect are explicit CPU-collector choices and win);
-      * --oneply-acting keeps the CPU collector (the vectorized worker
-        hard-refuses it; auto-routing must not manufacture that error).
-        Callers must normalize "--oneply-acting implies --oneply" BEFORE
-        calling this;
-      * the default is NOT a no-op: an existing `--oneply --device
-        cuda` command is auto-routed onto the vectorized collector
-        (bit-exact, so a speed choice, not a results change); a run
-        that must keep the CPU collector says --no-vectorized-collect.
-    The CUDA/workers availability checks stay in Trainer.train (which
-    also runs the VRAM preflight and can fall back loudly).
+      * --c-collect with --no-c-collect is an error;
+      * match play: the Python collector unless --c-collect (an explicit
+        opt-in; Trainer.train errors on any unmet precondition);
+      * money modes: the C collector is the default (args.c_collect_auto);
+        --c-collect is accepted (it only makes a missing library an
+        error); the default with `c_fallbacks`: a NOTE per reason and the
+        Python collector, while an explicit --c-collect keeps
+        Trainer.train's NOTE + Python collector; --no-c-collect: the
+        Python collector; the C collector is a CPU collector, so --oneply
+        --device cuda keeps it (NOTE).
     """
     notes = []
-    if args.vectorized_collect and args.no_vectorized_collect:
+    explicit_c = bool(getattr(args, "c_collect", False))
+    no_c = bool(args.no_c_collect)
+    if explicit_c and no_c:
         raise SystemExit(
-            "ERROR: --vectorized-collect and --no-vectorized-collect "
-            "are mutually exclusive")
-    if not (args.oneply and args.device == "cuda"):
+            "ERROR: --c-collect and --no-c-collect/--python-api are "
+            "mutually exclusive")
+    if args.game_mode == "matchplay":
+        args.c_collect_auto = False
+        args.c_collect = explicit_c
         return notes
-    if args.no_vectorized_collect:
-        notes.append(
-            "NOTE: --no-vectorized-collect: keeping the CPU collector; "
-            "the master training step runs on cuda.")
+    default_c = not (explicit_c or no_c)
+    fallback = default_c and bool(c_fallbacks)
+    args.c_collect_auto = default_c and not fallback
+    args.c_collect = explicit_c or args.c_collect_auto
+    if args.c_collect:
+        if args.oneply and args.device == "cuda" and not (
+                args.bf16_collect or args.oneply_acting):
+            # (Those two keep the Python collector; Trainer.train's NOTE
+            # says so.)
+            who = "--c-collect" if explicit_c else "the C collector (default)"
+            notes.append(
+                f"NOTE: {who}: --oneply --device cuda keeps the C collector "
+                f"(a CPU collector; --no-c-collect for the Python "
+                f"collector); the master training step runs on cuda.")
         return notes
-    if args.vectorized_collect:
-        return notes
-    if args.c_engine or args.bf16_collect:
-        notes.append(
-            "NOTE: --oneply --device cuda would default to the "
-            "vectorized GPU collector, but an explicit CPU-collector "
-            "accelerator (--c-engine/--bf16-collect) was chosen and "
-            "wins. Drop it to use the GPU collector.")
-        return notes
-    if args.oneply_acting:
-        # The vectorized collector refuses --oneply-acting (hard error in
-        # Trainer.train); auto-routing would turn a valid command into
-        # that error, blaming a flag the user never passed.
-        notes.append(
-            "NOTE: --oneply-acting is not supported by the vectorized "
-            "GPU collector; keeping the CPU collector. The master "
-            "training step runs on cuda.")
-        return notes
-    if getattr(args, "game_mode", None) == "matchplay":
-        # The active matchplay line chooses its collector explicitly;
-        # auto-routing here would silently switch it (the matchplay
-        # vectorized driver also has extra requirements, e.g.
-        # --boltzmann-temp 0). Money-mode UX only.
-        notes.append(
-            "NOTE: matchplay does not auto-route to the vectorized GPU "
-            "collector; pass --vectorized-collect explicitly if wanted.")
-        return notes
-    args.vectorized_collect = True
-    notes.append(
-        "AUTO: --oneply --device cuda -> vectorized GPU collector "
-        "(pass --no-vectorized-collect for the CPU collector; the VRAM "
-        "preflight may still cap workers or fall back, and will say so).")
+    if fallback:
+        notes += [f"NOTE: --c-collect (default): {why}; falling back to "
+                  f"the Python collector (the routing from before the "
+                  f"default)." for why in c_fallbacks]
     return notes
 
 
@@ -127,6 +132,15 @@ def main():
                        help="Optimizer learning rate.")
     g_opt.add_argument("--end-lr", type=float, default=None,
                        help="If set, linearly anneal lr -> end_lr over the run.")
+    g_opt.add_argument("--resume-episodes", type=int, default=0, metavar="N",
+                       help="Crash recovery: the --resume checkpoint already "
+                            "has N episodes of THIS schedule (e.g. from its "
+                            "_ep{N} / _ep{N}_sigterm name). Pass the ORIGINAL "
+                            "--lr/--end-lr/--num-episodes; the run then starts "
+                            "at lr(N) = lr + (end_lr - lr) * N / num_episodes, "
+                            "trains the remaining num_episodes - N, and names "
+                            "checkpoints by the global episode count. Give a "
+                            "new --seed, or the worker seeds replay from ep 0.")
     g_opt.add_argument("--momentum", type=float, default=0.0,
                        help="SGD momentum (ignored for Adam).")
     g_opt.add_argument("--grad-clip", type=float, default=None,
@@ -146,7 +160,7 @@ def main():
     g_batch.add_argument("--oneply", action="store_true",
                          help="Compute training targets via 1-ply lookahead "
                               "(enumerate all 21 dice outcomes per state). "
-                              "Lower variance, ~5-10x slower per turn. "
+                              "Lower variance, several times slower per turn. "
                               "Move selection during collection stays at 0-ply "
                               "unless --oneply-acting is also set.")
     g_batch.add_argument("--oneply-acting", action="store_true",
@@ -161,26 +175,10 @@ def main():
                          help="Ramp LR from lr*0.1 up to scheduled lr over the "
                               "first N rounds. For task transfers, where a "
                               "fresh head sits on a trained trunk.")
-    g_batch.add_argument("--c-engine", action="store_true",
-                         help="compute the 1-ply cubeful target's net-forward "
-                              "in C via libbg_nply (OpenBLAS sgemm) instead of "
-                              "PyTorch. Requires --oneply and "
-                              "c_engine/libbg_nply.so (build_nply.sh). Targets "
-                              "are numerically equivalent; only the forward "
-                              "moves to C. ~+17%% on top of --pipeline-collect.")
     g_batch.add_argument("--bf16-collect", action="store_true",
-                         help="Run 1-ply target NN forward in bf16 inside "
-                              "collection workers (~1.9x matmul speedup). "
-                              "Master training step stays fp32. Introduces "
-                              "~1e-3 numerical drift in 1-ply targets.")
-    g_batch.add_argument("--cube-targets-1ply", action="store_true",
-                         help="EXPERIMENTAL: in --oneply training mode, use "
-                              "value_oneply_checker_cubeful() for cube-decision "
-                              "targets (pure 1-ply, conceptually a deeper "
-                              "search). Default uses the 0-ply formula "
-                              "(evaluate_cubeful at is_cube_action=False) for "
-                              "cube targets, which empirically gives much "
-                              "better cube_mEMG. No effect without --oneply.")
+                         help="Run the 1-ply target forward in bf16 inside "
+                              "collection workers; the master training step "
+                              "stays fp32. ~1e-3 drift in 1-ply targets.")
     g_batch.add_argument("--oracle-targets", default=None, metavar="SPEC",
                          help="Supervised oracle training (matchplay "
                               "only): prob5 checkpoint path, optional "
@@ -188,7 +186,8 @@ def main():
                               "net; every collected target is replaced "
                               "by the p5jan oracle's value of the "
                               "encoded state (janowski_match). "
-                              "Incompatible with --oneply and --met.")
+                              "Incompatible with --oneply, --met and "
+                              "--outcome-mix > 0.")
     g_batch.add_argument("--oracle-eval-server", action="store_true",
                          help="With --oracle-targets: host the teacher "
                               "net on ONE shared GPU process; workers "
@@ -208,29 +207,28 @@ def main():
     g_batch.add_argument("--oracle-move-eps", type=float, default=None,
                          metavar="EPS",
                          help="With --oracle-targets: also supervise "
-                              "every legal successor that EITHER the "
-                              "teacher rates within EPS (MWC) of its own "
-                              "best move, OR the student rates within EPS "
-                              "of the teacher's best. The union matters: "
-                              "the second set is where the student's "
-                              "inflated favourites get corrected, and "
-                              "greedy play never visits those states.")
-    g_batch.add_argument("--score-curriculum", type=float, default=0.0,
-                         metavar="P",
-                         help="Matchplay: fraction of episodes that "
-                              "start at a seeded away-score pair "
-                              "(uniform over reachable pairs, Crawford "
-                              "handled; see trainer._curriculum_start) "
-                              "instead of the natural full-match "
-                              "score. Default 0 = off. The published "
-                              "champion was trained with 0.5.")
+                              "every legal successor whose oracle value "
+                              "is within EPS (MWC) of the oracle's best "
+                              "move -- the near-optimal action set the "
+                              "net must rank correctly.")
+    g_batch.add_argument("--outcome-mix", type=float, default=0.0,
+                         metavar="BETA",
+                         help="Matchplay: blend BETA of the realized "
+                              "match outcome into every collected "
+                              "target (t = (1-BETA)*backup + BETA*z). "
+                              "Grounds cube-decision samples, which "
+                              "pure TD(0) never grounds; BETA=0.3 "
+                              "validated on stuck cube positions.")
     g_batch.add_argument("--met", default=None, metavar="TABLE",
                          help="Matchplay: ground all cross-game equity in a "
                               "real match equity table instead of the "
                               "network's own new-game evaluation. Accepts "
-                              "'auto' (gnubg's Kazaross-XG2 default), a "
-                              "table name from /usr/share/gnubg/met, or a "
-                              "path to a MET XML. This pins v_dp, the take "
+                              "'auto' (the bundled "
+                              "met_tables/Kazaross-XG2.xml, "
+                              "falling back to gnubg's system table in "
+                              "/usr/share/gnubg/met), a table name from "
+                              "/usr/share/gnubg/met, or a path to a MET "
+                              "XML. This pins v_dp, the take "
                               "point, terminal gammon pricing and the "
                               "collector's game-boundary target, all of "
                               "which are otherwise bootstraps off the net's "
@@ -248,69 +246,58 @@ def main():
                               "never be grounded from a table.")
     g_batch.add_argument("--pipeline-collect", action="store_true",
                          help="Overlap worker collection of round N+1 with the "
-                              "master training step of round N. Workers in round "
-                              "N+1 see weights from end of round N-1 (one-round "
-                              "stale targets). Negligible TD impact at typical "
-                              "1-ply LRs but should be validated when changing "
-                              "recipes. Reproducibility preserved. Requires "
-                              "--workers > 1; no-op otherwise.")
-    g_batch.add_argument("--max-episode-plies", type=int,
-                         default=DEFAULT_MAX_EPISODE_PLIES, metavar="N",
-                         help="Safety bound on self-play episode length, in "
-                              "plies (turns). An episode exceeding it is "
-                              "DISCARDED (its samples are dropped, not "
-                              "truncated) and counted in the round log line. "
-                              "Guards against a degenerate policy producing "
-                              "non-terminating games, which otherwise hang the "
-                              "round barrier forever while worker RSS grows "
-                              "until the OOM killer fires. Never triggers on "
-                              "healthy play (healthy max is ~341 samples "
-                              "i.e. well under 1500 plies). On the matchplay "
-                              "vectorized path this is a per-GAME turn bound "
-                              "(a runaway game in lockstep pins a driver slot "
-                              "and stalls the round). 0 disables.")
+                              "master training step of round N: workers see "
+                              "one-round-stale weights. Requires --workers > 1; "
+                              "no-op otherwise.")
     g_batch.add_argument("--vectorized-collect", action="store_true",
-                         help="Collect on the GPU with the lockstep generator "
-                              "driver: each worker process runs "
-                              "--vectorized-batch games (matchplay: matches, "
-                              "via vectorized_matchplay.py) concurrently and "
-                              "batches every pending network forward across "
-                              "them into ONE local CUDA call (no IPC, no "
-                              "inference server). Requires --oneply, "
-                              "--workers > 1 and CUDA (matchplay additionally "
-                              "--boltzmann-temp 0); warns and falls back to "
-                              "the CPU collector otherwise. DISABLES "
-                              "--pipeline-collect, --c-engine and "
-                              "--bf16-collect (each logged explicitly). Use a "
-                              "large --episodes-per-round (>= workers * "
-                              "batch * 8) or the lockstep tail-drain eats the "
-                              "throughput gain. --max-episode-plies is "
-                              "enforced per game, as on the CPU paths.")
-    g_batch.add_argument("--no-vectorized-collect", action="store_true",
-                         help="Keep the CPU collector even when --oneply "
-                              "--device cuda would default to the vectorized "
-                              "GPU collector (money modes only; matchplay "
-                              "never auto-routes). The master training step "
-                              "still runs on cuda. Mutually exclusive with an "
-                              "explicit --vectorized-collect.")
-    g_batch.add_argument("--vectorized-batch", type=int, default=32,
-                         metavar="B",
-                         help="Games in flight per worker process for "
-                              "--vectorized-collect (default 32, must be "
-                              ">= 1). Larger B means bigger GPU batches but "
-                              "more GPU memory per process and a longer "
-                              "lockstep tail (~730 MB/driver at B=32 on the "
-                              "matchplay path).")
+                         help="MATCHPLAY + --oneply only. Collect with the "
+                              "lockstep generator driver "
+                              "(vectorized_matchplay.py): each worker runs "
+                              "--vectorized-batch matches concurrently and "
+                              "batches all their pending network forwards "
+                              "into one GPU call per step, instead of one "
+                              "CPU forward per game per step. Produces "
+                              "equivalent training data (bit-identical when "
+                              "driven single-game on CPU). Requires "
+                              "--workers > 1, CUDA and --boltzmann-temp 0; "
+                              "prints a WARN and falls back otherwise. "
+                              "Set --episodes-per-round >= workers x "
+                              "--vectorized-batch or the fused batches "
+                              "never reach B (2-3x slower). "
+                              "Disables --pipeline-collect.")
     g_batch.add_argument("--oracle-act-only", action="store_true",
                          help="Use the teacher for MOVE SELECTION only: no "
                               "oracle value targets are emitted, so training "
                               "targets come from the normal (--oneply) TD "
                               "path. Requires --oracle-targets, "
                               "--oracle-move-eps and --oracle-act-prob > 0. "
-                              "Transfers the teacher's ranking through the "
-                              "visited trajectory while keeping the "
-                              "student's own value targets (no teacher "
-                              "calibration error imported).")
+                              "Motivation: p5jan outplays the champion at "
+                              "checker by 5.84 mMWC, yet distilling its VALUES "
+                              "damages the net -- its ranking is better than "
+                              "its calibration. This transfers the ranking "
+                              "through the visited trajectory while keeping "
+                              "the student's own value targets.")
+    g_batch.add_argument("--td-eps-only", action="store_true",
+                         help="MATCHPLAY + --td-move-eps. Drop the "
+                              "on-trajectory CHECKER rows, keeping the eps "
+                              "rows, the cube rows and the game-boundary "
+                              "rows. Pure self-distillation of the 1-ply "
+                              "value into the 0-ply read, with no "
+                              "bootstrapped trajectory target. Isolates "
+                              "whether those rows are what degrades a "
+                              "converged net.")
+    g_batch.add_argument("--td-oneply-act", type=int, default=0, metavar="K",
+                         help="MATCHPLAY + --oneply. EXPERT ITERATION: the "
+                              "collector ACTS with 1-ply move selection over "
+                              "the top-K successors by the 0-ply read, "
+                              "instead of acting 0-ply. 1-ply selection "
+                              "measures +2.00pp over 0-ply on identical "
+                              "weights, so trajectories come from the "
+                              "stronger policy and the net learns to "
+                              "reproduce choices it cannot yet make at 0 "
+                              "ply. K=3 matched FULL 1-ply selection on the "
+                              "gnubg-confirmed set at 5.2x less compute. "
+                              "0 = act 0-ply (default).")
     g_batch.add_argument("--oracle-1ply-eps", type=float, default=0.0,
                          metavar="EPS",
                          help="MATCHPLAY + --oracle-plies>0. Use the CHEAP "
@@ -329,11 +316,24 @@ def main():
                               "(MWC) of the best 0-ply value, each targeted "
                               "at its OWN 1-ply value. Does NOT change which "
                               "move is played, so the state distribution is "
-                              "untouched. Closes "
+                              "untouched (unlike --move-explore-eps). Closes "
                               "the coverage hole: ~540 successor reads feed "
                               "each 1-ply target but only the played one "
                               "becomes a row, leaving the skipped siblings "
                               "undervalued by ~12 mMWC. Try 0.01.")
+    g_batch.add_argument("--move-explore-eps", type=float, default=0.0,
+                         metavar="EPS",
+                         help="MATCHPLAY. Fraction of checker decisions that "
+                              "execute a RANDOM legal move instead of the "
+                              "greedy one (default 0.0 = fully greedy, the "
+                              "historical behaviour). Targets are unaffected: "
+                              "under --oneply the target is a max over "
+                              "successors computed from the state, and in the "
+                              "0-ply path the greedy successor's bootstrap is "
+                              "kept -- so this is off-policy TD, not the "
+                              "random policy's value. Fixes the closed loop "
+                              "where greedy play only ever visits the states "
+                              "the net already prefers.")
     g_batch.add_argument("--oracle-act-prob", type=float, default=0.0,
                          metavar="BETA",
                          help="Requires --oracle-targets and "
@@ -348,6 +348,12 @@ def main():
                               "states its own errors lead to, so prefer an "
                               "intermediate value. Cube decisions are "
                               "unaffected.")
+    g_batch.add_argument("--vectorized-batch", type=int, default=32,
+                         metavar="B",
+                         help="Concurrent matches per vectorized worker "
+                              "(default 32, must be >= 1). Larger B means "
+                              "bigger fused GPU batches and more RSS per "
+                              "worker (~730 MB/driver at B=32).")
     g_batch.add_argument("--vectorized-device", default="cuda",
                          help="Device for the vectorized driver net "
                               "(default cuda). 'cpu' is for testing only. "
@@ -364,8 +370,10 @@ def main():
                               "feature matrices to it over per-worker shared "
                               "memory. VRAM grows with the width of the fused "
                               "batch rather than with the number of CUDA "
-                              "contexts, at the cost of one queue "
-                              "round-trip per forward. Routes the "
+                              "contexts (measured 412 MB at 8 slots, 1262 MB "
+                              "at a saturated 48, vs ~475 MB PER worker for "
+                              "--vectorized-collect), at the cost of one "
+                              "queue round-trip per forward. Routes the "
                               "1-ply target forward (96%% of collected rows). "
                               "NOT bitwise reproducible unless you add "
                               "--gpu-eval-deterministic. Requires --workers > "
@@ -398,6 +406,86 @@ def main():
                               "capture a twentieth of the FLOPs -- separate "
                               "flag so the A/B can isolate it. Batch-1 "
                               "evaluate_matchplay is never routed.")
+    g_batch.add_argument("--max-episode-plies", type=int, default=None,
+                         metavar="N",
+                         help="Safety bound on self-play episode length, in "
+                              "plies (turns). Money modes (default "
+                              f"{DEFAULT_MAX_EPISODE_PLIES}): an episode "
+                              "exceeding it is DISCARDED (its samples are "
+                              "dropped, not truncated) and counted in the "
+                              "round log line; healthy episodes stay far "
+                              "below it. Match play (default 0 = off): a "
+                              "per-GAME bound of --vectorized-collect and "
+                              "--c-collect only; a match exceeding it is "
+                              "discarded whole (a runaway game in lockstep "
+                              "pins a driver slot and stalls the round). The "
+                              "serial match collector does not apply it, and "
+                              "a --vectorized-collect fallback says so. 0 "
+                              "disables.")
+    # default=SUPPRESS: the help must not print "(default: False)" for
+    # the default money collector; resolve_collector sets the attr.
+    g_batch.add_argument("--c-collect", action="store_true",
+                         default=argparse.SUPPRESS,
+                         help="Money modes: the default collector (this flag "
+                              "is accepted for old command lines; it only "
+                              "makes a library that cannot be built an "
+                              "error): the self-play episodes are collected "
+                              "in C (bgc_collect, c_api/; a missing "
+                              "libpuretd_<backend>.so is built on demand "
+                              "with `bash c_api/build.sh <backend>`), the "
+                              "samples the Python collector produces for the "
+                              "same seed, 0-ply play, 0-/1-ply targets, dmp / "
+                              "cubeless-money / cubeful-money with the "
+                              "perspective196 / cubeful_perspective196 "
+                              "encoders. Ruled out, with a NOTE per reason "
+                              "and the Python collector, by --boltzmann-temp "
+                              "!= 0, --oneply-acting, --bf16-collect, another "
+                              "encoder, dmp with an equity net, or a library "
+                              "that cannot be built. "
+                              "MATCHPLAY (an explicit opt-in; without it the "
+                              "Python collector collects): collect every "
+                              "round in C "
+                              "(bgc_collect_match, c_api/): "
+                              "0-ply play, 0-/1-ply targets, the samples the "
+                              "Python collector produces for the same seed, "
+                              "on --c-collect-backend; the workers hold no "
+                              "CUDA context, so --workers is bounded by "
+                              "cores (W=60 on a 64-core box). Needs --met "
+                              "with all scopes, the matchplay1h64met / "
+                              "matchplay1h64met6 encoders, --boltzmann-temp "
+                              "0. Any unmet precondition (--vectorized-"
+                              "collect, --gpu-eval-server, oracle / "
+                              "--td-move-eps / "
+                              "--move-explore-eps / --td-oneply-act, a MET "
+                              "mismatch, ...) is "
+                              "an ERROR naming every reason; there is no "
+                              "silent fallback. Works with --pipeline-"
+                              "collect (one-round-stale targets), "
+                              "--save-every, --resume and --workers 1.")
+    g_batch.add_argument("--no-c-collect", "--python-api", action="store_true",
+                         dest="no_c_collect",
+                         help="Money modes: collect with the Python collector "
+                              "(the routing from before the C collector became "
+                              "the default). --python-api is the same flag "
+                              "(play_models.py's name). Match play collects "
+                              "in Python unless --c-collect.")
+    g_batch.add_argument("--c-collect-backend", choices=C_COLLECT_BACKENDS,
+                         default=None,
+                         help="The libpuretd_<backend>.so the C collection "
+                              "workers load (built on demand with "
+                              "c_api/build.sh). Default simd. Match play: "
+                              "with --c-collect only.")
+    g_batch.add_argument("--c-collect-rng", choices=sorted(C_COLLECT_RNG_MODES),
+                         default=None,
+                         help="MATCHPLAY, with --c-collect: the RNG streams of a "
+                              "worker's episodes. 'vectorized' (default, the "
+                              "production leg): one stream per episode "
+                              "derived from the worker seed, as "
+                              "--vectorized-collect plays them, so a C round "
+                              "plays the vectorized recipe's matches for the "
+                              "same --seed and --workers. 'serial': all of a "
+                              "worker's episodes on one stream, as the "
+                              "standard collector (the parity oracle).")
     g_batch.add_argument("--save-every", type=int, default=0, metavar="N",
                          help="Checkpoint at the first round boundary on "
                               "or after every N episodes (effective "
@@ -410,6 +498,11 @@ def main():
                         help="Print recent batch loss every N rounds (0 to disable).")
     args = parser.parse_args()
 
+    # --oneply-acting implies --oneply. Normalize BEFORE the collector
+    # routing so both spellings route identically.
+    if args.oneply_acting:
+        args.oneply = True
+
     # A batch < 1 fills no lockstep slot, so the worker would collect
     # ZERO episodes and the run would report success having trained on
     # nothing. Reject at the CLI rather than let that be discovered from
@@ -419,16 +512,23 @@ def main():
             f"--vectorized-batch must be >= 1 (got {args.vectorized_batch}); "
             "a batch < 1 collects zero episodes per worker"
         )
-
-    # --oneply-acting implies --oneply for targets. Normalize BEFORE the
-    # collector routing so the resolver sees the real ply config (it must
-    # not depend on flag-spelling: --oneply-acting alone and
-    # --oneply --oneply-acting have to route identically).
-    if args.oneply_acting:
-        args.oneply = True
-
-    for note in resolve_cuda_oneply_collector(args):
-        print(note, flush=True)
+    explicit_c = bool(getattr(args, "c_collect", False))
+    if explicit_c and args.vectorized_collect:
+        parser.error("--c-collect and --vectorized-collect are mutually "
+                     "exclusive (two collectors for the same rounds): pick one")
+    if args.game_mode == "matchplay":
+        if not explicit_c:
+            for flag in ("c_collect_backend", "c_collect_rng"):
+                if getattr(args, flag) is not None:
+                    parser.error(f"--{flag.replace('_', '-')} requires --c-collect")
+    else:
+        if args.c_collect_rng is not None:
+            parser.error("--c-collect-rng is match play only (the money C "
+                         "collector plays each worker's episodes on one "
+                         "stream)")
+        if args.vectorized_collect:
+            parser.error("--vectorized-collect is match play only (the "
+                         "money GPU collector is not on this branch)")
 
     apply_cubeful_money_upgrades(args)
 
@@ -488,22 +588,6 @@ def main():
     agent = TDAgent(net, device=args.device, oneply=args.oneply_acting,
                     boltzmann_temp=args.boltzmann_temp, met=met_table,
                     met_scopes=met_scopes)
-    # If the loaded/built network is a cubeful_take_* model, the
-    # take-decision-state collector must be used (the new encoder bit
-    # is only valid in the new state graph). Conversely, --take-decision-state
-    # on a non-take encoder is a user error.
-    take_decision_state = bool(getattr(args, "take_decision_state", False))
-    if agent.is_cubeful_take and not take_decision_state:
-        print(
-            "  NOTE: detected cubeful_take_* encoder; enabling "
-            "--take-decision-state mode automatically."
-        )
-        take_decision_state = True
-    elif take_decision_state and not agent.is_cubeful_take:
-        raise ValueError(
-            "--take-decision-state requires a cubeful_take_* encoder; "
-            f"got encoder={net.encoder_name!r}"
-        )
     if args.oracle_targets:
         if args.game_mode != "matchplay":
             raise ValueError("--oracle-targets is matchplay-only")
@@ -512,6 +596,10 @@ def main():
                 "--oracle-targets is 0-ply supervision; drop --oneply "
                 "(or pass --oracle-act-only to use the teacher for moves "
                 "only, with TD targets)")
+        if args.outcome_mix > 0.0:
+            raise ValueError(
+                "--oracle-targets replaces every target; "
+                "--outcome-mix would dilute the oracle")
         if args.met and not args.oracle_act_only:
             raise ValueError(
                 "--oracle-targets carries its own exact MET; drop --met "
@@ -543,26 +631,40 @@ def main():
         raise ValueError("--oracle-eval-server requires --oracle-targets")
     mode = build_mode(
         args.game_mode, jacoby=args.jacoby,
-        take_decision_state=take_decision_state,
         match_length=args.match_length,
-        score_curriculum=args.score_curriculum,
+        outcome_mix=args.outcome_mix,
         oracle_spec=args.oracle_targets,
         oracle_move_eps=args.oracle_move_eps,
         oracle_plies=args.oracle_plies,
         oracle_act_prob=args.oracle_act_prob,
+        move_explore_eps=args.move_explore_eps,
         td_move_eps=args.td_move_eps,
         oracle_1ply_eps=args.oracle_1ply_eps,
+        oneply_act_k=args.td_oneply_act,
+        td_eps_only=args.td_eps_only,
         oracle_act_only=args.oracle_act_only,
     )
 
-    # Equity output is unbounded; high lr can cause gradient explosion -> NaN.
-    # SGD is more sensitive than Adam (which normalizes by gradient moments).
-    if args.cube_targets_1ply and args.game_mode == "matchplay" \
-            and not args.oneply:
+    # The collector, once the network is built: whether the default C
+    # collector applies depends on its encoder and output (a run it rules
+    # out gets the Python collector).
+    for note in resolve_collector(
+            args, c_collect_default_fallbacks(args, net, mode)):
+        print(note, flush=True)
+
+    if args.td_eps_only and not args.td_move_eps:
         raise ValueError(
-            "--cube-targets-1ply prices cube targets with the 1-ply value; "
-            "it needs --oneply, otherwise the checker rows it must stay "
-            "consistent with are 0-ply themselves.")
+            "--td-eps-only keeps only the eps rows; it needs --td-move-eps "
+            "to produce any")
+    if args.td_oneply_act and args.game_mode != "matchplay":
+        raise ValueError("--td-oneply-act is matchplay-only")
+    if args.td_oneply_act and not args.oneply:
+        raise ValueError(
+            "--td-oneply-act needs --oneply (it re-prices successors with "
+            "the 1-ply value the target path already computes)")
+    if args.td_oneply_act < 0:
+        raise ValueError(
+            f"--td-oneply-act must be >= 0, got {args.td_oneply_act}")
     if args.oracle_1ply_eps and not args.oracle_plies:
         raise ValueError(
             "--oracle-1ply-eps filters which rows get DEEP oracle pricing; "
@@ -585,6 +687,14 @@ def main():
     if not (0.0 <= args.td_move_eps <= 1.0):
         raise ValueError(
             f"--td-move-eps must be in [0,1], got {args.td_move_eps}")
+    if args.move_explore_eps and args.game_mode != "matchplay":
+        raise ValueError("--move-explore-eps is matchplay-only")
+    if not (0.0 <= args.move_explore_eps <= 1.0):
+        raise ValueError(
+            f"--move-explore-eps must be in [0,1], got {args.move_explore_eps}")
+    # Equity output is unbounded. A high lr can blow up to NaN. SGD is
+    # more sensitive than Adam.
+    if net.output_mode == "equity":
         lr_limit = 0.05 if args.optimizer == "sgd" else 0.01
         if args.lr > lr_limit:
             print(
@@ -592,6 +702,26 @@ def main():
                 f"with {args.optimizer} (unbounded targets may cause NaN). "
                 f"Recommended: --lr {lr_limit} or lower for equity + {args.optimizer}."
             )
+
+    if args.resume_episodes:
+        n_done, n_total = args.resume_episodes, args.num_episodes
+        if not args.resume:
+            raise ValueError("--resume-episodes requires --resume")
+        if not (0 < n_done < n_total):
+            raise ValueError(
+                f"--resume-episodes must be in (0, --num-episodes={n_total}),"
+                f" got {n_done}")
+        lr0 = args.lr
+        if args.end_lr is not None:
+            args.lr = lr0 + (args.end_lr - lr0) * n_done / n_total
+        args.num_episodes = n_total - n_done
+        print(
+            f"Resume-episodes: {n_done}/{n_total} already done -> "
+            f"lr {lr0:g} -> {args.lr:.6g} at ep {n_done}"
+            + (f", annealing to {args.end_lr:g}" if args.end_lr is not None
+               else " (constant)")
+            + f"; {args.num_episodes} episodes remain"
+        )
 
     optimizer_cls = torch.optim.Adam if args.optimizer == "adam" else torch.optim.SGD
     optimizer_kwargs = {}
@@ -614,14 +744,54 @@ def main():
         f"(batch={args.batch_size}, ep/round={args.episodes_per_round}, "
         f"epochs/round={args.epochs_per_round})..."
     )
-    # Resolve save path up-front so periodic checkpoints and the final
-    # save share the same normalized target.
+    # Resolved once so checkpoints and the final save agree.
     resolved_save = (
         resolve_save_path(args.save, args.game_mode, net.hidden_sizes)
         if args.save else None
     )
     if args.save_every > 0 and not resolved_save:
         raise ValueError("--save-every requires --save")
+
+    if args.c_collect and args.game_mode == "matchplay":
+        # Every unmet precondition at once, before anything starts
+        # (Trainer.train raises the same error for API callers).
+        _c_reasons = c_collect_fallbacks(
+            net, mode, oneply=args.oneply, oneply_acting=args.oneply_acting,
+            boltzmann_temp=args.boltzmann_temp, met_path=met_path,
+            met_scopes=met_scopes,
+            vectorized_collect=args.vectorized_collect,
+            gpu_eval_server=args.gpu_eval_server,
+            oracle_eval_server=args.oracle_eval_server)
+        if _c_reasons:
+            parser.error(c_collect_error(_c_reasons))
+
+    # Stamped into every checkpoint. Trainer.train sets c_collect to
+    # whether the C collector collected (a failed precondition or a
+    # missing library falls back to Python). Match play adds its own
+    # fields (provenance only: no loader reads them back).
+    train_params = {
+        "game_mode": args.game_mode,
+        "encoder": net.encoder_name,
+        "num_episodes": args.num_episodes,
+        "lr": args.lr,
+        "end_lr": args.end_lr,
+        "seed": args.seed,
+        "oneply": args.oneply,
+        "jacoby": args.jacoby,
+        "c_collect": bool(args.c_collect),
+    }
+    if args.game_mode == "matchplay":
+        del train_params["jacoby"]                  # a money-game rule
+        train_params.update({
+            "match_length": args.match_length,
+            "met": args.met,
+            "met_scope": args.met_scope,
+            "boltzmann_temp": args.boltzmann_temp,
+            "episodes_per_round": args.episodes_per_round,
+            "c_collect_backend": args.c_collect_backend,
+            "c_collect_rng": args.c_collect_rng,
+            "resume": args.resume,
+        })
 
     t0 = time.perf_counter()
     losses = trainer.train(
@@ -639,10 +809,8 @@ def main():
         warmup_cycles=args.warmup_cycles,
         boltzmann_temp=args.boltzmann_temp,
         bf16_collect=args.bf16_collect,
-        c_engine=args.c_engine,
         save_path=resolved_save,
         save_every=args.save_every,
-        cube_targets_1ply=args.cube_targets_1ply,
         pipeline_collect=args.pipeline_collect,
         met_path=met_path,
         met_scopes=met_scopes,
@@ -655,6 +823,12 @@ def main():
         gpu_eval_device=args.gpu_eval_device,
         gpu_eval_route_moves=args.gpu_eval_route_moves,
         gpu_eval_deterministic=args.gpu_eval_deterministic,
+        episode_offset=args.resume_episodes,
+        train_params=train_params,
+        c_collect=args.c_collect,
+        c_collect_backend=args.c_collect_backend or "simd",
+        c_collect_auto=args.c_collect_auto,
+        c_collect_rng=args.c_collect_rng or "vectorized",
     )
     elapsed = time.perf_counter() - t0
     eps_per_s = args.num_episodes / elapsed if elapsed > 0 else 0.0
@@ -664,7 +838,7 @@ def main():
     )
 
     if resolved_save:
-        net.save(resolved_save)
+        net.save(resolved_save, train_params=train_params)
         print(f"Saved network to {resolved_save}")
 
     if args.eval_vs_random > 0:

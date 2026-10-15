@@ -1,121 +1,242 @@
-"""Central GPU inference server for 1-ply self-play collection.
+"""Central GPU inference server for MATCHPLAY 1-ply self-play collection.
 
-Opt-in via `--gpu-eval-server`; nothing here runs unless that flag is
-set. Ported from the money-game reference and adapted to matchplay's
-much larger request matrices.
+Ported from the money-game engine's `gpu_eval_server.py` and adapted
+to matchplay's much larger request matrices. Opt-in via
+`--gpu-eval-server`; nothing here runs unless that flag is set.
 
-WHY, AND HOW IT DIFFERS FROM `vectorized_matchplay`
-===================================================
-Matchplay 1-ply collection is ~80% NN-forward by wall time, almost all
-of it from `TDAgent.value_oneply_checker_matchplay` (21 dice outcomes in
-one feature matrix; mean ~450 rows, p99 ~1500). Two GPU designs exist:
+WHAT PROBLEM THIS SOLVES, AND HOW IT DIFFERS FROM `vectorized_matchplay`
+=======================================================================
+Matchplay 1-ply collection is ~80% NN-forward by wall time, and 96% of
+the rows pushed through the net come from ONE call site,
+`TDAgent.value_oneply_checker_matchplay` (21 dice outcomes concatenated
+into a single feature matrix; measured mean 431 rows, p99 ~1500, max
+~3600). CPU workers run that forward single-threaded.
 
-  * `vectorized_matchplay.py` (`--vectorized-collect`): a lockstep
-    driver INSIDE each worker. No IPC, but one CUDA context (~475 MB)
-    per worker, so VRAM caps workers near ~20 on a 12 GB card.
-  * THIS module (`--gpu-eval-server`): exactly ONE process holds the
-    only CUDA context; N pure-CPU workers ship feature matrices over
-    per-worker shared memory. Cost: a queue round-trip per forward.
+There are two ways to put it on the GPU, and this repo now has both:
 
-At W=8 vectorized wins (~2.3x); what the server buys is an order of
-magnitude less VRAM and no VRAM cap on worker count. See
-`benchmarks/matchplay_gpu_eval_server_ab.md` (and its noise-floor
-section) before quoting numbers.
+  * `vectorized_matchplay.py` (`--vectorized-collect`) runs a lockstep
+    generator driver INSIDE each worker. No IPC at all, but every
+    worker process holds its own CUDA context (~475 MB), so on a 12 GB
+    card the worker count is capped at ~20 by VRAM rather than by cores.
 
-VRAM GROWS (SLOWLY) WITH THE SLOT COUNT
-=======================================
-The CUDA context does not grow with worker count, but the ACTIVATIONS of
-a coalesced batch do (up to `num_slots` fused requests). Saturating
-sweep of the real server:
+  * THIS module (`--gpu-eval-server`) inverts the trade: exactly ONE
+    process holds the only CUDA context, and N pure-CPU workers ship
+    feature matrices to it over per-worker shared memory. VRAM grows
+    only with the size of the fused batch, NOT with the number of CUDA
+    contexts, so it is roughly an order of magnitude cheaper than
+    vectorized at the same worker count; the cost is one queue
+    round-trip per forward.
+
+Which wins is an empirical question about `per-worker rate x workers`.
+MEASURED at W=8 on this host (3pt, 512/512/256/256, contended box, two
+reps; mind the noise floor before quoting any of these to two digits:
+four runs of an identical CPU-serial workload inside 15 minutes spanned
+1.71x, 3.70 - 6.33 ep/s, so these min-max ranges are not intervals):
+
+    cpu serial        3.1 -  3.4 ep/s       0 MB VRAM
+    vectorized       21.7 - 24.5 ep/s    3856 MB VRAM  (~482 MB/worker)
+    this server       7.2 -  8.8 ep/s     412 MB VRAM  (8 slots)
+      +route-moves    9.2 - 10.9 ep/s     400 MB VRAM  (8 slots)
+
+So at W=8 VECTORIZED WINS, by 2.3x, and that is the expected shape: the
+server pays a queue round-trip per forward that vectorized does not,
+while vectorized's only cost -- VRAM -- is not yet binding at 8 workers.
+What the server buys is ~10x less VRAM at W=8 and VRAM that grows far
+more slowly than vectorized's: vectorized is capped near W=20 on a 12 GB
+card, the server is not. Whether that converts into more total
+throughput at W=48 was NOT measured (the box was busy) and should not be
+assumed.
+
+VRAM IS NOT CONSTANT IN THE WORKER COUNT -- IT GROWS, SLOWLY
+============================================================
+An earlier revision of this docstring claimed ~350 MB independent of the
+worker count. That is wrong and was measured wrong. The CUDA context
+does not grow with worker count, but the ACTIVATIONS of a coalesced
+batch do: the fused batch can be as wide as `num_slots` requests, so
+peak VRAM is O(num_slots x rows/request).
+Driving the real server with a saturating client (worst case: every slot
+always has a request pending) gives
 
     slots      1     2     4     8    16    32    48
     MB       328   350   350   412   640   976  1262
 
-Real collection coalesces far less (mean 1.67 requests/GPU call at W=8),
-so real runs land below the sweep — but not "constant". `max_batch_rows`
-(env `GPU_EVAL_MAX_BATCH_ROWS`) caps the fused batch: without it,
-48 slots x 8192 rows is a 393216-row forward, which really does
-CUDA-OOM the server. The cap costs nothing in practice and turns a
-pathological tail into one extra GPU call.
+Real collection coalesces far less than a saturating driver (measured
+mean 1.67 requests per GPU call at W=8, 1.06 at W=2), so a real W=48 run
+should land well below 1262 MB -- but "flat" it is not, and anything
+above ~8 slots exceeds the 400 MB that revision predicted. Note the
+saturated and real-collection numbers agree exactly at 8 slots (412 vs
+398 MB), so the sweep does not inflate the low end.
+
+`max_batch_rows` (env `GPU_EVAL_MAX_BATCH_ROWS`) caps the fused batch so
+this stays bounded: without it, `num_slots` slots each sending
+`max_rows` rows is a 48 x 8192 = 393216-row forward, which really does
+CUDA-OOM the server (observed at exactly those settings). The cap costs
+nothing in practice -- real 1-ply requests average ~459 rows -- and turns
+a pathological tail into one extra GPU call.
 
 DETERMINISM: COALESCING COSTS BITWISE REPRODUCIBILITY
 =====================================================
-Which requests share a GEMM is decided by wall-clock arrival order, and
-fp32 reductions are batch-composition sensitive, so a SAME-seeded run
-can produce last-ulp-different values. Those ~1e-8 differences feed a
-`min()` over candidate moves; a flipped tie changes the move, hence the
-trajectory, hence the collected data. Every value is still a correct
-forward of the correct weights — this is a reproducibility property, not
-a correctness one. `coalesce=False` (`--gpu-eval-deterministic`) runs
-one request per GPU call: bit-exact against the serial collector at any
-slot count and reproducible run to run, at the price of cross-slot
-fusion (nearly free at low W, real at high W). `--vectorized-collect`
-is not bit-exact against serial either, but its batch composition is
-fixed, so IT reproduces run to run.
+The server fuses concurrently-pending requests into one GEMM. Which
+requests share a GEMM is decided by wall-clock arrival order at the
+request queue, and fp32 reductions are batch-composition sensitive, so
+the SAME seeded run can produce last-ulp-different values on different
+executions. Those differences are ~1e-8 in a value, but the values feed
+a `min()` over candidate moves; a flipped tie changes the move, hence
+the trajectory, hence the collected data. Measured end to end: with
+coalescing on, four identically-seeded 32-episode runs at W=4 produced
+three identical and one different final-weight fingerprint.
+
+This is a REPRODUCIBILITY property, not a correctness one -- every value
+is a correct forward of the correct weights over the correct rows -- but
+this repo treats seeded reruns as regenerable, so it must be stated
+rather than discovered.
+
+`coalesce=False` (`--gpu-eval-deterministic`) runs exactly one request
+per GPU call. Then the tensor handed to the net is byte-identical to the
+one the serial collector would have built, and routed collection is
+bit-exact against the unrouted collector at ANY slot count, and
+reproducible run to run. It gives up cross-slot fusion, which at W=8 is
+worth little (1.67 requests/call) and at W=48 rather more. Measured at
+W=4 on a contended box it cost NOTHING (5.05/4.91 ep/s deterministic vs
+3.53/3.97 coalescing, arms interleaved) -- at low worker counts the
+drain and concatenate are pure overhead. Assume that reverses at high W;
+it has not been measured there.
+
+The sibling `--vectorized-collect` is not bit-exact against the serial
+collector either (its own tests compare at atol=1e-6), but its batch
+composition is fixed by B and the game list, so IT reproduces run to
+run. That is the difference that matters here.
 
 TRANSPORT
 =========
-Per-slot POSIX shared-memory buffers carry payloads; one request `Queue`
-plus per-slot `Event`s signal. Each worker has one forward in flight, so
-the server coalesces up to `num_slots` requests (<= `max_batch_rows`
-rows) per GPU call. Wire messages: `(slot:int, n:int, seq:int)` eval
-request, `(_MSG_WEIGHTS, state_dict)`, `(_MSG_STOP,)`.
+Per-slot POSIX shared-memory buffers carry the payloads (no large
+pickling); one request `Queue` plus per-slot `Event`s handle signalling.
+Each worker has exactly one forward in flight at a time (collection is
+synchronous), so the server coalesces up to `num_slots` requests (and at
+most `max_batch_rows` rows) into a single GPU call.
 
-`seq` is a per-slot request counter echoed by the server before it sets
-the slot's Event. Without it an Event cannot distinguish "your answer"
-from a previous, abandoned answer: after an `EvalServerTimeout` the late
-reply would hand the NEXT `forward()` the previous request's values —
-silently, right dtype, wrong rows. The client checks the echo and raises
-`EvalServerDesync`; `RemoteEvaluator` POISONS itself after any fault so
-a desynced slot never returns another value.
+The wire carries exactly three message shapes:
+    (slot:int, n:int, seq:int)  - evaluate rows [0:n] of slot's in-buffer
+    (_MSG_WEIGHTS, state_dict)  - replace weights, ack
+    (_MSG_STOP,)                - ack and exit
+discriminated on `item[0]`; an eval request has an int there, so there
+is no collision with the two sentinel strings.
 
-PRECISION: fp32. bf16 would break the parity story for no real gain —
-the forward is bandwidth-bound and the values feed argmin/min where a
-flipped comparison changes the trajectory.
+`seq` is a per-slot request counter, echoed by the server into a shared
+`int64` array before it sets the slot's Event. WITHOUT it, an Event
+cannot distinguish "your answer" from "the previous, abandoned answer":
+after an `EvalServerTimeout` the late reply sets the Event, and the next
+`forward()` on that slot would return the PREVIOUS request's values --
+silently, with the wrong shape of correctness (right dtype, plausible
+range, wrong rows). The client checks the echo and raises
+`EvalServerDesync` instead. `RemoteEvaluator` additionally POISONS
+itself after any server fault, so a slot that has lost protocol sync
+never returns another value.
 
-LIFECYCLE (enforced in `trainer.train`, not merely documented)
-==============================================================
-  * Spawn start method only.
-  * `update_weights()` between rounds shares the request queue with eval
-    requests, so it is safe only when no worker is mid-request: the
-    server is incompatible with `--pipeline-collect`, and trainer.train
-    RAISES on the combination (a silently mixed-weight round looks like
-    a normal loss curve).
-  * The pool must not recycle workers: each claims one slot ONCE in the
-    initializer; a recycled worker would drain `free_slots` and block
-    forever. trainer.train raises if TRAINER_MAXTASKSPERCHILD is set.
+PRECISION
+=========
+The server runs fp32. bf16 would break the parity story for no real
+gain: at these batch sizes the forward is bandwidth-bound, and the
+values feed an `argmin`/`min` over candidate moves where a flipped
+comparison changes the chosen move, hence the trajectory.
+
+LIFECYCLE / CONSTRAINTS (all enforced in `trainer.train`, not merely
+documented)
+===================================================================
+  * Spawn start method only (matches the trainer's worker pool).
+  * Weights are pushed between rounds via `update_weights()`, which
+    blocks until the server has applied them. That is safe ONLY when no
+    worker is mid-request, because the weights message shares the
+    request queue with eval requests: mid-round, a worker's `(slot, n)`
+    could queue behind it and be evaluated against the new weights.
+    Hence the server is incompatible with `--pipeline-collect`, and
+    `trainer.train` RAISES on the combination rather than silently
+    downgrading (the reference only printed a note). A silently
+    mixed-weight round produces a normal-looking loss curve and is
+    invisible without a bit-exactness harness.
+  * The worker pool must NOT recycle processes while the server is
+    active: each worker claims one slot ONCE in the pool initializer and
+    never returns it, so a recycled worker would drain `free_slots` and
+    the next one would block forever. `trainer.train` raises if
+    `TRAINER_MAXTASKSPERCHILD` is set alongside the server.
 
 FAILURE MODES: BOUNDED, NOT HUNG
 ================================
-Every cross-process wait is bounded: `RemoteEvaluator.forward` and
-`update_weights` poll in `_POLL_SECONDS` slices with a liveness check
-between slices (`EvalServerGone` / `EvalServerTimeout`), and
-`map_watched` runs the round's map as a polled `map_async` so a dead
-server or dead pool worker surfaces as an exception (a SIGKILLed pool
-worker is otherwise respawned silently forever; the initializer sets a
-shared `fail_event` that map_watched polls, and the `finally` unlinks
-/dev/shm). The liveness probe treats a ZOMBIE as dead — `os.kill(pid,0)`
-succeeds for an unreaped child, which would turn a 2-second
-`EvalServerGone` into a full-budget `EvalServerTimeout`.
+The reference waits on `event.wait()` with no timeout, so a dead server
+hangs every worker and the master's `pool.map` forever - no traceback,
+no checkpoint, no log line. Here EVERY cross-process wait is bounded:
 
-KNOWN LIMITATION: a SIGKILLed CLIENT can wedge the transport.
-`multiprocessing.Queue`'s feeder lock (and the per-slot Event's) dies
-with its holder; siblings may then block. The bounded waits surface
-this as a loud, restartable exception instead of a stall, but the run
-does not survive it; a real fix is a per-slot lock-free transport.
+  * `RemoteEvaluator.forward` waits in `_POLL_SECONDS` slices, checks
+    server liveness between slices, and raises `EvalServerGone` /
+    `EvalServerTimeout`.
+  * `EvalServer.update_weights` (master side, top of every round) does
+    the same on its ack. An earlier revision used a bare
+    `_ack_q.get()`, which hung the MASTER forever if the server had
+    already died -- e.g. a CUDA OOM inside `net.to(device)` at startup
+    -- which is precisely the failure this section claims to have
+    eliminated.
+  * `EvalServer.map_watched` runs the round's `pool.map` as a polled
+    `map_async`, so a dead server or a dead POOL WORKER surfaces as an
+    exception instead of an indefinite stall. `multiprocessing.Pool`
+    cannot recover from a SIGKILLed worker: it silently respawns
+    replacements forever, and here each replacement dies in the pool
+    initializer with no free slot to claim, where nothing propagates it
+    to the master. The initializer sets a shared `fail_event` that
+    `map_watched` polls, which converts that into a loud failure AND
+    lets the `finally` run so /dev/shm is unlinked.
+
+The liveness probe treats a ZOMBIE as dead. `os.kill(pid, 0)` succeeds
+for an unreaped child, and the master (blocked in `pool.map`) does not
+reap the server, so the naive probe reported a dead server as alive for
+the WHOLE wait budget -- turning a 2-second `EvalServerGone` into a
+300-second `EvalServerTimeout`.
+
+KNOWN LIMITATION: A SIGKILLED CLIENT CAN WEDGE THE TRANSPORT
+============================================================
+This is inherited from the reference's transport and is NOT fixed here.
+`multiprocessing.Queue` guards its pipe with a cross-process lock held
+by a feeder thread; a process killed while holding it never releases
+it, and every other producer then blocks forever. The per-slot `Event`
+has the same shape of hazard on the server's `set()`. Measured: kill a
+client mid-request and a sibling's next request sometimes completes
+normally and sometimes never reaches the server
+(`tests/.../test_sigkilled_client_fails_bounded_never_hangs`).
+
+What the bounded wait buys is that this surfaces as an exception out of
+`pool.map` - a loud, restartable failure - instead of the reference's
+indefinite stall. It does NOT make the run survive a killed worker.
+Killing one is not a recovery strategy; a real fix means replacing the
+shared Queue with per-slot lock-free signalling (atomic sub-PIPE_BUF
+writes on per-slot pipes, server selecting across them), which is a
+transport redesign rather than a port.
 
 BUFFER SIZING
 =============
-`max_rows` caps a request; larger requests return None from `forward()`
-and the caller does a local CPU forward — a throughput cliff, never a
-wrong answer, counted and warned LOUDLY on first occurrence. The engine
-ceiling is 21 x MAX_PLAYS = 21504 rows, but measured requests peak
-~3620, so the 8192 default has ~2.3x headroom (6.5 MB/slot at 207
-features; ~310 MB of /dev/shm at 48 slots). Override with
-`GPU_EVAL_MAX_ROWS`; `ENGINE_MAX_ROWS` removes the cliff for
-17.7 MB/slot. `max_rows` is ALSO a VRAM exposure — `num_slots x
-max_rows` rows can be pending at once — which is why
-`MAX_BATCH_ROWS_DEFAULT` bounds the fused batch.
+`max_rows` is the per-slot row cap. A request larger than that returns
+None from `forward()`, and the caller does a local CPU forward - a
+throughput cliff, never a wrong answer. Because it is silent by
+construction, `RemoteEvaluator` counts overflows and warns LOUDLY on the
+first one.
+
+The hard engine ceiling for a 1-ply request is 21 dice x MAX_PLAYS
+(1024, `c_engine/bg_engine.h`) = 21504 rows, but that is astronomically
+above what real positions produce: over 83k sampled rolls the per-roll
+max was 685 with zero rolls at the cap. Measured request sizes peak
+around 3620 rows, so the 8192 default carries ~2.3x headroom at
+`8192 x n_feat x 4` bytes per input slot: 6.5 MB for the 207-feature
+matchplay encoder in production here, 7.2 MB for the 220-feature MET
+encoder. Across 48 slots (input + the much smaller output buffer) that
+is ~310 MB of /dev/shm at 207 features. Override with
+`GPU_EVAL_MAX_ROWS`; `ENGINE_MAX_ROWS` removes the cliff entirely for
+17.7 MB/slot if you would rather pay RAM than ever fall back.
+
+`max_rows` is ALSO a VRAM exposure, which is easy to miss because it is
+sized as a host-RAM question: `num_slots` slots can be pending at once,
+so the fused batch is bounded by `num_slots x max_rows` rows unless
+`max_batch_rows` caps it. At 48 slots x 8192 rows that is a 393216-row
+forward, which CUDA-OOMs a 12 GB card outright. `MAX_BATCH_ROWS_DEFAULT`
+keeps the fused batch to something a card can hold; requests beyond the
+cap simply go in the next GPU call.
 """
 
 from __future__ import annotations
@@ -154,7 +275,7 @@ MAX_BATCH_ROWS_DEFAULT = 32768
 # How long a worker waits on its slot Event before deciding the server
 # is gone. Generous: a real coalesced forward is milliseconds even at
 # W=48, so anything near this is a genuine fault, not queueing.
-_WAIT_TIMEOUT_DEFAULT = float(os.environ.get("GPU_EVAL_WAIT_TIMEOUT", "300"))
+_WAIT_TIMEOUT_DEFAULT = 300.0
 _POLL_SECONDS = 2.0
 
 # Master-side bound on the between-rounds weight push. The server only
@@ -288,10 +409,7 @@ def build_spec_from(net) -> dict:
 
 
 def _build_net(build_spec: dict):
-    # Two spec spellings are live: this branch's `net_class: "prob"` and
-    # the money-line train_prob5 / validity-suite `net_type: "prob5"`.
-    if (build_spec.get("net_class") == "prob"
-            or build_spec.get("net_type") == "prob5"):
+    if build_spec.get("net_class") == "prob":
         from model import ProbNetwork
         return ProbNetwork(
             hidden_sizes=build_spec["hidden_sizes"],

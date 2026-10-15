@@ -22,7 +22,8 @@ each emitted sample:
                    the on-roll player's view.
 
 Usage:
-    python audit_collector.py --model models/foo.pt --episodes 30
+    python audit_collector.py --model models/foo.pt --episodes 30 \
+        [--from-errors /tmp/cube_errors.json --index 0]
 """
 
 import argparse
@@ -31,7 +32,8 @@ import random
 import numpy as np
 import torch
 
-from modes import MatchplayMode, cube_perspective
+from backgammon_engine import BoardState
+from modes import MatchplayMode, MatchState, cube_perspective
 from model import TDNetwork
 from td_agent import TDAgent
 
@@ -72,8 +74,9 @@ class SpyAgent(TDAgent):
 
     def choose_checker_action_matchplay(self, state, dice, match_state,
                                         rng=None):
-        # `rng` must be accepted here: the trainer passes it
-        # unconditionally (Boltzmann selection).
+        # `rng` threads the episode's Random into Boltzmann selection
+        # (trainer.py:775 passes it unconditionally); without it here the
+        # spy raised TypeError on every call and the audit could not run.
         r = super().choose_checker_action_matchplay(state, dice, match_state,
                                                     rng=rng)
         self.log.append(("choose", state, dice, match_state,
@@ -265,6 +268,10 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
     p.add_argument("--episodes", type=int, default=30)
+    p.add_argument("--from-errors", default=None,
+                   help="audit train_from_position's collector seeded "
+                        "at this errors-file position instead")
+    p.add_argument("--index", type=int, default=0)
     p.add_argument("--seed", type=int, default=17)
     p.add_argument("--oracle", default=None, metavar="SPEC",
                    help="audit the supervised-oracle target path "
@@ -293,12 +300,20 @@ def main():
         spy.log = []
         spy.clear_matchplay_memo()
         fresh.clear_matchplay_memo()
-        from trainer import collect_episode
-        mode = MatchplayMode(3, oracle_spec=args.oracle,
-                             oracle_move_eps=args.oracle_move_eps,
-                             td_move_eps=args.td_move_eps)
-        enc, tgts = collect_episode(spy, mode, rng,
-                                    oneply=args.oneply)
+        if args.from_errors:
+            import json
+            from train_from_position import load_position, \
+                collect_from_position
+            err = json.load(open(args.from_errors))[args.index]
+            s0, gms0 = load_position(err)
+            enc, tgts, _ = collect_from_position(spy, s0, gms0, rng)
+        else:
+            from trainer import collect_episode
+            mode = MatchplayMode(3, oracle_spec=args.oracle,
+                                 oracle_move_eps=args.oracle_move_eps,
+                                 td_move_eps=args.td_move_eps)
+            enc, tgts = collect_episode(spy, mode, rng,
+                                        oneply=args.oneply)
         oracle = None
         if args.oracle:
             from trainer import _get_oracle

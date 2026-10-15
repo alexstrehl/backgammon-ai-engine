@@ -4,7 +4,9 @@ test_model.py -- Tests for model.py.
 Includes:
     - Architecture unit tests (no training)
     - Save/load tests
-    - Smoke training test (full pipeline)
+    - Edge cases
+    - Encoder abstraction
+    - Cubeful encoder
 
 Run with: pytest tests/test_model.py -v
 """
@@ -259,4 +261,10 @@ class TestCubefulEncoder:
         state = BoardState.initial()
         x = cubeful.encode(state, CubePerspective.CENTERED)
         np.testing.assert_array_equal(x[:NUM_FEATURES], base.encode(state))
+
+    def test_cube_features(self):
+        """Fast paths size their cube blocks from cube_features."""
+        enc = get_encoder("cubeful_perspective196")
+        assert enc.cube_features == 4
+        assert enc.num_features == NUM_FEATURES + 4
 

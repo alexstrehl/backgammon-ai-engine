@@ -28,6 +28,7 @@ from backgammon_engine import (
 )
 from gnubg_eval import (
     CubeRecord, GameRecord, MoveRecord, export_mat, run_gnubg_analysis,
+    GNUBG_CMD,
 )
 from modes import MatchState
 
@@ -173,10 +174,13 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
     p.add_argument("--met", default=None, metavar="TABLE",
-                   help="Match equity table to PLAY with ('auto', a gnubg "
-                        "MET name, or a path). Must match how the model "
-                        "was trained. Note the analysis side (gnubg CLI) "
-                        "uses its own default table, Kazaross-XG2.")
+                   help="Match equity table to PLAY with ('auto' = the "
+                        "bundled met_tables/Kazaross-XG2.xml, falling back "
+                        "to gnubg's system table; a table name from "
+                        "/usr/share/gnubg/met; or a path). Must match how "
+                        "the model was trained. Note the analysis side "
+                        "(gnubg CLI) uses its own default table, "
+                        "Kazaross-XG2.")
     p.add_argument("--matches", type=int, default=50)
     p.add_argument("--match-length", type=int, default=3)
     p.add_argument("--plies", type=int, default=2,
@@ -209,8 +213,9 @@ def main():
             gen_args.append((args.model, n, args.match_length, work_dir,
                              start, args.seed + 1000 * i, met_path))
             start += n
+    from proc_utils import die_with_parent
     ctx = mp.get_context("spawn")
-    with ctx.Pool(len(gen_args)) as pool:
+    with ctx.Pool(len(gen_args), initializer=die_with_parent) as pool:
         mat_files = [f for chunk in pool.map(_gen_worker, gen_args)
                      for f in chunk]
     print(f"  {len(mat_files)} match files written")
@@ -220,7 +225,7 @@ def main():
     n_chunks = min(args.gnubg_workers, len(mat_files))
     chunks = [mat_files[i::n_chunks] for i in range(n_chunks)]
     an_args = [(chunk, work_dir, args.plies) for chunk in chunks]
-    with ctx.Pool(n_chunks) as pool:
+    with ctx.Pool(n_chunks, initializer=die_with_parent) as pool:
         results = pool.map(_analyze_worker, an_args)
 
     chequer, cube, overall = [], [], []

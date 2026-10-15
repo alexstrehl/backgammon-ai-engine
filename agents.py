@@ -1,32 +1,23 @@
 """
 agents.py -- Agent interface and lightweight implementations for backgammon.
 
-No torch dependency — safe to import without a PyTorch installation.
+No torch dependency.
 
-Agent interface
----------------
-
-A single Agent class supports three roles:
-  1. Action selection         (choose_checker_action)
+An Agent has three roles:
+  1. Action selection         (choose_checker_action, cube methods)
   2. Value queries            (evaluate / evaluate_batch)
   3. Learning primitives      (bootstrap_target / terminal_target /
                                predict / stack_targets / loss)
-Lightweight non-learning agents (RandomAgent,
-GnubgNNAgent) only implement role 1 (and optionally 2). Learning agents
-(TDAgent, multi-output variants) implement all three.
+RandomAgent implements role 1 only; the gnubg-nn agents (GnubgNNAgent,
+GnubgNNCubefulAgent, GnubgNNMatchplayAgent: roles 1 and 2, H-H sanity
+checks only) and AlwaysCubeAgent are below.
+TDAgent implements all three.
 
-The optimizer / training loop is outside the agent — it lives in
-trainer.Trainer. The agent provides representation-specific primitives:
-`predict` runs a forward pass and returns raw outputs in the agent's
-own prediction space, and `loss` scores those predictions against targets in
-that same space. The Trainer owns backprop, the optimizer, gradient
-clipping, schedules, etc. This makes agents safe to use in worker
-processes.
-
-Targets are opaque to the trainer. A scalar-equity agent's target is a
-float; a multi-output agent's target is a length-K vector. The agent
-knows how to stack a list of them into a tensor (`stack_targets`) and
-how to compute loss against its own predictions.
+The training loop lives in trainer.Trainer, which owns the optimizer
+and backprop. The agent supplies `predict` (forward pass in its own
+prediction space) and `loss` (predictions vs targets in that space).
+Targets are opaque to the trainer, and `stack_targets` turns a list of
+them into a tensor.
 """
 
 import random
@@ -40,11 +31,8 @@ from backgammon_engine import BoardState, WHITE, BLACK, Play
 
 @dataclass
 class CubeOffer:
-    """Result of an Agent's offer_double() call.
-
-    `_cache` is opaque to the caller — it lets respond_to_double()
-    skip recomputation when self-play threads it back through.
-    """
+    """Result of offer_double(). `_cache` is opaque to the caller. Self-play
+    passes it back to respond_to_double() to skip recomputation."""
     should_double: bool
     _cache: Any = None
 
@@ -53,21 +41,6 @@ try:
     _GNUBG_NN_AVAILABLE = True
 except ImportError:
     _GNUBG_NN_AVAILABLE = False
-
-_GNUBG_NN_WARNED = False
-
-
-def _warn_gnubg_nn():
-    """One loud line per process when a gnubg-nn agent is built: gnubg-nn
-    is a fast CUBE-BLIND approximation of gnubg (21pt-match cube, no
-    Jacoby); H-H sanity checks only. Real gnubg = the gnubg-ext specs."""
-    global _GNUBG_NN_WARNED
-    if not _GNUBG_NN_WARNED:
-        import sys
-        print("[gnubg-nn] WARNING: fast cube-blind APPROXIMATION of gnubg "
-              "(21pt cube approx, no Jacoby). H-H sanity checks only; never "
-              "label results 'gnubg'. Real gnubg = gnubg-ext.", file=sys.stderr)
-        _GNUBG_NN_WARNED = True
 
 
 class Agent:
@@ -83,13 +56,9 @@ class Agent:
     ) -> Tuple[Play, BoardState]:
         """Pick one (play, resulting_state) from the legal checker actions.
 
-        Each action's `resulting_state.turn` is the opponent (already
-        switched by `backgammon_engine.get_legal_plays`), so
-        `evaluate(resulting_state)` returns the value to the OPPONENT.
-        The on-roll player picks the action that minimises that.
-
-        Default implementation evaluates every successor in one batch.
-        Subclasses may override (e.g. RandomAgent ignores values).
+        `resulting_state.turn` is already the opponent, so
+        `evaluate(resulting_state)` is the OPPONENT's value. The default
+        batch-evaluates every successor and takes the minimum.
         """
         next_states = [s for _, s in actions]
         values = self.evaluate_batch(next_states)
@@ -99,85 +68,54 @@ class Agent:
     # ── value primitive (no grad, scalar, on-roll's view) ──────────────
 
     def evaluate(self, state: BoardState) -> float:
-        """Scalar value of `state` from `state.turn`'s perspective.
-
-        For scalar-equity agents this is the raw network output;
-        for multi-output agents this is equity derived from the
-        predicted outcome distribution.
-        """
+        """Scalar value of `state` from `state.turn`'s view (raw output for
+        scalar agents, derived equity for multi-output ones)."""
         raise NotImplementedError
 
     def evaluate_batch(self, states: Sequence[BoardState]) -> np.ndarray:
-        """Batched evaluate(). Default falls back to a Python loop;
-        learning agents should override with a single forward pass.
-        """
+        """Batched evaluate(). Default is a Python loop. Learning agents
+        override with one forward pass."""
         return np.asarray([self.evaluate(s) for s in states], dtype=np.float32)
 
     # ── training-side primitives (used by trainer) ─────────────────────
-    #
-    # The Trainer composes targets from these primitives and owns the
-    # optimizer / backprop step.
 
     def bootstrap_target(self, next_state: BoardState):
-        """Target for the state PRECEDING `next_state`, derived by
-        bootstrapping the agent's own value function.
-
-        For checker plays, `next_state.turn` is the opponent of the mover,
-        so a raw evaluation of `next_state` is from the opponent's view.
-        The agent flips this into the mover's target representation
-        (e.g. `1 - V` for win-prob, `-V` for equity).
-
-        No grad. Used by the trainer to construct TD targets.
-        """
+        """TD target for the state PRECEDING `next_state`, from the
+        agent's own value. `next_state.turn` is the opponent, so the
+        value is flipped into the mover's view (`1 - V` for win-prob,
+        `-V` for equity). No grad."""
         raise NotImplementedError
 
     def terminal_target(self, terminal_info):
-        """Target representing a terminal outcome. Used as the TD target
-        when an episode ends. `terminal_info` is a mode-defined record
-        produced by the game engine (winner, gammon flag, cube value, etc.).
-        """
+        """TD target for a finished episode. `terminal_info` is the
+        mode-defined record from the game engine (winner, gammon flag,
+        cube value, ...)."""
         raise NotImplementedError
 
     def predict(self, states: Sequence[BoardState]):
-        """Forward pass on a batch of states, returning predictions in
-        the agent's prediction space (a tensor whose shape depends on
-        the agent type — 1-D for scalar TDAgent, [B, K] for
-        multi-output). Trainer uses this to compute loss with grad
-        enabled (and wraps in `torch.no_grad()` for eval).
-        """
+        """Forward pass on a batch, in the agent's prediction space (1-D
+        for scalar agents, [B, K] for multi-output). Grad enabled; the
+        trainer wraps it in `torch.no_grad()` for eval."""
         raise NotImplementedError
 
     def stack_targets(self, targets):
-        """Convert a python list of targets (as produced by
-        `bootstrap_target` / `terminal_target`) into a tensor of the
-        appropriate shape on the agent's device. Trainer calls this
-        after collecting targets and before passing them to `loss`.
-        """
+        """List of targets (from `bootstrap_target` / `terminal_target`)
+        -> tensor on the agent's device, ready for `loss`."""
         raise NotImplementedError
 
     def loss(self, predictions, targets):
-        """Compute the training loss between `predictions` (from
-        `predict`) and `targets` (from `stack_targets`). Returns a
-        scalar tensor. The trainer is responsible for `backward()` and
-        the optimizer step.
-        """
+        """Scalar loss tensor for `predict` output vs `stack_targets`
+        output. The trainer does `backward()` and the optimizer step."""
         raise NotImplementedError
 
     # ── cube actions (cubeful modes only) ──────────────────────────────
     #
-    # Defaults are a valid "never offer, always take" cube policy —
-    # sensible for RandomAgent and cubeless-trained TDAgents when
-    # dropped into a cubeful game. Cubeful learning agents override.
+    # Defaults are a valid "never offer, always take" policy for
+    # cubeless agents in a cubeful game. Cubeful agents override.
 
     def offer_double(self, state: BoardState, match_state) -> CubeOffer:
         """Pre-roll cube decision: should the on-roll player double?
-
-        Returns a CubeOffer carrying the decision plus an opaque cache
-        that `respond_to_double` can consume to skip recomputation
-        during self-play. Inter-agent play passes `hint=None`.
-
-        Default: never doubles. Override for cubeful agents.
-        """
+        Default: never."""
         return CubeOffer(should_double=False, _cache=None)
 
     def respond_to_double(
@@ -186,25 +124,18 @@ class Agent:
         match_state,
         hint: Optional[CubeOffer] = None,
     ) -> bool:
-        """Cube response from the player who was just doubled.
-        Returns True for take, False for pass.
-
-        Default: always takes. Override for cubeful agents.
-        """
+        """Response of the player just doubled: True = take, False = pass.
+        Default: always take."""
         return True
 
     def choose_checker_action_cubeful(
         self, state: BoardState, dice, match_state,
     ):
-        """Cubeful move selection. Returns `(next_state, bootstrap)`
-        or None on forced pass. `bootstrap` is only consumed by the
-        trainer; non-training callers (eval, play_models) just read
-        `next_state`.
+        """Cubeful move selection: `(next_state, bootstrap)`, or None on a
+        forced pass. Only the trainer reads `bootstrap`.
 
-        Default: ignore the cube context and pick via the cubeless
-        `choose_checker_action`, returning bootstrap=0.0. Cubeful
-        learning agents override to bake the opponent's cube
-        perspective into successor encodings.
+        Default: ignore the cube and use `choose_checker_action`, with
+        bootstrap=0.0. Cubeful agents override.
         """
         from backgammon_engine import get_legal_plays
         plays = get_legal_plays(state, dice)
@@ -274,7 +205,6 @@ class GnubgNNAgent(Agent):
     """
 
     def __init__(self, plies: int = 0, cubeless_money: bool = False):
-        _warn_gnubg_nn()
         if not _GNUBG_NN_AVAILABLE:
             raise ImportError("gnubg-nn is not installed. Run: pip install gnubg-nn")
         self.plies = plies
@@ -326,21 +256,31 @@ class GnubgNNCubefulAgent(Agent):
     on the resulting position and convert the 5-tuple to cubeless money
     equity, then pick the move minimising the opponent's equity.
 
-    Checker play is cube-BLIND: gnubg-nn exposes no way to make
-    ``probabilities``/``best_move`` cube-aware (measured invariant to
-    cube ownership at every ply).
+    Note on cube-aware checker play: gnubg's desktop "Cubeful checker
+    evaluations" GUI toggle does take cube ownership into account, but
+    we could not find a way to enable that path through gnubg-nn —
+    every ``set.*`` combination we tried left both ``probabilities``
+    and ``best_move`` invariant to cube ownership at every ply. There
+    is a ``best_move`` API that could be used in place of the equity
+    argmin above, but in a 400k-game H-H at 0-ply, calling it both at
+    money score (0,0) and at the 21-point 0-0 match-equity approximation
+    was statistically inferior to the equity approach, so we leave that
+    path unused.
 
     Cube decisions: gnubg_nn.evaluate_cube_decision at a simulated
-    match (default 21pt, 0-0) approximates money play; ml ∈ {13..25}
-    are equivalent, ml ∈ {31, 41} are BROKEN in gnubg-nn. Jacoby
-    override: when gnubg says "no double, too good" on a centered
-    cube, we force a double — under Jacoby, gammons don't count on a
-    centered cube so doubling is monotonic.
+    match (default 21pt, 0-0) approximates money play. Match-length
+    sweep against ml=21 baseline at 800k games showed ml ∈ {13,17,21,25}
+    all within ±2 mEq of each other (effective tie); ml ∈ {31, 41} are
+    broken in gnubg-nn (runaway tails / weak play). 21pt picked as a
+    safe middle. Jacoby override: when gnubg says "no double, too good"
+    on a centered cube, we force a double — under Jacoby, gammons don't
+    count on a centered cube so doubling is monotonic.
 
     Cube plies clamp: gnubg-nn's evaluate_cube_decision at n=0 is
-    broken (stale state — see __init__ comment). We default cube_plies
-    to max(plies, 1); pass cube_plies=0 to reproduce the broken
-    behavior deliberately.
+    broken (returns stale state — see __init__ comment). We default
+    cube_plies to max(plies, 1) so a "0-ply" GnubgNNCubefulAgent still
+    makes sane cube decisions, at ~25-40% throughput cost. Pass
+    cube_plies=0 to reproduce the historical (broken) behavior.
     """
 
     def __init__(
@@ -349,15 +289,30 @@ class GnubgNNCubefulAgent(Agent):
         match_length: int = 21,
         cube_plies: Optional[int] = None,
     ):
-        # cube_plies defaults to max(plies, 1): gnubg-nn's
-        # evaluate_cube_decision is BROKEN at n=0 — danalyze.cc's
-        # nPlies==0 branch discards the computed equities, so
-        # setDecision reads stale fields from the previous cube call
-        # and the decision is essentially random (gnubg CLI `hint` at
-        # 0-ply is correct; gnubg-nn n=0 is not; n>=1 is fine). The
-        # clamp costs ~25-40% wall time. cube_plies=0 reproduces the
-        # broken behavior deliberately.
-        _warn_gnubg_nn()
+        # cube_plies controls plies for evaluate_cube_decision calls.
+        # Defaults to max(plies, 1) — i.e. clamped to at least 1.
+        #
+        # Why the clamp: gnubg-nn's evaluate_cube_decision is BROKEN at
+        # n=0. In gnubg-nn/analyze/danalyze.cc the else branch of
+        # Analyze::R1::cubefulEquities (the nPlies==0 case) calls
+        # cubefulEquity once and discards the result, never writing
+        # matchProbNoDouble / matchProbDoubleTake / matchProbDoubleDrop.
+        # setDecision then reads those three fields from stale state
+        # left over from a previous cube call on the same Player object,
+        # so the decision is essentially random.
+        #
+        # Verified empirically: gnubg's CLI `hint` at 0-ply gives the
+        # right answer; gnubg-nn's evaluate_cube_decision(n=0) does not.
+        # At n>=1 the bug doesn't trigger (the n>0 branch writes the
+        # three fields correctly).
+        #
+        # Speed cost of the clamp: cube actions are ~5-10/game vs
+        # ~50-100 chequer moves, so going from n=0 to n=1 on cube alone
+        # only adds ~25-40% wall time per game. Worth it for sane cube
+        # decisions.
+        #
+        # Set cube_plies=0 explicitly if you specifically want the
+        # broken-at-0-ply behavior (e.g. to reproduce historical numbers).
         if not _GNUBG_NN_AVAILABLE:
             raise ImportError("gnubg-nn is not installed. Run: pip install gnubg-nn")
         self.plies = plies
@@ -490,7 +445,6 @@ class GnubgNNMatchplayAgent(Agent):
     def __init__(self, plies: int = 0, cube_plies: Optional[int] = None):
         # Same n=0 evaluate_cube_decision clamp as GnubgNNCubefulAgent
         # (gnubg-nn's cube decision is broken at n=0; see that class).
-        _warn_gnubg_nn()
         if not _GNUBG_NN_AVAILABLE:
             raise ImportError("gnubg-nn is not installed. Run: pip install gnubg-nn")
         self.plies = plies

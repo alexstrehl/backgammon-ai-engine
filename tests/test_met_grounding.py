@@ -69,9 +69,9 @@ def test_met_agent_ignores_network_weights(table):
 
 def test_net_met_is_exactly_half_at_symmetric_scores():
     """Structural, not learned: at equal away scores the averaged
-    new-game estimate cancels to 0.5 for any weights. MATCHPLAY.md's
-    "2a2a = 0.50" convergence claim is therefore not evidence of
-    anything having been learned."""
+    new-game estimate cancels to 0.5 for any weights. A "2a2a = 0.50"
+    convergence claim is therefore not evidence of anything having been
+    learned."""
     for seed in range(3):
         agent = _agent(seed=seed)
         for away in (2, 3, 5):
@@ -104,7 +104,7 @@ def test_crawford_flag_is_applied(table):
 
 
 def test_v_dp_is_pinned_to_the_canary(table):
-    """MATCHPLAY.md's canary: v_dp at 2-away/2-away must be the MET's
+    """The canary: v_dp at 2-away/2-away must be the MET's
     1-away/2-away value. Under pure TD(0) it drifted 0.680 -> 0.639."""
     agent = _agent(met=table)
     state = BoardState.initial()

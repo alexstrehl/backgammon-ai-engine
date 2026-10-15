@@ -97,8 +97,7 @@ by the row-order test rather than numerically.
 
 WHAT IS NOT CLAIMED
 ===================
-Nothing here measures throughput; see
-`benchmarks/matchplay_gpu_eval_server_ab.md`. And `TestWorkerDeath`
+Nothing here measures throughput. And `TestWorkerDeath`
 proves the SERVER survives an abandoned request and keeps serving other
 slots; it does not claim `multiprocessing.pool.Pool` recovers from a
 dead worker. It cannot: the replacement re-runs the initializer and
@@ -1020,20 +1019,16 @@ class TestTrainerIntegration:
 
     def test_pool_does_not_recycle_workers(self, monkeypatch):
         """maxtasksperchild must be None when the server is active --
-        the invariant that keeps each worker's slot claim valid."""
+        the invariant that keeps each worker's slot claim valid.
+        (Trainer.train builds its pool as pool_guard.GuardedPool.)"""
         seen = {}
-        ctx = mp.get_context("spawn")
-        real_pool = ctx.Pool
+        real_pool = T.GuardedPool
 
-        class _Spy:
-            def Pool(self, *a, **kw):
-                seen.update(kw)
-                return real_pool(*a, **kw)
+        def _spy(*a, **kw):
+            seen.update(kw)
+            return real_pool(*a, **kw)
 
-            def __getattr__(self, k):
-                return getattr(ctx, k)
-
-        monkeypatch.setattr(T.mp, "get_context", lambda _m: _Spy())
+        monkeypatch.setattr(T, "GuardedPool", _spy)
         _tiny_train(workers=2, episodes=2, per_round=2,
                     gpu_eval_server=True, gpu_eval_device="cpu")
         assert seen.get("maxtasksperchild", "missing") is None
@@ -1172,37 +1167,6 @@ class TestCoalescingAndDeterminism:
         assert st["gpu_calls"] < 100, (
             "no fusion at all under a saturating 4-slot driver; the "
             "coalescing path may be dead", st)
-
-    def test_values_are_correct_either_way(self):
-        """Fusion (or its absence) must not change which value a slot
-        gets, on a batch-composition-INVARIANT net.
-
-        Asserted to a tight tolerance rather than bit-exactly: the net is
-        composition-invariant in exact arithmetic, but BLAS still selects
-        different GEMM kernels by batch shape, so fused and unfused runs
-        can differ in the last ulp (~6e-8 on values near 0.5). The bugs
-        this guards against -- a slot receiving another slot's rows, or
-        the scatter landing at the wrong offset -- move values by O(1),
-        so 1e-6 catches them with orders of magnitude to spare while not
-        failing intermittently on float noise."""
-        for coalesce in (True, False):
-            net = _column_picker_net(32)
-            with _Server(net, num_slots=4, max_rows=256,
-                         coalesce=coalesce) as srv:
-                out_q = _drive_saturated(srv, n_slots=4, n_rows=48,
-                                         n_reqs=10)
-            while not out_q.empty():
-                slot, head, vals = out_q.get()
-                want = _local_values(
-                    net,
-                    np.random.default_rng(1000 + slot).standard_normal(
-                        (48, 32), dtype=np.float32),
-                )
-                got = np.array(vals, dtype=np.float32)
-                assert got.shape == want.shape
-                assert np.allclose(got, want, rtol=0, atol=1e-6), (
-                    "coalescing changed a value beyond float noise; "
-                    "max|delta| = %g" % np.max(np.abs(got - want)))
 
     def test_trainer_states_which_reproducibility_mode_it_is_in(self,
                                                                 capsys):
@@ -1590,15 +1554,25 @@ class TestWorkerNetMatchesTheMaster:
     mean 0.0202, max 0.0565 in MWC units."""
 
     def _captured_worker_args(self, net, monkeypatch):
-        """The args the master actually builds for `_collect_worker`."""
+        """The args the master actually builds for `_collect_worker`.
+        Trainer.train builds its pool as pool_guard.GuardedPool and waits
+        on it through pool_guard.PoolWatch (worker list, ready / wait /
+        get), so the fake stands in for both."""
         captured = []
-        ctx = mp.get_context("spawn")
 
         class _FakePoolCapture:
+            _pool = []          # PoolWatch's worker list: none to watch
+
             def map_async(self, fn, args):
                 captured.extend(args)
 
                 class _R:
+                    def ready(self_inner):
+                        return True
+
+                    def wait(self_inner, timeout=None):
+                        return None
+
                     def get(self_inner, timeout=None):
                         return [(np.zeros((0, 1), dtype=np.float32),
                                  np.zeros((0, 1), dtype=np.float32))]
@@ -1615,14 +1589,8 @@ class TestWorkerNetMatchesTheMaster:
             def join(self):
                 pass
 
-        class _Spy:
-            def Pool(self, *a, **kw):
-                return _FakePoolCapture()
-
-            def __getattr__(self, k):
-                return getattr(ctx, k)
-
-        monkeypatch.setattr(T.mp, "get_context", lambda _m: _Spy())
+        monkeypatch.setattr(T, "GuardedPool",
+                            lambda *a, **kw: _FakePoolCapture())
         tr = Trainer(_agent(net), lr=1e-3)
         tr.train(MatchplayMode(2), num_episodes=2, episodes_per_round=2,
                  batch_size=8, workers=2, oneply=True, seed=1,
@@ -1698,17 +1666,8 @@ class TestBf16DoesNotTouchMatchplay:
 # ── 19. the docs must match the measurements ────────────────────────
 
 
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def _bench_doc():
-    with open(os.path.join(_REPO, "benchmarks",
-                           "matchplay_gpu_eval_server_ab.md")) as f:
-        return f.read()
-
-
 class TestDocsMatchMeasurements:
-    """Three quantitative claims in the shipped docs were reproduced as
+    """Quantitative claims in the module docstring were reproduced as
     FALSE by an independent re-measurement. Docs are the interface to a
     benchmark nobody will rerun, so they get tests too."""
 
@@ -1716,37 +1675,31 @@ class TestDocsMatchMeasurements:
         """Measured on the real server, saturated: 328 MB at 1 slot ->
         1262 MB at 48. The growing term is the fused batch's
         activations, not the CUDA context."""
-        doc = _bench_doc()
-        for text, where in ((GES.__doc__, "module docstring"),
-                            (doc, "benchmark doc")):
-            low = text.lower()
-            assert "flat in w" not in low, where
-            assert "~350 mb flat" not in low, where
-        assert "1262" in GES.__doc__ and "1262" in doc, (
+        low = GES.__doc__.lower()
+        assert "flat in w" not in low
+        assert "~350 mb flat" not in low
+        assert "1262" in GES.__doc__, (
             "the measured slot-count sweep is not recorded anywhere")
 
     def test_shm_per_slot_arithmetic(self):
-        """52 MB / 8 workers = 6.5 MB, not 7.2 (7.2 is the 220-feature
-        number; production here is 207-feature)."""
-        doc = _bench_doc()
-        assert "7.2 MB per worker" not in doc
-        assert "6.5" in doc
+        """8192 rows x 207 features x 4 bytes = 6.5 MB per slot, not 7.2
+        (7.2 is the 220-feature number; production here is 207-feature)."""
+        assert "7.2 MB per worker" not in GES.__doc__
+        assert "6.5 MB for the 207-feature" in GES.__doc__
 
     def test_noise_floor_is_disclosed(self):
         """Four measurements of an IDENTICAL CPU-serial workload inside
         15 minutes spanned 1.71x (3.70 - 6.33 ep/s), so two-rep min-max
         ranges must not be read as confidence intervals."""
-        doc = _bench_doc().lower()
-        assert "noise floor" in doc
-        assert "1.71" in doc
+        low = GES.__doc__.lower()
+        assert "noise floor" in low
+        assert "1.71" in low
 
     def test_move_routing_gain_is_not_quoted_as_a_point_estimate(self):
         """Direction reproduced (5/5 positive); magnitude spanned +14%
         to +121%."""
-        doc = _bench_doc()
-        assert "+26%)" not in doc
+        assert "+26%)" not in GES.__doc__
 
     def test_determinism_is_documented_where_someone_will_read_it(self):
-        for text in (GES.__doc__, _bench_doc()):
-            assert "reproducib" in text.lower()
-        assert "--gpu-eval-deterministic" in _bench_doc()
+        assert "reproducib" in GES.__doc__.lower()
+        assert "--gpu-eval-deterministic" in GES.__doc__

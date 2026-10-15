@@ -14,6 +14,7 @@ import shutil
 import pytest
 
 from backgammon_engine import BoardState, WHITE, BLACK
+from met import resolve_met_path
 from modes import CubeOwner, MatchState
 
 gnubg_external = pytest.importorskip("gnubg_external")
@@ -25,7 +26,7 @@ needs_gnubg = pytest.mark.skipif(
 )
 
 MET_DIR = "/usr/share/gnubg/met"
-KAZAROSS = os.path.join(MET_DIR, "Kazaross-XG2.xml")
+KAZAROSS = resolve_met_path("auto")     # the table training grounds on
 SNOWIE = os.path.join(MET_DIR, "snowie.xml")
 
 

@@ -248,7 +248,7 @@ def _args(**kw):
         resume=None, expand=None, expand_depth=None, hidden=None,
         output_mode=None, encoder=None, met_features=False,
         warm_start_equity=None, warm_start_cubeful=None,
-        warm_start_cubeful_take=None, warm_start_matchplay=None,
+        warm_start_matchplay=None,
         warm_start_matchplay1h=None, warm_start_matchplay_cubeful=None,
         warm_start_matchplay_met=None,
     )

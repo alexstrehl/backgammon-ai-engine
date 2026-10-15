@@ -18,8 +18,7 @@ defects:
                        max(T1, min(v_dt, v_dp)) when the window is live
   cube rows (ca=1)   : target == max(v_nd_0ply, min(v_dt, v_dp)) -- the
                        matchplay collector composes cube targets from
-                       0-PLY reads even under --oneply (see the
-                       --cube-targets-1ply guard in trainer.collect_episode)
+                       0-PLY reads even under --oneply
 
 Usage:
     python verify_targets.py --model M.pt [--episodes 2] [--td-move-eps 0.01]

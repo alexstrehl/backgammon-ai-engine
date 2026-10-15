@@ -2,8 +2,9 @@
 
 The property that matters is that these rows are ADDITIVE: they add
 supervision at states the collector already evaluated without changing
-which move is played. Random exploration was measured harmful precisely
-because it moved the state distribution; this must not.
+which move is played. Random exploration (--move-explore-eps) was
+measured harmful precisely because it moved the state distribution;
+this must not.
 """
 import random
 
@@ -161,38 +162,55 @@ def test_targets_match_the_independent_slow_path(agent):
     assert checked
 
 
-def test_cube_targets_1ply_changes_only_cube_rows(agent):
-    """--cube-targets-1ply must re-price the cube rows and leave every
-    checker row byte-identical: it exists to make the two channels share a
-    depth, not to alter the checker target."""
-    import numpy as np
-    mode = MatchplayMode(match_length=11)
-    ms = MatchState(jacoby=False, match_length=11, my_away=11, opp_away=11)
-    e0, t0 = T._collect_episode_matchplay(
-        agent, mode, random.Random(4), ms, oneply=True,
-        cube_targets_1ply=False)[:2]
-    e1, t1 = T._collect_episode_matchplay(
-        agent, mode, random.Random(4), ms, oneply=True,
-        cube_targets_1ply=True)[:2]
-    assert len(t0) == len(t1)
-    assert np.array_equal(np.asarray(e0), np.asarray(e1)), \
-        "encodings must be unchanged -- only target VALUES may move"
-    changed = [i for i in range(len(t0)) if t0[i] != t1[i]]
-    assert changed, "flag had no effect"
-    # every changed row must be a cube row (is_cube_action set in extras)
-    n_base = agent.encoder._base.num_features
-    for i in changed:
-        assert np.asarray(e0[i])[n_base + 3] == 1.0, \
-            f"row {i} changed but is not a cube-action row"
+def test_oneply_act_k_matches_full_selection_but_cheaper(agent):
+    """The top-K filter must not change WHICH move 1-ply selection picks in
+    the common case -- the argmin is decided among the best few candidates.
+    K=3 matched full 1-ply on 101/128 gnubg-confirmed positions at 5.2x
+    less compute; here we pin the equivalence on ordinary self-play states."""
+    from backgammon_engine import opening_roll
+    from met import MatchEquityTable, resolve_met_path
+    from model import TDNetwork
+    met = MatchEquityTable.from_xml(resolve_met_path("auto"))
+    net = TDNetwork.load(MODEL)
+    full = TDAgent(net, met=met, oneply_moves=True)
+    topk = TDAgent(net, met=met, oneply_moves=True, oneply_moves_k=3)
+    rng = random.Random(5)
+    gms = MatchState(jacoby=False, match_length=11,
+                     my_away=11, opp_away=11).start_game()
+    state, dice = opening_roll(rng)
+    same = n = 0
+    for _ in range(12):
+        a = full.choose_checker_action_matchplay(state, dice, gms)
+        b = topk.choose_checker_action_matchplay(state, dice, gms)
+        if a is None or b is None:
+            break
+        n += 1
+        same += (a[0] == b[0])
+        if a[0].is_game_over():
+            break
+        state = a[0]
+        dice = (rng.randint(1, 6), rng.randint(1, 6))
+    assert n > 0
+    assert same >= n - 1, f"top-K diverged from full on {n-same}/{n} decisions"
 
 
-def test_cube_targets_1ply_needs_oneply():
-    """0-ply checker rows with 1-ply cube rows would be the same mixed-depth
-    defect in reverse."""
-    import subprocess, sys
-    r = subprocess.run(
-        [sys.executable, "train_batch.py", "--game-mode", "matchplay",
-         "--match-length", "11", "--cube-targets-1ply",
-         "--resume", MODEL, "--num-episodes", "1", "--save", "/tmp/x.pt"],
-        capture_output=True, text=True, cwd=".")
-    assert "needs --oneply" in (r.stderr + r.stdout)
+def test_oneply_act_k_zero_is_plain_oneply(agent):
+    """k=0 must mean 'no filter', not 'no deep read'."""
+    from backgammon_engine import opening_roll
+    from met import MatchEquityTable, resolve_met_path
+    from model import TDNetwork
+    met = MatchEquityTable.from_xml(resolve_met_path("auto"))
+    net = TDNetwork.load(MODEL)
+    a = TDAgent(net, met=met, oneply_moves=True, oneply_moves_k=0)
+    b = TDAgent(net, met=met, oneply_moves=True)
+    rng = random.Random(9)
+    gms = MatchState(jacoby=False, match_length=11,
+                     my_away=11, opp_away=11).start_game()
+    state, dice = opening_roll(rng)
+    assert (a.choose_checker_action_matchplay(state, dice, gms)[0]
+            == b.choose_checker_action_matchplay(state, dice, gms)[0])
+
+
+def test_vectorized_refuses_oneply_act():
+    import inspect
+    assert "--td-oneply-act acts with 1-ply move selection" in inspect.getsource(T)

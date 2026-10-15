@@ -1,34 +1,27 @@
-# Reproduction environment (python 3.10-3.12). See also
-# experiments/head_to_head/README.md "Requirements".
+# Python 3.10 to 3.12.
 #
-# Pins are the versions the banked results were actually produced under, not
-# aspirational ones -- see VERIFIED ENVIRONMENT below. An unpinned torch is a
-# real reproducibility hole in a repo whose headline artifacts are +-2 mEq
-# measurements, because numerics and RNG behaviour move between releases.
+# The pins are the versions of the environment that trained the match-play
+# champion and produced its results. Numerics and RNG behaviour change
+# between releases, so do not loosen them when reproducing a result.
+# torch==2.13.0 installs the build your package index serves by default;
+# install a CUDA build for GPU training. numpy 2.x has not been re-tested
+# on this branch.
 torch==2.13.0
-numpy==2.2.6
+numpy==1.26.3
+
+# The gnubg-nn agents (agents.py, play_models.py) and mine_cube_errors.py.
 gnubg-nn==1.1.0a8
 
-# Optional. scipy is used only by play_models.compute_binomial_pvalue, which
-# falls back to a normal approximation when it is absent (and IS absent in the
-# environment below, so that fallback is the tested path). bgsage is imported
-# lazily by experiments/benchmarks/fixedpool_bench.py for cubeless modes only.
-# scipy
-# bgsage==1.3.20260723
+# The test suite.
+pytest
 
-# Plus, for the paper's gnubg-ext opponents and the mEMG judge:
-#   GNU Backgammon 1.08.003 binary (weights md5 14184acc...) on PATH or GNUBG_CMD
-#
-# Package-manager gnubg versions vary: recent Debian/Ubuntu ship 1.08.003
-# (Ubuntu 26.04 does), older releases ship 1.06/1.07, whose nets differ.
-# The runtime preflight verifies version + weights md5 and refuses anything
-# but 1.08.003; set GNUBG_CMD if the /usr/games/gnubg default holds a
-# different build. The behavioural tests skip with the version they found
-# rather than failing on equity mismatches that look like a code regression.
-#
-# Verified environment (recorded 2026-08-26, the machine that produced the
-# cf5L chain): Python 3.10.12, torch 2.13.0+cu130 for training and
-# head-to-head, torch 2.13.0+cpu elsewhere, numpy 2.2.6, scipy absent,
-# GNU Backgammon 1.08.003. `torch==2.13.0` above resolves to whichever
-# build variant the index serves -- pip cannot express "+cu130 here, +cpu
-# there" -- so install the CUDA build explicitly for training.
+# Optional. play_models.compute_binomial_pvalue uses scipy when it is
+# installed and a normal approximation otherwise.
+# scipy
+
+# Not a pip package: GNU Backgammon 1.08.003. The gnubg-ext opponent
+# (gnubg_external.py) runs GNUBG_CMD if it is set, else /usr/local/bin/gnubg
+# if it exists, else /usr/games/gnubg. gnubg_eval.py runs /usr/games/gnubg.
+# tools/run_gnubg_mats.sh runs gnubg from PATH. Older releases (1.06, 1.07)
+# ship different nets. Nothing here checks the version, so check
+# `gnubg --version` yourself.

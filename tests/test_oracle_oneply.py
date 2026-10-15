@@ -378,6 +378,73 @@ def test_act_prob_one_changes_trajectory():
         "beta=1 produced the identical trajectory to beta=0"
 
 
+# ── --move-explore-eps (checker exploration) ─────────────────────────
+
+
+def _collect_td(explore_eps, seed):
+    """One --oneply TD episode (no oracle) at a given exploration rate."""
+    from td_agent import TDAgent
+    from model import TDNetwork
+    from trainer import _collect_episode_matchplay
+    from train_cli import build_mode
+    torch.manual_seed(3)
+    net = TDNetwork(hidden_sizes=[32, 16], input_size=207,
+                    encoder_name="matchplay1h_perspective196",
+                    output_mode="probability")
+    agent = TDAgent(net)
+    mode = build_mode("matchplay", match_length=3,
+                      move_explore_eps=explore_eps)
+    return _collect_episode_matchplay(
+        agent, mode, random.Random(seed),
+        MatchState(jacoby=False, match_length=3, my_away=3, opp_away=3),
+        oneply=True,
+    )
+
+
+def test_explore_zero_is_historical_path():
+    a_enc, a_t = _collect_td(0.0, seed=77)
+    b_enc, b_t = _collect_td(0.0, seed=77)
+    assert np.array_equal(a_enc, b_enc) and np.array_equal(a_t, b_t)
+
+
+def test_explore_changes_visited_states():
+    """eps=1 executes random moves, so the trajectory must diverge."""
+    g_enc, _ = _collect_td(0.0, seed=77)
+    e_enc, _ = _collect_td(1.0, seed=77)
+    assert not (g_enc.shape == e_enc.shape and np.array_equal(g_enc, e_enc))
+
+
+def test_explore_does_not_touch_targets():
+    """The invariant that makes this safe: every emitted target is still the
+    1-ply value of the state it encodes, whatever move was executed."""
+    from td_agent import TDAgent
+    from model import TDNetwork
+    torch.manual_seed(3)
+    net = TDNetwork(hidden_sizes=[32, 16], input_size=207,
+                    encoder_name="matchplay1h_perspective196",
+                    output_mode="probability")
+    agent = TDAgent(net)
+    m = ms(match_length=3, my_away=3, opp_away=3)
+    checked = 0
+    for sd in range(30):
+        state = random_state(sd, 6)
+        if state is None:
+            continue
+        dice = next((d for d in DICE if get_legal_plays(state, d)), None)
+        if dice is None or len(get_legal_plays(state, dice)) < 2:
+            continue
+        # the target for this state is a max over successors: independent of
+        # which successor is executed
+        t = agent.value_oneply_checker_matchplay(state, m)
+        assert 0.0 <= t <= 1.0
+        t2 = agent.value_oneply_checker_matchplay(state, m)
+        assert t == t2, "1-ply target is not a pure function of the state"
+        checked += 1
+        if checked >= 5:
+            break
+    assert checked >= 5
+
+
 # ── --oracle-act-only (teacher moves, student targets) ───────────────
 
 

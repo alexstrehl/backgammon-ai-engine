@@ -24,8 +24,10 @@ reasons.
    target keeps its per-dice loop instead of `expand_21`, its float64
    Python accumulation instead of a dot product, its float32 terminal
    overrides and its final [0,1] clamp, and move selection keeps the
-   PYTHON move generator (the fused C one emits plays in a different
-   order and would break argmin ties differently).
+   PYTHON move generator. (This header once said the fused C generator
+   emits plays in a different order; it does not -- same plays, same
+   order, all 36 ordered rolls, 8,640,000 cases, 0 mismatches:
+   c_api/movegen_fuzz.py, tests/test_movegen_order_stable.py.)
 
 2. Value equality alone is not enough, so we compare ENCODINGS too, row
    for row. The matchplay collector's failure modes are structural, not
@@ -47,7 +49,8 @@ reasons.
    would not show up at all.
 
 The sweep is run across `MatchplayMode(2)` and `MatchplayMode(3)` (2pt
-exercises Crawford and dead-cube suppression far more), and `met=None`
+exercises Crawford and dead-cube suppression far more), `outcome_mix`
+0.0 and 0.3 (a viewer-list bug is invisible at mix=0), and `met=None`
 vs a real MatchEquityTable (`_eval_new_game` takes a completely
 different branch, which also changes the number of forwards).
 
@@ -175,7 +178,6 @@ def _worker_args(mode, num_episodes, seed, B, device="cpu",
         False,   # oneply_acting
         0.0,     # boltzmann_temp
         False,   # bf16_inference
-        False,   # cube_targets_1ply
         met_path,
         B, device, max_episode_plies,
     )
@@ -261,10 +263,11 @@ class TestBitwiseEquivalence:
     bar here rather than a numeric tolerance."""
 
     @pytest.mark.parametrize("match_length", [2, 3])
-    def test_bitwise(self, match_length):
+    @pytest.mark.parametrize("outcome_mix", [0.0, 0.3])
+    def test_bitwise(self, match_length, outcome_mix):
         net = _net()
         agent = _agent(net)
-        mode = MatchplayMode(match_length)
+        mode = MatchplayMode(match_length, outcome_mix=outcome_mix)
         compared = 0
         for seed in range(8):
             ev, tv, disc = _gen_episode(agent, net, mode, seed)
@@ -401,8 +404,8 @@ class TestSampleStructure:
             er, tr = _serial_episode(agent, mode, seed)
             assert np.array_equal(enc, er) and np.array_equal(tgt, tr)
             n_games = len(calls)
-            # Not >= 3: a gammon/backgammon on a checker move scores
-            # 2-3 points, so a 3pt match can end in a single game.
+            # Not >= 3: the score curriculum can start the match part
+            # way through, and a gammon on a checker move scores 2-3.
             assert n_games >= 1
             triples = [i for i, ln in _run_starts(enc, tgt) if ln >= 3]
             assert len(triples) == n_games, (
@@ -542,10 +545,11 @@ class TestCubeSample:
 
 class TestBoundaryUpweight:
     def test_default_weight_is_the_unbiased_one(self, monkeypatch):
-        """Upweighting boundary rows triple-counts the winner's
-        game-ending branch and biases the weighted fixed point, so
-        the DEFAULT must stay the unbiased 1: no duplicated boundary
-        rows unless the env override is set."""
+        """The x3 upweight triple-counted the winner's
+        game-ending branch and biased the weighted fixed point (root
+        cause of a TD degradation seen in training). The DEFAULT is now
+        the unbiased 1: no duplicated boundary rows unless the
+        historical env override is set."""
         assert VM._BOUNDARY_UPWEIGHT == 1
         monkeypatch.setattr(VM, "_CUBE_EXPLORATION_EPS", 0.0)
         net = _net()
@@ -615,14 +619,60 @@ class TestBoundaryUpweight:
         assert saw > 0, "no game ended on a checker move"
 
 
-# ── 5. Crawford / post-Crawford / dead cube ─────────────────────────
+# ── 5. outcome-mix blending ─────────────────────────────────────────
+
+
+class TestOutcomeMix:
+    def test_blend_is_affine_in_a_binary_outcome(self):
+        """mix does not touch the trajectory, only the targets: the
+        encodings must be identical to the mix=0 run, and solving
+        t_mix = (1-mix)*t0 + mix*z must recover z in {0, 1}. Both values
+        must appear (each viewer sees the opposite outcome), which is
+        what a corrupted `viewers` list would break."""
+        net = _net()
+        agent = _agent(net)
+        mix = 0.25
+        for seed in range(5):
+            e0, t0, _ = _gen_episode(
+                agent, net, MatchplayMode(3, outcome_mix=0.0), seed,
+            )
+            em, tm, _ = _gen_episode(
+                agent, net, MatchplayMode(3, outcome_mix=mix), seed,
+            )
+            assert np.array_equal(e0, em)
+            z = (tm.astype(np.float64) - (1 - mix) * t0.astype(np.float64)) / mix
+            assert np.all(np.abs(z - np.round(z)) < 1e-4)
+            assert set(np.round(z).astype(int)) == {0, 1}, (
+                "both viewer perspectives must be represented"
+            )
+
+    def test_boundary_triples_share_one_z(self, monkeypatch):
+        """All three copies of a boundary sample carry the same viewer,
+        so the blend must not split them."""
+        monkeypatch.setattr(VM, "_BOUNDARY_UPWEIGHT", 3)
+        net = _net()
+        agent = _agent(net)
+        mix = 0.25
+        for seed in range(4):
+            enc, tgt, _ = _gen_episode(
+                agent, net, MatchplayMode(3, outcome_mix=mix), seed,
+            )
+            # `_runs` requires the TARGETS to be equal too, so a blend
+            # that split a triple (wrong viewer on one copy) would turn
+            # every boundary triple into singletons.
+            assert any(l >= 3 for l in _runs(enc, tgt)), (
+                "boundary triples did not survive the outcome-mix blend"
+            )
+
+
+# ── 6. Crawford / post-Crawford / dead cube ─────────────────────────
 
 
 def _no_curriculum(monkeypatch):
     """Pin the episode's starting score (the curriculum would otherwise
     randomise it) in BOTH collectors."""
-    monkeypatch.setattr(VM, "_curriculum_start", lambda ims, rng, p: ims)
-    monkeypatch.setattr(T, "_curriculum_start", lambda ims, rng, p: ims)
+    monkeypatch.setattr(VM, "_curriculum_start", lambda ims, rng: ims)
+    monkeypatch.setattr(T, "_curriculum_start", lambda ims, rng: ims)
 
 
 class TestCrawfordAndDeadCube:
@@ -715,7 +765,7 @@ class TestCrawfordAndDeadCube:
         assert hits > 0
 
 
-# ── 6. forced pass ──────────────────────────────────────────────────
+# ── 7. forced pass ──────────────────────────────────────────────────
 
 
 def _dance_state():
@@ -824,7 +874,7 @@ class _ValueGen:
         return self._g.send(v)
 
 
-# ── 7. match chaining and match end ─────────────────────────────────
+# ── 8. match chaining and match end ─────────────────────────────────
 
 
 class TestMatchChaining:
@@ -877,7 +927,7 @@ class TestMatchChaining:
             assert len(calls) == 1
 
 
-# ── 8. the per-game ply guard ───────────────────────────────────────
+# ── 9. the per-game ply guard ───────────────────────────────────────
 
 
 class TestPlyGuard:
@@ -969,7 +1019,7 @@ class TestPlyGuard:
             assert np.array_equal(e0, e1) and np.array_equal(t0, t1)
 
 
-# ── 9. the worker: contract, lockstep, aliasing ────────────────────
+# ── 10. the worker: contract, lockstep, aliasing ────────────────────
 
 
 class TestWorker:
@@ -1100,7 +1150,7 @@ class TestWorker:
         assert not (a[1].shape == b[1].shape and np.array_equal(a[1], b[1]))
 
 
-# ── 10. CUDA availability / trainer wiring ──────────────────────────
+# ── 11. CUDA availability / trainer wiring ──────────────────────────
 
 
 class TestCuda:
@@ -1151,7 +1201,7 @@ class TestCuda:
         assert isinstance(losses, list)
 
 
-# ── 11. Regressions from the adversarial review ─────────────────────
+# ── 12. Regressions from the adversarial review ─────────────────────
 #
 # Every test below reproduces a CONFIRMED divergence found by review of
 # the first version of this collector. Each one fails on that version.

@@ -1,14 +1,17 @@
 """
-model.py -- Neural network for backgammon position evaluation.
+model.py -- Neural networks for backgammon position evaluation.
 
-Architecture:
-    Input:  configurable (default 196: perspective encoding, 98 my + 98 opponent)
-    Hidden: configurable (default [40], Tesauro used 40-80)
-    Output: 1 unit     (sigmoid -> P(on-roll player wins))
+Two feedforward nets over an encoder's feature vector (see encoding.py),
+with configurable hidden sizes and activation:
 
-Supports:
-    - Multiple hidden layers of arbitrary sizes
-    - Configurable activations: sigmoid, relu, tanh, leaky_relu
+  * TDNetwork: one output, either P(on-roll player wins) (sigmoid) or
+    money equity (linear), chosen by ``output_mode``.
+  * ProbNetwork: five outputs, P(win/wg/wbg/lg/lbg), for cubeless money
+    ("prob5"); ``prob5_to_equity`` reduces them to equity.
+
+Both save/load their own checkpoints (``load_model`` dispatches on the
+saved ``model_type``) and support function-preserving width and depth
+expansion.
 """
 
 import torch
@@ -34,31 +37,24 @@ def _get_activation_fn(name: str):
         raise ValueError(f"Unknown activation: {name}. Choose from: sigmoid, relu, tanh, leaky_relu, hardsigmoid")
 
 
-# Depth expansion appends a hidden layer initialised as ``I + eps*randn``
-# (function-preserving up to the eps symmetry-breaking term). `eps` is
-# REQUIRED -- no default. Measured cost of the old flat 0.01:
-#   prob5  +256   eps=0.01  -38.3 mEq [-42.2,-34.3];  eps=0.001  +1.4 (null)
-#   cubeful+256   eps=0.01  mean|d| 37.07 / max 164.9; eps=0.001  3.71 / 16.5
-# Equity damage is net-specific (a 1/sqrt(n) rule still cost 6.25 mEq on a
-# 128-wide tail), so choose eps per net and MEASURE the deviation on real
-# positions. suggested_depth_expand_eps() is a starting point only.
+# Depth expansion appends a hidden layer initialised as ``I + eps*randn``.
+# `eps` is REQUIRED (no default): choose it per net.
+# suggested_depth_expand_eps() is a starting point: 0.001 * sqrt(256).
 DEPTH_EXPAND_EPS_SCALE = 0.016
 
 
 def suggested_depth_expand_eps(new_layer_size: int) -> float:
-    """Starting point only: holds eps*sqrt(n) at the known-good
-    (n=256, eps=0.001) anchor. Measure the deviation before relying on it."""
+    """Starting point only: holds eps*sqrt(n) at the (n=256, eps=0.001)
+    anchor. Measure before relying on it."""
     return DEPTH_EXPAND_EPS_SCALE / (float(new_layer_size) ** 0.5)
 
 
 class TDNetwork(nn.Module):
-    """Feedforward network for backgammon value estimation.
+    """Single-output value network.
 
-    Supports two output modes:
-      - "probability": sigmoid → P(on-roll player wins) ∈ [0, 1]
-      - "equity": linear → expected payoff ∈ [-3, +3]
-
-    Supports multiple hidden layers and configurable activation functions.
+    output_mode:
+      - "probability": sigmoid -> P(on-roll player wins) in [0, 1]
+      - "equity": linear -> expected payoff in [-3, +3]
     """
 
     def __init__(
@@ -96,7 +92,7 @@ class TDNetwork(nn.Module):
         self.fc_output = nn.Linear(prev_size, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.  *x* can be a single 196-vector or a batch."""
+        """Forward pass. *x* is one feature vector or a batch."""
         if self._n_hidden == 1:
             h = self._activation_fn(self.hidden_layers[0](x))
         else:
@@ -126,13 +122,8 @@ class TDNetwork(nn.Module):
 
     @classmethod
     def load(cls, path: str, map_location="cpu") -> "TDNetwork":
-        """Load a saved model. Defaults to CPU to handle models saved on GPU.
-
-        `weights_only=True` because a checkpoint is a pickle and the False
-        setting executes whatever it contains -- fine for files you trained,
-        a code-execution hole for one you were sent. Everything these
-        checkpoints hold (build spec, state_dict, train_params) is plain
-        tensors and builtins, so nothing needs the unsafe loader.
+        """Load a saved model (to CPU by default, so GPU-saved files work).
+        `weights_only=True`: checkpoints hold only tensors and builtins.
         """
         checkpoint = torch.load(path, map_location=map_location, weights_only=True)
 
@@ -151,25 +142,13 @@ class TDNetwork(nn.Module):
 
     @classmethod
     def width_expand(cls, source: "TDNetwork", new_hidden_sizes: List[int]) -> "TDNetwork":
-        """Create a wider network initialized from a narrower one.
-
-        Inspired by Net2Net (Chen, Goodfellow & Shlens, 2015;
-        https://arxiv.org/abs/1511.05641). Same number of hidden layers;
-        each layer can have more (not fewer) units, so the old model is
-        embedded as a subgraph. Weights corresponding to the embedded
-        old model are copied exactly. Weights that are inputs to new
-        units get random Kaiming initialization (PyTorch default). All
-        other new weights (new units to old units, or final output
-        weights of new units) are zeroed. With no training the new
-        model behaves identically to the old.
+        """Wider network initialised from a narrower one (Net2Net-style,
+        https://arxiv.org/abs/1511.05641): same depth, no layer shrinks.
+        The function is unchanged at init: weights from new units into
+        old units and into the output are zeroed.
 
         Args:
-            source: The smaller trained network to expand from.
-            new_hidden_sizes: Hidden layer sizes for the new (wider) network.
-                Must have the same number of layers as source.
-
-        Returns:
-            A new TDNetwork with expanded width, preserving learned features.
+            new_hidden_sizes: same layer count as source, each >= old.
         """
         old_sizes = source.hidden_sizes
         if len(new_hidden_sizes) != len(old_sizes):
@@ -196,19 +175,15 @@ class TDNetwork(nn.Module):
                 zip(source.hidden_layers, expanded.hidden_layers)
             ):
                 old_out, old_in = old_layer.weight.shape
-                # Copy existing weights and biases
+                # Copy the old block. New units' rows keep their random init.
                 new_layer.weight[:old_out, :old_in] = old_layer.weight
                 new_layer.bias[:old_out] = old_layer.bias
-                # New input connections (rows beyond old_out) already Kaiming-init'd
-                # by nn.Linear default. Zero out isn't needed for input weights.
-                # But we need to handle the case where previous layer was also expanded:
                 if i > 0:
                     prev_old = old_sizes[i - 1]
-                    # New columns (connections from new units in previous layer)
-                    # should be zero for existing units to preserve function
+                    # Old units must not see the previous layer's new units.
                     new_layer.weight[:old_out, prev_old:] = 0.0
 
-            # Output layer: copy old weights, zero new connections
+            # Output layer: copy old weights, zero the new units' columns.
             old_out_w = source.fc_output.weight
             expanded.fc_output.weight[:, :old_sizes[-1]] = old_out_w
             expanded.fc_output.weight[:, old_sizes[-1]:] = 0.0
@@ -219,28 +194,16 @@ class TDNetwork(nn.Module):
 
     @classmethod
     def depth_expand(cls, source: "TDNetwork", new_layer_size: int = None, *, eps: float) -> "TDNetwork":
-        """Create a deeper network by appending one hidden layer, initialized as near-identity.
-
-        The new layer is inserted before the output layer and initialized as
-        ``I + ε·randn`` (identity plus small noise) so the network computes
-        almost exactly the same function as *source* at initialization.
-        Training then gradually activates the new layer's capacity.
-
-        Because ReLU(h) = h for h ≥ 0 (all hidden activations after a ReLU
-        layer are non-negative), the identity init gives exact function
-        preservation at init; the ε noise breaks weight symmetry so neurons
-        diversify during training.
+        """Deeper network: one hidden layer appended before the output,
+        initialised as ``I + eps*randn``. With ReLU the function is
+        preserved at init up to the eps term, which breaks weight
+        symmetry.
 
         Args:
-            source:          Trained network to deepen.
-            new_layer_size:  Size of the appended layer.  Must equal the last
-                             hidden size (required for square identity init).
-                             Defaults to ``source.hidden_sizes[-1]``.
-            eps:             REQUIRED, keyword-only; see the module-level
-                             note. 0.0 = exact copy but symmetric.
-
-        Returns:
-            A new TDNetwork with one additional hidden layer.
+            new_layer_size: must equal the last hidden size (square
+                identity). Defaults to ``source.hidden_sizes[-1]``.
+            eps: REQUIRED, keyword-only; see DEPTH_EXPAND_EPS_SCALE.
+                0.0 = exact copy but symmetric.
         """
         if new_layer_size is None:
             new_layer_size = source.hidden_sizes[-1]
@@ -265,28 +228,24 @@ class TDNetwork(nn.Module):
         )
 
         with torch.no_grad():
-            # Copy all existing hidden layers unchanged
+            # Copy the existing hidden layers unchanged.
             for src_layer, dst_layer in zip(source.hidden_layers, expanded.hidden_layers[:-1]):
                 dst_layer.weight.copy_(src_layer.weight)
                 dst_layer.bias.copy_(src_layer.bias)
 
-            # New last hidden layer: near-identity init, bias = 0
+            # New last hidden layer: identity + eps noise, bias 0.
             new_layer = expanded.hidden_layers[-1]
             if new_layer_size == last_size:
-                # Square case: I + ε·randn
                 nn.init.eye_(new_layer.weight)
             else:
-                # Non-square case: truncated identity (first new_layer_size rows
-                # of the last_size×last_size identity) + ε·randn
+                # Unreachable (sizes are checked equal above): truncated identity.
                 nn.init.zeros_(new_layer.weight)
                 for i in range(new_layer_size):
                     new_layer.weight[i, i] = 1.0
             new_layer.weight.add_(torch.randn_like(new_layer.weight) * eps)
             nn.init.zeros_(new_layer.bias)
 
-            # Output layer: copy first new_layer_size columns from source output weights
-            # (truncated identity maps unit i → unit i, so output weights are the same
-            # for the first new_layer_size units)
+            # Output layer: unit i still maps to unit i, so the weights carry over.
             expanded.fc_output.weight[:, :new_layer_size] = source.fc_output.weight[:, :new_layer_size]
             expanded.fc_output.bias.copy_(source.fc_output.bias)
 
@@ -303,25 +262,17 @@ _PROB5_EQUITY_WEIGHTS = torch.tensor([2.0, 1.0, 1.0, -1.0, -1.0])
 
 
 def prob5_to_equity(probs: torch.Tensor) -> torch.Tensor:
-    """Convert 5-output probability tensor to per-position money equity.
-
-    Inputs are in canonical order: P(win), P(wg), P(wbg), P(lg), P(lbg).
-    Accepts any leading shape; the last dim must be 5.
-    """
+    """Money equity from a ``(..., 5)`` tensor of P(win, wg, wbg, lg, lbg)."""
     w = _PROB5_EQUITY_WEIGHTS.to(device=probs.device, dtype=probs.dtype)
     return (probs * w).sum(dim=-1) - 1.0
 
 
 def prob5_postprocess(probs: torch.Tensor) -> torch.Tensor:
-    """Enforce nested-event inequalities on a ``(..., 5)`` prob tensor.
-
-    Post-hoc clamp of 5 independent sigmoids onto the valid joint:
+    """Clamp a ``(..., 5)`` prob tensor onto the nested-event constraints
+    (targets always satisfy them; the five sigmoids need not):
       P(wg)  <= P(win),       P(wbg) <= P(wg)
       P(lg)  <= 1 - P(win),   P(lbg) <= P(lg)
-
-    Targets always satisfy these; the model's outputs are nudged to as
-    well at inference time. Returns a fresh tensor — caller's input is
-    untouched.
+    Returns a new tensor.
     """
     p = probs.clone()
     p[..., 1] = torch.minimum(p[..., 0], p[..., 1])
@@ -335,18 +286,12 @@ def prob5_postprocess(probs: torch.Tensor) -> torch.Tensor:
 class ProbNetwork(nn.Module):
     """5-output probability network for cubeless money games.
 
-    Outputs (after sigmoid, from on-roll player's perspective):
-      0: P(win)
-      1: P(win gammon)
-      2: P(win backgammon)
-      3: P(lose gammon)
-      4: P(lose backgammon)
+    Outputs (after sigmoid, on-roll player's view): P(win), P(win
+    gammon), P(win backgammon), P(lose gammon), P(lose backgammon).
+    For equity / move selection apply :func:`prob5_postprocess` then
+    :func:`prob5_to_equity`.
 
-    For scalar equity / move selection, reduce via :func:`prob5_to_equity`
-    (apply :func:`prob5_postprocess` first at inference time).
-
-    ``raw_logits=True`` drops the final sigmoid; pair with BCEWithLogits
-    or MSE for stability when outputs saturate near 0/1.
+    ``raw_logits=True`` drops the sigmoid (for BCEWithLogits training).
     """
 
     NUM_OUTPUTS = 5
@@ -371,7 +316,7 @@ class ProbNetwork(nn.Module):
         self.activation = activation.lower()
         self.encoder_name = encoder_name
         self.raw_logits = bool(raw_logits)
-        # Set so TDAgent / play_models can dispatch without isinstance.
+        # Lets TDAgent / play_models dispatch without isinstance.
         self.output_mode = "prob5"
 
         act_cls = {
@@ -432,13 +377,13 @@ class ProbNetwork(nn.Module):
         net._train_params = ckpt.get("train_params", {})
         return net
 
-    # ── width / depth expansion (mirror TDNetwork semantics) ────────
+    # ── width / depth expansion (same semantics as TDNetwork) ───────
 
     @classmethod
     def width_expand(
         cls, source: "ProbNetwork", new_hidden_sizes: List[int],
     ) -> "ProbNetwork":
-        """Function-preserving Net2Net-style width expansion. Same depth."""
+        """Function-preserving width expansion; same depth."""
         if len(new_hidden_sizes) != len(source.hidden_sizes):
             raise ValueError(
                 f"Layer count mismatch: source has "
@@ -467,11 +412,9 @@ class ProbNetwork(nn.Module):
                 src_w = src_sd[wkey]
                 src_b = src_sd[bkey]
                 old_out, old_in = src_w.shape
-                # Copy the old block; leave the NEW units' input rows at their
-                # fresh Kaiming init (nonzero -> they get gradient and can
-                # learn). Zero ONLY the old units' new input columns so
-                # newly-added prior-layer units don't perturb the preserved
-                # function at init. (Mirrors TDNetwork.width_expand.)
+                # Copy the old block. New units' rows keep their random
+                # init. Old units must not see the previous layer's new
+                # units.
                 dst_w[:old_out, :old_in] = src_w
                 dst_w[:old_out, old_in:] = 0.0
                 dst_b[:old_out] = src_b
@@ -494,7 +437,8 @@ class ProbNetwork(nn.Module):
         *,
         eps: float,
     ) -> "ProbNetwork":
-        """Append one near-identity hidden layer before the output head."""
+        """Append one near-identity hidden layer before the head. See
+        TDNetwork.depth_expand."""
         last_size = source.hidden_sizes[-1]
         if new_layer_size is None:
             new_layer_size = last_size
@@ -522,7 +466,7 @@ class ProbNetwork(nn.Module):
                 bkey = f"trunk.{2 * i}.bias"
                 expanded.get_parameter(wkey).copy_(src_sd[wkey])
                 expanded.get_parameter(bkey).copy_(src_sd[bkey])
-            # New layer: truncated identity + small noise.
+            # New layer: identity + eps noise, bias 0.
             new_idx = len(source.hidden_sizes) * 2
             new_w = expanded.get_parameter(f"trunk.{new_idx}.weight")
             new_b = expanded.get_parameter(f"trunk.{new_idx}.bias")
@@ -531,7 +475,7 @@ class ProbNetwork(nn.Module):
                 new_w[i, i] = 1.0
             new_w.add_(torch.randn_like(new_w) * eps)
             new_b.zero_()
-            # Head: truncate source's columns to new_layer_size.
+            # Head: unit i still maps to unit i, so the weights carry over.
             expanded.get_parameter("head.weight").copy_(
                 src_sd["head.weight"][:, :new_layer_size]
             )
@@ -543,15 +487,13 @@ class ProbNetwork(nn.Module):
 
 
 def load_model(path: str, map_location: str = "cpu"):
-    """Load a checkpoint and return either :class:`TDNetwork` or
-    :class:`ProbNetwork` based on the saved ``model_type`` (legacy
-    files without that field load as ``TDNetwork``).
-    """
+    """Load a checkpoint as :class:`TDNetwork` or :class:`ProbNetwork`
+    by its saved ``model_type`` (absent = TDNetwork)."""
     ckpt = torch.load(path, map_location=map_location, weights_only=True)
     if ckpt.get("model_type") == "prob5":
         return ProbNetwork.load(path, map_location=map_location)
-    # Guard: a prob5-shaped checkpoint missing model_type must NOT silently
-    # load as a scalar TDNetwork (its 5-output head would be mis-read).
+    # A prob5-shaped checkpoint without model_type must not load as a
+    # scalar TDNetwork.
     sd = ckpt.get("state_dict", {})
     if "head.weight" in sd or ckpt.get("output_mode") == "prob5":
         raise ValueError(

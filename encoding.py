@@ -1,33 +1,18 @@
 """
 encoding.py -- Board state encoding for neural network input.
 
-Always encodes from the ON-ROLL PLAYER's perspective.  The network
-learns a single function: P(on-roll player wins | board).
+Always encoded from the ON-ROLL player's perspective: the on-roll
+player's checkers fill the "my" block [0-97], the opponent's the
+"opponent" block [98-195]. When BLACK is on roll the point indices
+are mirrored.
 
-When WHITE is on roll, WHITE's checkers go in the "my" block [0-97]
-and BLACK's in the "opponent" block [98-195], with normal point order.
+Layout (196 features), per block (98):
+    24 points x 4-unit thermometer   = 96
+    bar / 2.0                        =  1
+    off / 15.0                       =  1
 
-When BLACK is on roll, BLACK's checkers go in the "my" block [0-97]
-and WHITE's in the "opponent" block [98-195], with MIRRORED point
-indices (so "my home board" is always in the same feature positions).
-
-Layout (196 features):
-    MY block (98 features):
-        For each of 24 points: 4 units for on-roll player's checkers = 96
-        My bar / 2.0                                                  =  1
-        My off / 15.0                                                 =  1
-
-    OPPONENT block (98 features):
-        For each of 24 points: 4 units for opponent's checkers        = 96
-        Opponent bar / 2.0                                            =  1
-        Opponent off / 15.0                                           =  1
-
-    Total: 98 + 98 = 196
-
-Network output interpretation:
-    output = P(on-roll player wins)
-    P(WHITE wins) = output          when WHITE is on roll
-    P(WHITE wins) = 1 - output      when BLACK is on roll
+Network output is also from the on-roll player's view (win
+probability, equity, or prob5; see model.py).
 """
 
 from enum import IntEnum
@@ -37,14 +22,10 @@ from backgammon_engine import BoardState, WHITE, BLACK
 
 
 # ── Feature layout constants ─────────────────────────────────────────
-#
-# Index arithmetic for the 196-feature perspective encoding.
-# "MY" block = on-roll player's checkers; "OPP" block = opponent's.
 
 FEATURES_PER_POINT = 4
 NUM_POINTS = 24
 
-MY_BLOCK_OFFSET = 0
 MY_POINT_FEATURES = NUM_POINTS * FEATURES_PER_POINT  # 96
 MY_BAR_INDEX = MY_POINT_FEATURES                      # 96
 MY_OFF_INDEX = MY_POINT_FEATURES + 1                  # 97
@@ -59,9 +40,8 @@ OPP_BLOCK_SIZE = OPP_POINT_FEATURES + 2              # 98
 BAR_SCALE = 0.5       # bar count divided by 2
 OFF_SCALE = 1.0 / 15  # off count divided by 15
 
-# Terminal detection: when OPP_OFF_INDEX feature ≥ 1.0 (off/15 = 15/15),
-# the opponent has borne off all checkers → the mover of the ENCODED
-# successor has won.
+# Terminal test on encoded successors: OPP off feature >= 1.0 means
+# the opponent (of the encoded on-roll player) has borne off all 15.
 TERMINAL_OFF_THRESHOLD = 1.0 - 1e-6
 
 
@@ -102,11 +82,7 @@ class Encoder:
 
 
 class Perspective196Encoder(Encoder):
-    """196-feature perspective encoding (4-unit thermometer per point).
-
-    Encodes from the on-roll player's perspective.  BLACK's board is
-    mirrored so that "my home board" is always in the same positions.
-    """
+    """196-feature perspective encoding (see module docstring)."""
 
     @property
     def num_features(self) -> int:
@@ -121,7 +97,7 @@ class Perspective196Encoder(Encoder):
         pts = state.points
 
         if state.turn == WHITE:
-            # MY block: WHITE's checkers at normal indices
+            # Normal indices.
             for idx in range(NUM_POINTS):
                 v = pts[idx]
                 if v > 0:
@@ -129,7 +105,6 @@ class Perspective196Encoder(Encoder):
             x[MY_BAR_INDEX] = state.bar[WHITE] * BAR_SCALE
             x[MY_OFF_INDEX] = state.off[WHITE] * OFF_SCALE
 
-            # OPPONENT block: BLACK's checkers at normal indices
             for idx in range(NUM_POINTS):
                 v = pts[idx]
                 if v < 0:
@@ -137,8 +112,8 @@ class Perspective196Encoder(Encoder):
             x[OPP_BAR_INDEX] = state.bar[BLACK] * BAR_SCALE
             x[OPP_OFF_INDEX] = state.off[BLACK] * OFF_SCALE
 
-        else:  # BLACK on roll
-            # MY block: BLACK's checkers at mirrored indices
+        else:
+            # BLACK on roll: mirrored indices.
             for idx in range(NUM_POINTS):
                 v = pts[idx]
                 if v < 0:
@@ -146,7 +121,6 @@ class Perspective196Encoder(Encoder):
             x[MY_BAR_INDEX] = state.bar[BLACK] * BAR_SCALE
             x[MY_OFF_INDEX] = state.off[BLACK] * OFF_SCALE
 
-            # OPPONENT block: WHITE's checkers at mirrored indices
             for idx in range(NUM_POINTS):
                 v = pts[idx]
                 if v > 0:
@@ -158,21 +132,13 @@ class Perspective196Encoder(Encoder):
 
 
 CUBE_FEATURES = 4  # 3-hot cube perspective + 1 is_cube_action bit
-CUBE_TAKE_FEATURES = 5  # CUBE_FEATURES + 1 is_cube_take_decision bit
 
 
 class CubefulEncoder(Encoder):
-    """Wraps a base encoder, appending cube state features.
-
-    Features appended (4 total):
-      [cube_centered, cube_mine, cube_theirs]  3  (one-hot)
-      is_cube_action                         1  (binary)
-
-    Cube perspective is the on-roll player's view (CENTERED / MINE /
-    THEIRS), produced by `cube_perspective()` in modes.py from the
-    absolute CubeOwner. is_cube_action=1 at the cube decision
-    point (before doubling/not-doubling), 0 at the checker decision
-    point.
+    """Base encoder plus 4 cube features: one-hot
+    [centered, mine, theirs] (on-roll player's view, from
+    `modes.cube_perspective()`) and is_cube_action (1 at the cube
+    decision, 0 at the checker decision).
     """
 
     def __init__(self, base_encoder_name: str = "perspective196"):
@@ -184,8 +150,13 @@ class CubefulEncoder(Encoder):
         return f"cubeful_{self.base_name}"
 
     @property
+    def cube_features(self) -> int:
+        """Cube columns appended after the base features."""
+        return CUBE_FEATURES
+
+    @property
     def num_features(self) -> int:
-        return self._base.num_features + CUBE_FEATURES
+        return self._base.num_features + self.cube_features
 
     def encode(
         self, state: BoardState, cube_state: CubePerspective,
@@ -199,10 +170,8 @@ class CubefulEncoder(Encoder):
         self, base_features: np.ndarray, cube_state: CubePerspective,
         is_cube_action: bool = False,
     ) -> np.ndarray:
-        """Append cube features to a precomputed base-encoder array.
-        Lets callers reuse a fast (e.g. C) base encoding without
-        re-running the Python base encoder.
-        """
+        """Append cube features to a precomputed base encoding (e.g.
+        from the C encoder)."""
         x = np.empty(self.num_features, dtype=np.float32)
         n = base_features.shape[0]
         x[:n] = base_features
@@ -210,71 +179,6 @@ class CubefulEncoder(Encoder):
         x[n + int(cube_state)] = 1.0
         if is_cube_action:
             x[n + 3] = 1.0
-        return x
-
-
-class CubefulTakeEncoder(CubefulEncoder):
-    """Cubeful encoder with an explicit take-decision flag.
-
-    Inherits from CubefulEncoder so `isinstance(_, CubefulEncoder)` checks
-    treat instances of this class as cubeful. Adds one binary feature
-    `is_cube_take_decision` to distinguish the responder's take/pass
-    decision state from the doubler's offer state and from the
-    chequer-play state.
-
-    Features appended (5 total):
-      [cube_centered, cube_mine, cube_theirs]  3  (one-hot)
-      is_cube_action                         1  (binary)
-      is_cube_take_decision                  1  (binary)
-
-    First 4 cube features (indices [n, n+3]) match CubefulEncoder
-    bit-for-bit when `is_cube_take_decision=False`, so a CubefulEncoder
-    checkpoint can be warm-started into this one by extending the
-    input projection by a single zero-initialized column for the new
-    bit (handled by the warm-start utility).
-
-    States:
-      (is_cube_action=0, is_cube_take_decision=0): checker decision
-      (is_cube_action=1, is_cube_take_decision=0): doubler's offer
-      (is_cube_action=0, is_cube_take_decision=1): responder's take/pass
-
-    The (1, 1) combination is unused.
-    """
-
-    @property
-    def name(self) -> str:
-        return f"cubeful_take_{self.base_name}"
-
-    @property
-    def num_features(self) -> int:
-        return self._base.num_features + CUBE_TAKE_FEATURES
-
-    def encode(
-        self, state: BoardState, cube_state: CubePerspective,
-        is_cube_action: bool = False,
-        is_cube_take_decision: bool = False,
-    ) -> np.ndarray:
-        return self.encode_with_base(
-            self._base.encode(state), cube_state,
-            is_cube_action, is_cube_take_decision,
-        )
-
-    def encode_with_base(
-        self, base_features: np.ndarray, cube_state: CubePerspective,
-        is_cube_action: bool = False,
-        is_cube_take_decision: bool = False,
-    ) -> np.ndarray:
-        assert not (is_cube_action and is_cube_take_decision), \
-            "is_cube_action and is_cube_take_decision are mutually exclusive"
-        x = np.empty(self.num_features, dtype=np.float32)
-        n = base_features.shape[0]
-        x[:n] = base_features
-        x[n:] = 0.0
-        x[n + int(cube_state)] = 1.0
-        if is_cube_action:
-            x[n + 3] = 1.0
-        if is_cube_take_decision:
-            x[n + 4] = 1.0
         return x
 
 
@@ -371,11 +275,15 @@ class MatchplayEncoder(Encoder):
 class MatchplayCube1HEncoder(MatchplayEncoder):
     """MatchplayEncoder variant with the cube VALUE one-hot encoded.
 
-    A raw-scalar cube_value lets learned values alias across cube
-    states (v_nd == v_dt at positions whose true values differ by
-    0.1+ MWC); one-hot slots give each cube level its own column.
-    Cube values are always powers of two; slot 3 absorbs >= 8 (cube 8
-    is already dead at any score it can occur at in short matches).
+    The raw-scalar cube_value feature lets the trunk underweight cube
+    context: the same board under cube 1 / 2 / 4 maps to nearly
+    identical activations, and learned values alias across cube
+    states (diagnosed via train_from_position.py: v_nd == v_dt at
+    positions where their true values differ by 0.1+ MWC). One-hot
+    slots give each cube level its own input column so gradients can
+    decouple them. Cube values are always powers of two; slot 3
+    absorbs >= 8 (cube 8 is already dead at any score it can occur
+    at in short matches).
 
     Features appended (11 total):
       [cube_centered, cube_mine, cube_theirs]   3  (one-hot)
@@ -438,12 +346,17 @@ class MatchplayCube1H64Encoder(MatchplayCube1HEncoder):
     """Long-match variant of the 1-hot encoder, sized for matches up
     to 64 points (nobody plays longer than 50).
 
-    Away scores are ONE-HOT (64 slots per side): a new away level is
-    a fresh input column, so bumping match length never forces
-    extrapolation or disturbs lower aways. Cube one-hot widened to 7
-    slots (1/2/4/8/16/32/>=64; the old >=8 bucket aliased cube 8 vs
-    16). post_crawford is explicit — derivable, but a discrete
-    strategy regime (mandatory trailer double, free drop).
+    Away scores are ONE-HOT (64 slots per side) instead of raw
+    scalars: a new away level is a fresh input column rather than an
+    out-of-distribution scalar value, so bumping match length never
+    forces linear extrapolation and never disturbs the learned
+    meaning of lower aways. The cube one-hot is widened to 7 slots
+    (1/2/4/8/16/32/>=64) -- the old >=8 bucket aliased cube 8 vs 16,
+    which are genuinely different states once someone is more than
+    8-away. post_crawford is exposed as an explicit input; it is
+    derivable ((someone 1-away) and not crawford) but sits on a
+    discrete strategy regime (mandatory trailer double, free drop)
+    that should not have to be inferred through a scalar threshold.
 
     Extras layout (141): persp 0-2 | is_cube_action 3 | cube 4-10 |
     my_away 11-74 | opp_away 75-138 | crawford 139 | post_crawford 140.
@@ -528,6 +441,142 @@ class Matchplay1H64METEncoder(MatchplayCube1H64Encoder):
         return np.concatenate([base, block - np.float32(0.5)])
 
 
+class Matchplay1H64MET6Encoder(Matchplay1H64METEncoder):
+    """Matchplay1H64METEncoder with the MET block widened 13 -> 17.
+
+    met4 without its two exact duplicates. met4 appended all six 4x-cube
+    prices, but x4_win_n and x4_lose_n price 4C, which dt_win_g and
+    dt_lose_g already price -- the block is a function of POINTS STAKED,
+    not cube level, so a gammon at 2C and a single at 4C are the same
+    lookup. Identical over all 1,694 reachable (away, away, crawford,
+    cube) states at 11pt; the 19-wide met4 block is rank 13 and this
+    17-wide one is rank 13, so nothing is lost.
+
+    Kept: the 8C and 12C prices, win and lose. The 12C pair is constant
+    at 11pt (a backgammon at 4x cube is 12+ points, which always decides
+    an 11-point match) but becomes informative at longer match lengths.
+
+    The first 350 columns are bit-identical to matchplay1h64met, so a
+    350-input net expands by zero-padding with exact function
+    preservation (surgery_1h64met6.py). 141 + 17 = 158 extras; 354
+    inputs over perspective196."""
+
+    @property
+    def name(self) -> str:
+        return f"matchplay1h64met6_{self.base_name}"
+
+    @property
+    def num_features(self) -> int:
+        from met import N_MET6_FEATURES
+        if not hasattr(self, "_nf6"):
+            self._nf6 = (self._base.num_features + MATCHPLAY_1H64_FEATURES
+                         + N_MET6_FEATURES)
+        return self._nf6
+
+    def match_extras(
+        self, cube_state: CubePerspective, cube_value: int,
+        my_away: int, opp_away: int, is_crawford: bool,
+        is_cube_action: bool = False,
+    ) -> np.ndarray:
+        base = MatchplayCube1H64Encoder.match_extras(
+            self, cube_state, cube_value, my_away, opp_away, is_crawford,
+            is_cube_action,
+        )
+        crawford_done = (my_away == 1 or opp_away == 1)
+        block = self.met.outcome_block_x6(
+            my_away, opp_away, crawford_done, is_crawford, cube_value,
+        )
+        return np.concatenate([base, block - np.float32(0.5)])
+
+
+class Matchplay1H64MET4Encoder(Matchplay1H64METEncoder):
+    """Matchplay1H64METEncoder with the MET block widened 13 -> 19.
+
+    Adds the six MWC-after prices at 4 x the current cube (win/lose x
+    normal/gammon/backgammon), the level a double-and-recube reaches.
+    The first 350 columns are bit-identical to matchplay1h64met, so a
+    350-input net expands by zero-padding with exact function
+    preservation (surgery_1h64met4.py). 141 + 19 = 160 extras; 356
+    inputs over perspective196."""
+
+    @property
+    def name(self) -> str:
+        return f"matchplay1h64met4_{self.base_name}"
+
+    @property
+    def num_features(self) -> int:
+        from met import N_MET4_FEATURES
+        if not hasattr(self, "_nf8"):
+            self._nf8 = (self._base.num_features + MATCHPLAY_1H64_FEATURES
+                         + N_MET4_FEATURES)
+        return self._nf8
+
+    def match_extras(
+        self, cube_state: CubePerspective, cube_value: int,
+        my_away: int, opp_away: int, is_crawford: bool,
+        is_cube_action: bool = False,
+    ) -> np.ndarray:
+        # Grandparent, not super(): we replace the 13-wide MET block
+        # rather than appending to it.
+        base = MatchplayCube1H64Encoder.match_extras(
+            self, cube_state, cube_value, my_away, opp_away, is_crawford,
+            is_cube_action,
+        )
+        crawford_done = (my_away == 1 or opp_away == 1)
+        block = self.met.outcome_block_x4(
+            my_away, opp_away, crawford_done, is_crawford, cube_value,
+        )
+        return np.concatenate([base, block - np.float32(0.5)])
+
+
+class Matchplay1H64MET5Encoder(Matchplay1H64MET4Encoder):
+    """Matchplay1H64MET4Encoder minus the dead lose_bg column: 355 inputs.
+
+    MEASURED, over all 568 reachable (my_away, opp_away, crawford, cube)
+    states at 11pt: the two backgammon prices at 4x cube are CONSTANT --
+    win_bg is +0.5 and lose_bg is -0.5 in every single state, std exactly
+    0.000000. At 4x cube a backgammon is 12+ points, which always decides
+    an 11-point match, so the MWC pins at 1.0 / 0.0 and never moves. The
+    pair is rank 1 and carries no information at this match length (the
+    19-wide block has rank 17, not 19).
+
+    They are not harmless. A constant input yields a constant gradient,
+    so its weight ramps LINEARLY and never plateaus -- measured 0.099 per
+    1M episodes across 3.4M episodes of 0-ply, with the two dead columns
+    carrying the LARGEST weight of all six new ones, and still growing
+    while the informative columns shrank. The net was spending them as
+    extra bias.
+
+    One copy is kept rather than both: at longer match lengths 12 points
+    stops being decisive, the two columns separate, and the slot becomes
+    real information. Dropping the LAST column keeps indices 0..354
+    aligned with met4, so met4 -> met5 is a plain truncation and
+    met -> met5 stays a zero-padded append (surgery_1h64met5.py).
+    """
+
+    @property
+    def name(self) -> str:
+        return f"matchplay1h64met5_{self.base_name}"
+
+    @property
+    def num_features(self) -> int:
+        if not hasattr(self, "_nf5"):
+            self._nf5 = super().num_features - 1
+        return self._nf5
+
+    def match_extras(
+        self, cube_state: CubePerspective, cube_value: int,
+        my_away: int, opp_away: int, is_crawford: bool,
+        is_cube_action: bool = False,
+    ) -> np.ndarray:
+        # Drop the trailing lose_bg price; everything before it is
+        # bit-identical to met4.
+        return super().match_extras(
+            cube_state, cube_value, my_away, opp_away, is_crawford,
+            is_cube_action,
+        )[:-1]
+
+
 class MatchplayMETEncoder(MatchplayCube1HEncoder):
     """MatchplayCube1HEncoder plus the match-equity consequences of
     every cube branch, read from a real MET.
@@ -539,9 +588,13 @@ class MatchplayMETEncoder(MatchplayCube1HEncoder):
       [double-drop] MWC after collecting cube_value points 1
 
     Motivation: MWC factorises as sum_outcome P(outcome) x
-    MWC_after(outcome); the second factor is a pure score/cube
-    function that these columns supply directly instead of making the
-    MLP derive it.
+    MWC_after(outcome). The first factor is a board function, the
+    second a pure score/cube function — and an MLP approximates
+    products badly. The net already receives everything needed to
+    *derive* the second factor (away scores, cube one-hot, crawford),
+    so these columns add no information; they make the price of each
+    outcome directly available instead of recoverable, which is what
+    a gammon-pricing decision actually multiplies against.
 
     Values are centred (mwc - 0.5) so a neutral score contributes
     zero. Expect heavy saturation in short matches: at 3 points with
@@ -600,15 +653,10 @@ ENCODERS = {
 
 
 def get_encoder(name: str) -> Encoder:
-    """Look up an encoder by name and return a new instance.
-
-    Special prefixes:
-      `cubeful_<base>`      → CubefulEncoder over the named base.
-      `cubeful_take_<base>` → CubefulTakeEncoder over the named base
-                              (adds is_cube_take_decision flag).
-      `matchplay_<base>`    → MatchplayEncoder over the named base
-                              (cube + away scores + crawford).
-    """
+    """New encoder instance by name; `cubeful_<base>` wraps the base
+    in a `CubefulEncoder`, `matchplay_<base>` (and the matchplay1h_,
+    matchplay1h64_, matchplay1h64met*_, matchplaymet_ variants) in the
+    matching match-play encoder."""
     if name.startswith("matchplaymet_"):
         base_name = name[len("matchplaymet_"):]
         if base_name not in ENCODERS:
@@ -617,6 +665,30 @@ def get_encoder(name: str) -> Encoder:
                 f"Available: {sorted(ENCODERS)}"
             )
         return MatchplayMETEncoder(base_name)
+    if name.startswith("matchplay1h64met5_"):
+        base_name = name[len("matchplay1h64met5_"):]
+        if base_name not in ENCODERS:
+            raise ValueError(
+                f"Unknown base encoder: {base_name!r}. "
+                f"Available: {sorted(ENCODERS)}"
+            )
+        return Matchplay1H64MET5Encoder(base_name)
+    if name.startswith("matchplay1h64met6_"):
+        base_name = name[len("matchplay1h64met6_"):]
+        if base_name not in ENCODERS:
+            raise ValueError(
+                f"Unknown base encoder: {base_name!r}. "
+                f"Available: {sorted(ENCODERS)}"
+            )
+        return Matchplay1H64MET6Encoder(base_name)
+    if name.startswith("matchplay1h64met4_"):
+        base_name = name[len("matchplay1h64met4_"):]
+        if base_name not in ENCODERS:
+            raise ValueError(
+                f"Unknown base encoder: {base_name!r}. "
+                f"Available: {sorted(ENCODERS)}"
+            )
+        return Matchplay1H64MET4Encoder(base_name)
     if name.startswith("matchplay1h64met_"):
         base_name = name[len("matchplay1h64met_"):]
         if base_name not in ENCODERS:
@@ -649,14 +721,6 @@ def get_encoder(name: str) -> Encoder:
                 f"Available: {sorted(ENCODERS)}"
             )
         return MatchplayEncoder(base_name)
-    if name.startswith("cubeful_take_"):
-        base_name = name[len("cubeful_take_"):]
-        if base_name not in ENCODERS:
-            raise ValueError(
-                f"Unknown base encoder: {base_name!r}. "
-                f"Available: {sorted(ENCODERS)}"
-            )
-        return CubefulTakeEncoder(base_name)
     if name.startswith("cubeful_"):
         base_name = name[len("cubeful_"):]
         if base_name not in ENCODERS:
@@ -672,7 +736,7 @@ def get_encoder(name: str) -> Encoder:
     return ENCODERS[name]()
 
 
-# ── Module-level backward-compatible API ─────────────────────────────────────
+# ── Module-level API (default encoder) ───────────────────────────────────────
 
 _default_encoder = Perspective196Encoder()
 
@@ -680,8 +744,5 @@ NUM_FEATURES = _default_encoder.num_features  # 196
 
 
 def encode_state(state: BoardState) -> np.ndarray:
-    """Encode a board state from the on-roll player's perspective.
-
-    Delegates to the default Perspective196Encoder.
-    """
+    """Default (Perspective196) encoding of a board state."""
     return _default_encoder.encode(state)

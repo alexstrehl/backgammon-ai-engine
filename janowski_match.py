@@ -11,8 +11,9 @@ policy, no score awareness) into a full N-point MATCH player:
     instrument for debugging the learned cubeful match player.
 
 The cubeless->cubeful MWC conversion is a faithful port of gnubg
-1.08.003 (verified against gnubg's own printed probabilities to
-5.7e-7 -- tests/test_janowski_match_gnubg.py):
+1.08.003 -- the de-facto standard all three engines surveyed implement
+(gnubg natively; Open Sage ports the same `GetPoints` recursion; Hedgehog
+is money-only):
 
     eval.c:   Cl2CfMatchCentered / Cl2CfMatchOwned /
               Cl2CfMatchUnavailable  (piecewise-live + dead, blended
@@ -67,12 +68,34 @@ The x (cube-life index) policy is shared with the money layer
 (janowski.cube_x): gnubg's shallow-ply class constants -- contact
 0.76, race clamp(0.60 + 0.0025 * roller_pips, 0.60, 0.80) -- or a
 fixed override.
+
+C paths (c_api/README.md "p5jan / Janowski match play"). This module is
+the reference; two opt-ins move work into C without changing a decision
+beyond near-ties:
+  * the net forward only: BG_FAST_FORWARD=<backend> at construction (or
+    `agent._fast_ff = FastForward(net, backend)`): c_api/fast_forward.py
+    runs the prob5 forward, the conversion and every decision rule stay
+    here (~80% of a decision).
+  * the whole decision: `agent.enable_fast_decisions(backend)` --
+    offer_double, respond_to_double, choose_checker_action_cubeful and
+    value_oneply run in a c_api match engine on the prob5 net
+    (BGC_KIND_MATCH_JANOWSKI: c_api/puretd_janowski.c ports cubeful_mwc /
+    get_points / dead_mwc / do_cubeful / cube_decision / cube_x operation
+    for operation, bitwise this module's given the same probabilities;
+    puretd_match.c's evaluator seam reuses the TD match core's move
+    generation, batches and memos). Bitwise the net-only path on the same
+    backend's plain forward, within ~4e-7 of the torch path on the
+    production simd forward (tests/test_janowski_c.py).
+    eval_matchplay.py selects it for a p5jan side with --fast-forward /
+    `p5jan:ff-<backend>:`; `p5jan:ffnet-<backend>:` keeps the net-only path.
+    The constructor never enables it (the trainer's p5jan oracle keeps its
+    path).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -414,6 +437,38 @@ class JanowskiMatchAgent(Agent):
         self.x_policy = None if x_policy is None else float(x_policy)
         self.encoder = get_encoder(network.encoder_name)
         self._fast = _HAS_FAST and network.encoder_name == "perspective196"
+        # c_api forward backend (BG_FAST_FORWARD, see c_api/fast_forward.py);
+        # None keeps the torch forward.
+        self._fast_ff = None
+        from c_api.fast_forward import FastForward, backend_from_env, supports
+        _ff_backend = backend_from_env()
+        if _ff_backend is not None and device == "cpu" and supports(self.network):
+            self._fast_ff = FastForward(self.network, _ff_backend)
+        # C decisions (enable_fast_decisions); None: the Python methods.
+        self._fast_dec = None
+
+    def enable_fast_decisions(self, backend: Optional[str]) -> None:
+        """Run this agent's decisions in C on a c_api backend (None: back
+        to Python): offer_double, respond_to_double,
+        choose_checker_action_cubeful and value_oneply go through a
+        BGC_KIND_MATCH_JANOWSKI engine on this agent's net, MET and x
+        policy -- the prob5 forward, the conversion and the selection in
+        one C call. CPU only. The engine holds a copy of the weights,
+        re-opened when the net's parameters change in place (tensor
+        version counters, as FastForward) or the MET / x policy is
+        replaced. Independent of the net-only `_fast_ff`, which keeps
+        serving what stays in Python (_probs_state,
+        choose_checker_action_oneply's 0-ply pass)."""
+        if backend is None:
+            self._fast_dec = None
+            return
+        from c_api.fast_forward import supports
+        if self.device != "cpu":
+            raise ValueError("C decisions run on the CPU (device='cpu')")
+        if not supports(self.network):
+            raise ValueError(f"C decisions: {type(self.network).__name__} is not a "
+                             "plain ProbNetwork forward")
+        self._fast_dec = _CDecisions(self, backend)
 
     # ── net plumbing ────────────────────────────────────────────────
 
@@ -441,6 +496,11 @@ class JanowskiMatchAgent(Agent):
                         out = torch.sigmoid(out)
                     out = prob5_postprocess(out)
                 return out.numpy().astype(np.float64)
+        if self._fast_ff is not None:
+            # The backend's prob5 output is sigmoid(raw) = the branch below.
+            with torch.no_grad():
+                out = prob5_postprocess(torch.from_numpy(self._fast_ff(feats)))
+            return out.numpy().astype(np.float64)
         t = torch.from_numpy(feats)
         if self.device != "cpu":
             t = t.to(self.device)
@@ -469,6 +529,11 @@ class JanowskiMatchAgent(Agent):
         player = state.turn
         if not match_state.can_offer(player):
             return CubeOffer(should_double=False, _cache=None)
+        if self._fast_dec is not None:
+            dbl, c = self._fast_dec.engine().match_offer(state, match_state)
+            return CubeOffer(should_double=dbl,
+                             _cache={"v_nd": c.v_nd, "v_dt": c.v_dt,
+                                     "v_dp": c.v_dp})
         probs = self._probs_state(state)
         d = cube_decision(probs, match_state, player,
                           self._x(state), self.met)
@@ -488,6 +553,10 @@ class JanowskiMatchAgent(Agent):
         if hint is not None and hint._cache and "v_dt" in hint._cache:
             return hint._cache["v_dp"] > hint._cache["v_dt"]
         doubler = state.turn
+        if (self._fast_dec is not None
+                and match_state.can_offer(doubler)):     # else C has no triple
+            _, c = self._fast_dec.engine().match_offer(state, match_state)
+            return c.v_dp > c.v_dt
         probs = self._probs_state(state)
         d = cube_decision(probs, match_state, doubler,
                           self._x(state), self.met)
@@ -502,6 +571,10 @@ class JanowskiMatchAgent(Agent):
         successors of the mover's cubeful MWC. Returns
         (next_state, None) or None on a forced pass."""
         from modes import cube_perspective
+        if self._fast_dec is not None:
+            idx, nxt, _ = self._fast_dec.engine().match_best_move(
+                state, dice, match_state)
+            return None if idx < 0 else (nxt, None)
         mover = state.turn
         opponent = 1 - mover
 
@@ -549,8 +622,13 @@ class JanowskiMatchAgent(Agent):
     def choose_checker_action_oneply(self, state: BoardState, dice,
                                      match_state, topk: int = 0):
         """1-ply move selection with this agent's own evaluator: score each
-        successor by value_oneply and take the mover's best. Teacher-side
-        1-ply acting; --oracle-plies 1 distils this policy's values.
+        successor by value_oneply and take the mover's best. The mirror of
+        TDAgent's oneply_moves on the teacher side.
+
+        Exists to SIZE the teacher. --oracle-plies 1 distils this policy's
+        values, so how much headroom distillation has depends on how much
+        stronger this actually is than the 0-ply teacher -- which had been
+        assumed rather than measured.
 
         `topk` > 0 re-prices only the K best successors by the cheap 0-ply
         read (same cheap-filters-expensive cascade as --oracle-1ply-eps).
@@ -605,6 +683,8 @@ class JanowskiMatchAgent(Agent):
         opponent on roll). One batched net forward covers every
         non-terminal successor of every dice.
         """
+        if self._fast_dec is not None:
+            return self._fast_dec.engine().match_value_1ply(state, match_state)
         from backgammon_engine import switch_turn
         from modes import cube_perspective
         mover = state.turn
@@ -681,3 +761,36 @@ class JanowskiMatchAgent(Agent):
                 v = floor_v
             total += prob * v
         return float(total)
+
+
+class _CDecisions:
+    """The C engine behind JanowskiMatchAgent.enable_fast_decisions: a
+    c_api.puretd_py.Engine(net, backend, janowski=True) with the agent's
+    MET and x policy, re-opened when any of the three changes."""
+
+    def __init__(self, agent: JanowskiMatchAgent, backend: str):
+        from c_api import puretd_py
+        puretd_py.ensure_lib(backend)    # built on demand (missing / stale ABI), as the C collector
+        self._P = puretd_py
+        self.agent = agent
+        self.backend = backend
+        self._open()
+
+    def _version(self):
+        return sum(p._version for p in self._params)
+
+    def _open(self):
+        a = self.agent
+        self._params = list(a.network.parameters())
+        self._ver = self._version()
+        eng = self._P.Engine(a.network, self.backend, janowski=True)
+        eng.set_met(a.met)
+        eng.set_jan_x(a.x_policy)
+        self._eng, self._met, self._x = eng, a.met, a.x_policy
+
+    def engine(self):
+        a = self.agent
+        if (self._version() != self._ver or a.met is not self._met
+                or a.x_policy != self._x):
+            self._open()
+        return self._eng

@@ -2,14 +2,20 @@
 gnubg_eval.py -- Evaluate backgammon self-play games using GNU Backgammon.
 
 Workflow:
-    1. Play evaluation self-play games (with the model, or random agents).
+    1. Play evaluation games with the model (self-play or vs random).
     2. Record dice rolls and moves for each game.
     3. Export the games as .mat files (Jellyfish format that gnubg imports).
     4. Run gnubg once in batch mode to analyze all games.
     5. Parse the mEMG error rates from gnubg's output.
 
-The mEMG (millipoints Error per Move in Equivalent Money Game) is a
+The mEMG (millipoints Error per Move in Equivalent Money Game) is the
 standard metric used by the backgammon community to measure play quality.
+Lower is better:
+    mEMG < 3    : world class
+    mEMG 3-5    : expert
+    mEMG 5-8    : advanced
+    mEMG 8-12   : intermediate
+    mEMG > 12   : beginner
 
 Platform support:
     Set GNUBG_CMD to the path of your gnubg CLI executable.
@@ -21,23 +27,20 @@ Usage:
     python gnubg_eval.py --model td_model_final.pt --games 10
 """
 
+import math
 import multiprocessing as mp
 import os
 import platform
 import random
 import subprocess
-import sys
-import time as _time
 import tempfile
-import hashlib
 import re
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 
-from agents import RandomAgent
 from backgammon_engine import (
-    WHITE, BLACK, BAR, OFF,
-    Play, Move, get_legal_plays, switch_turn, opening_roll,
+    BoardState, WHITE, BLACK, BAR, OFF,
+    Play, Move, get_legal_plays, switch_turn, opening_roll, _apply_move,
 )
 
 # ── Platform configuration ───────────────────────────────────────────────────
@@ -59,135 +62,6 @@ if platform.system() == "Windows":
             break
 else:
     GNUBG_CMD = "/usr/games/gnubg"
-
-# GNUBG_CMD overrides the platform default, so a non-standard gnubg path
-# works for the whole pipeline (self-play + analysis).
-GNUBG_CMD = os.environ.get("GNUBG_CMD", GNUBG_CMD)
-
-
-# ── Judge preflight: pinned version/weights + bearoff database ───────────────
-
-_BEAROFF_OK: dict = {}
-_VERSION_OK: dict = {}
-
-# Every published row is judged by this exact binary + net. A different
-# version (older Debian/Ubuntu packages are 1.06) or a different gnubg.wd
-# (gnubg >= 1.08 ships retrained nets) produces non-comparable numbers
-# while everything appears to work.
-GNUBG_REQUIRED_VERSION = "1.08.003"
-GNUBG_REQUIRED_WEIGHTS_MD5 = "14184acc9c60ef67be0fad88548fd51a"
-
-
-def _gnubg_version(cmd: str):
-    """Version string of the binary at `cmd`, or None if it will not run."""
-    try:
-        out = subprocess.run([cmd, "--version"], capture_output=True,
-                             text=True, timeout=30).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    m = re.search(r"GNU Backgammon\s+(\S+)", out or "")
-    return m.group(1) if m else None
-
-
-def _gnubg_weights_md5(cmd: str):
-    """md5 of the gnubg.wd the binary at `cmd` will load, or None.
-
-    gnubg will not report its pkgdatadir, so derive it the standard
-    autotools way (<prefix>/bin/gnubg -> <prefix>/share/gnubg/gnubg.wd).
-    None (file absent / non-standard layout) degrades to the version
-    check alone rather than refusing to run."""
-    prefix = os.path.dirname(os.path.dirname(os.path.realpath(cmd)))
-    wd = os.path.join(prefix, "share", "gnubg", "gnubg.wd")
-    if not os.path.isfile(wd):
-        return None
-    h = hashlib.md5()
-    with open(wd, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _assert_gnubg_pinned_judge(cmd: str) -> None:
-    """Refuse to run on a gnubg other than the pinned version + weights.
-
-    A wrong binary passes every other preflight (it exists, it runs, it
-    may even have the bearoff DBs) and then produces silently different
-    equities. GNUBG_ALLOW_VERSION_MISMATCH=1 opts out deliberately."""
-    if cmd in _VERSION_OK:
-        return
-    if os.environ.get("GNUBG_ALLOW_VERSION_MISMATCH") == "1":
-        _VERSION_OK[cmd] = True
-        return
-    v = _gnubg_version(cmd)
-    if v != GNUBG_REQUIRED_VERSION:
-        raise RuntimeError(
-            f"gnubg at '{cmd}' is version {v!r}, but results are pinned to "
-            f"{GNUBG_REQUIRED_VERSION}. Package-manager versions vary "
-            f"(recent Debian/Ubuntu ship 1.08.003, older ship 1.06) -- "
-            f"install or build 1.08.003 and set GNUBG_CMD, or set "
-            f"GNUBG_ALLOW_VERSION_MISMATCH=1 to run on a different gnubg "
-            f"ON PURPOSE (results will not be comparable)."
-        )
-    w = _gnubg_weights_md5(cmd)
-    if w is None:
-        # Non-autotools layout: the weights pin cannot be checked. The
-        # pin is the point of this preflight, so refuse rather than fail
-        # open on the version check alone.
-        raise RuntimeError(
-            f"cannot locate gnubg.wd for '{cmd}' (expected "
-            f"<prefix>/share/gnubg/gnubg.wd), so the weights pin "
-            f"{GNUBG_REQUIRED_WEIGHTS_MD5} cannot be verified. Set "
-            f"GNUBG_ALLOW_VERSION_MISMATCH=1 to run unverified ON PURPOSE."
-        )
-    if w != GNUBG_REQUIRED_WEIGHTS_MD5:
-        raise RuntimeError(
-            f"gnubg.wd for '{cmd}' has md5 {w}, but results are pinned to "
-            f"{GNUBG_REQUIRED_WEIGHTS_MD5} (gnubg >= 1.08 ships retrained "
-            f"nets, so the version alone does not pin the judge). Set "
-            f"GNUBG_ALLOW_VERSION_MISMATCH=1 to override ON PURPOSE."
-        )
-    _VERSION_OK[cmd] = True
-
-
-def assert_gnubg_bearoff(gnubg_cmd: str = None) -> None:
-    """Refuse to run unless gnubg has its TWO-SIDED bearoff database
-    (gnubg_ts0.bd). Without it gnubg silently substitutes a net estimate
-    for exact cubeful bearoff equities -- wrong cube play, fabricated cube
-    errors when judging -- and the only signal is a startup warning that
-    the launch sites discard. Install location varies (Debian:
-    /var/lib/gnubg/), so ask gnubg itself; cached per binary (~0.2s once).
-    GNUBG_ALLOW_ONESIDED_BEAROFF=1 opts out deliberately."""
-    cmd = gnubg_cmd or GNUBG_CMD
-    if cmd in _BEAROFF_OK:
-        return
-    _assert_gnubg_pinned_judge(cmd)
-    if os.environ.get("GNUBG_ALLOW_ONESIDED_BEAROFF") == "1":
-        _BEAROFF_OK[cmd] = True
-        return
-    try:
-        out = subprocess.run(
-            [cmd, "-t", "-q", "-c", os.devnull],
-            capture_output=True, text=True, timeout=120,
-            env=dict(os.environ, LC_ALL="C"),
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        raise RuntimeError(f"cannot probe gnubg at '{cmd}': {e}")
-    blob = (out.stdout or "") + (out.stderr or "")
-    if "will not use the two-sided bearoff" in blob:
-        raise RuntimeError(
-            "gnubg at '%s' is MISSING its two-sided bearoff database "
-            "(gnubg_ts0.bd).\n"
-            "Cubeful bearoff equities would fall back to a net estimate, so "
-            "this host's results are NOT comparable with a correctly "
-            "configured one.\n"
-            "Fix: reinstall gnubg, or copy gnubg_ts0.bd (md5 "
-            "44b6040b49b46cb9dd2ce8caa947044d) into the directory holding "
-            "gnubg.wd, or regenerate it with "
-            "`makebearoff -t 6x6 -f gnubg_ts0.bd`.\n"
-            "To run one-sided ON PURPOSE set GNUBG_ALLOW_ONESIDED_BEAROFF=1."
-            % cmd
-        )
-    _BEAROFF_OK[cmd] = True
 
 
 # ── Game recording ───────────────────────────────────────────────────────────
@@ -220,79 +94,21 @@ class GameRecord:
     ended_by_drop: bool = False    # True if game ended on a drop
 
 
-def assert_cubeful_supported(model_path: str, cubeful: bool) -> None:
-    """Reject prob5 + cubeful early (in the parent, before workers spawn).
-
-    Raising inside a multiprocessing pool worker surfaces as an opaque
-    pool exception (or a hang); callers validate once up front instead.
-    """
-    if not cubeful:
-        return
-    from model import load_model, ProbNetwork
-    if isinstance(load_model(model_path), ProbNetwork):
-        raise ValueError(
-            f"{model_path}: prob5 is cubeless-only and has no cube policy; "
-            "cubeful gnubg analysis is not supported.")
-
-
-def _load_eval_agent(model_path: str, oneply: bool = False, cubeful: bool = False):
-    """Load a checkpoint and wrap it in the right agent for analysis:
-    prob5 -> ProbAgent (cubeless money only), scalar -> TDAgent."""
-    from model import load_model, ProbNetwork
-    net = load_model(model_path)
-    if isinstance(net, ProbNetwork):
-        if cubeful:  # backstop; parent should validate before spawning workers
-            raise ValueError(
-                f"{model_path}: prob5 is cubeless-only and has no cube policy; "
-                "cubeful gnubg analysis is not supported.")
-        from prob_agent import ProbAgent
-        return ProbAgent(net, plies=1 if oneply else 0)
-    from td_agent import TDAgent
-    return TDAgent(net, oneply=oneply)
-
-
-def _avg_rates(rates):
-    """Split a list of (white, black) error-rate tuples into per-side
-    lists plus the combined mean. Returns (white_list, black_list, mean)
-    where mean is None when there are no rates."""
-    w = [er[0] for er in rates]
-    b = [er[1] for er in rates]
-    a = w + b
-    return w, b, sum(a) / len(a) if a else None
-
-
 def play_and_record(agent_white, agent_black) -> GameRecord:
     """Play a full cubeless game, recording every dice roll and move.
 
     Both agents should implement choose_checker_action(state, dice, plays).
     """
-    # Standard opening: each player rolls one die, higher goes first, and
-    # doublets are rerolled (a game cannot start with a doublet).
-    state, opening_dice = opening_roll()
+    state = BoardState.initial()
     record = GameRecord()
-    first_roll = True
 
     while not state.is_game_over():
-        if first_roll:
-            d1, d2 = opening_dice
-            first_roll = False
-        else:
-            d1, d2 = random.randint(1, 6), random.randint(1, 6)
+        d1, d2 = random.randint(1, 6), random.randint(1, 6)
         plays = get_legal_plays(state, (d1, d2))
 
         if plays:
             agent = agent_white if state.turn == WHITE else agent_black
             play, next_state = agent.choose_checker_action(state, (d1, d2), plays)
-            if play is None:
-                # Some agents (e.g. gnubg-ext) return only the successor;
-                # recover the move by matching it among the legal plays
-                # (as play_and_record_cubeful does) so export_mat can
-                # render it — otherwise the .mat has dice but blank moves
-                # and the gnubg judge scores 0 error.
-                for _p, _s in plays:
-                    if _s == next_state:
-                        play = _p
-                        break
             record.moves.append(MoveRecord(
                 player=state.turn,
                 dice=(d1, d2),
@@ -328,12 +144,8 @@ def play_and_record_cubeful(
     matching Play object is the dominant remaining cost in cubeful
     self-play). Use False for stat-only runs (the cube actions and
     final result are still recorded so stake computation works).
-
-    The cube is intentionally UNCAPPED — redouble/take loops are left to
-    run to completion (the +/-128 capped equity handles the statistics;
-    runaway games are logged in full for inspection, not truncated).
     """
-    from modes import MatchState, CubeOwner  # local
+    from modes import MatchState, CubeOwner, cube_perspective  # local
 
     state, opening_dice = opening_roll()
     record = GameRecord()
@@ -420,30 +232,48 @@ def play_and_record_cubeful(
 
 # ── .mat export (Jellyfish format) ───────────────────────────────────────────
 
-def _move_notation(move: Move, player: int) -> str:
-    """Convert a single (src, dst) move to gnubg .mat notation.
+def _move_notation(move: Move, player: int, hit: bool = False) -> str:
+    """Convert a single (src, dst) move to Jellyfish .mat notation.
 
-    gnubg convention: bar = point 25, bear-off = point 0.
-    White's notation uses points 1-24 (our index + 1).
-    Black's notation mirrors: our index i -> Black's point (24 - i).
+    Jellyfish / gnubg-export convention: `bar/22`, `6/off`, a hit is
+    `13/7*`. White's notation uses points 1-24 (our index + 1);
+    Black's mirrors: our index i -> Black's point (24 - i). (gnubg also
+    reads the older `25/22` / `6/0` spelling this used to write; XG's
+    importer does not.)
     """
     src, dst = move
 
     if player == WHITE:
-        src_str = "25" if src == BAR else str(src + 1)
-        dst_str = "0" if dst == OFF else str(dst + 1)
+        src_str = "bar" if src == BAR else str(src + 1)
+        dst_str = "off" if dst == OFF else str(dst + 1)
     else:
-        src_str = "25" if src == BAR else str(24 - src)
-        dst_str = "0" if dst == OFF else str(24 - dst)
+        src_str = "bar" if src == BAR else str(24 - src)
+        dst_str = "off" if dst == OFF else str(24 - dst)
 
-    return f"{src_str}/{dst_str}"
+    return f"{src_str}/{dst_str}{'*' if hit else ''}"
 
 
-def _play_notation(play: Play, player: int) -> str:
-    """Convert a full play to notation string, e.g. '8/5 6/5'."""
-    if not play:
-        return ""
-    return " ".join(_move_notation(m, player) for m in play)
+def _play_notation(play: Play, player: int,
+                   state: Optional[BoardState] = None):
+    """Notation of a full play, e.g. '8/5 6/5*'.
+
+    With `state` (the position before the play, any `turn`), hits are
+    marked and `(notation, state after the play)` is returned; without
+    it, the plain notation string (no hit marks)."""
+    if state is None:
+        return " ".join(_move_notation(m, player) for m in play)
+    parts = []
+    for m in play:
+        dst = m[1]
+        # A lone opposing checker on dst (BoardState.checker_count inlined:
+        # WHITE checkers are positive, BLACK negative).
+        v = state.points[dst] if dst != OFF else 0
+        hit = dst != OFF and v == (1 if (1 - player) == WHITE else -1)
+        parts.append(_move_notation(m, player, hit))
+        st = state.copy()
+        st.turn = player
+        state = _apply_move(st, m)
+    return " ".join(parts), state
 
 
 def _dice_str(dice: Tuple[int, int]) -> str:
@@ -451,20 +281,8 @@ def _dice_str(dice: Tuple[int, int]) -> str:
     return f"{dice[0]}{dice[1]}"
 
 
-# .mat play-row layout: "%3d)" + space, then the white field padded to
-# _MAT_W_WIDTH, then black. XG reads the winner off the column its token sits
-# in, so the winner line must use these same offsets.
-_MAT_W_WIDTH = 33
-_MAT_COL_W = 5
-_MAT_COL_B = _MAT_COL_W + _MAT_W_WIDTH
-
-# A roll with no legal play, written as "DD:" with nothing after it.
-_FORCED_PASS = re.compile(r"^\s*[1-6][1-6]:\s*$")
-
-
 def export_mat(
     record: GameRecord, game_id: int = 1, money_game: bool = False,
-    white: str = "white", black: str = "black",
 ) -> str:
     """Export a GameRecord to Jellyfish .mat format string.
 
@@ -475,27 +293,15 @@ def export_mat(
     interleaved into the appropriate columns following gnubg's
     left-to-right reading order. `money_game=True` writes a "0 point
     match" header (= money game).
-
-    `white` / `black` name the players; XG shows them as profile names.
     """
     lines = []
 
-    # Money games need the XG rules block: without it XG assumes Beavers
-    # and misreads the cube sequence. Jacoby "On" matches the jacoby=True
-    # money path; match exports skip the block.
-    if money_game:
-        lines.append('; [Jacoby "On"]')
-        lines.append('; [Beaver "Off"]')
-        lines.append('; [CubeLimit "1024"]')
-        lines.append('; [Unrated "On"]')
-
+    # Header
     lines.append("")
     lines.append(" 0 point match" if money_game else " 1 point match")
     lines.append("")
     lines.append(f" Game {game_id}")
-    # XG surfaces these as the profile names in a stats export, so naming them
-    # after the engine/checkpoint makes an export self-identifying.
-    lines.append(f" {white} : 0                      {black} : 0")
+    lines.append(" white : 0                      black : 0")
 
     # Rows are [left_col, right_col] (left=WHITE, right=BLACK).
     rows: List[List[str]] = []
@@ -506,33 +312,7 @@ def export_mat(
 
     w_next = 0  # next row index where WHITE can write to the left col
     b_next = 0  # next row index where BLACK can write to the right col
-
-    def _clear_of_cube(row: int, other_col: int) -> int:
-        """First row at or after `row` whose `other_col` holds no cube token.
-
-        The mirror of _clear_of_pass: that one keeps a cube action off a row
-        whose other column is already a forced pass, but a forced pass written
-        LATER could still land beside a cube token, which is the same
-        ambiguity from the other direction.
-        """
-        while row < len(rows) and rows[row][other_col].strip().startswith(
-                ("Doubles", "Takes", "Drops")):
-            row += 1
-        _ensure_row(row)
-        return row
-
-    def _clear_of_pass(row: int, other_col: int) -> int:
-        """First row at or after `row` whose `other_col` is not a forced pass.
-
-        A cube token sharing a row with a bare "DD:" (roll, no legal play) is
-        where XG has been observed to lose the cube: it reported a 2-point win
-        for a game the record scores at 8 (cube 4, gammon). Giving the cube
-        action its own row removes the ambiguity.
-        """
-        while row < len(rows) and _FORCED_PASS.match(rows[row][other_col]):
-            row += 1
-        _ensure_row(row)
-        return row
+    board = BoardState.initial()   # replayed for the hit marks
 
     i = 0
     entries = record.moves
@@ -550,8 +330,8 @@ def export_mat(
 
             if entry.player == WHITE:
                 # WHITE doubles (left col) + response (right col) on SAME row.
-                _ensure_row(w_next)
-                row = _clear_of_pass(w_next, 1)
+                row = w_next
+                _ensure_row(row)
                 rows[row][0] = dbl_str
                 rows[row][1] = resp_str
                 w_next = row + 1
@@ -559,31 +339,29 @@ def export_mat(
             else:
                 # BLACK doubles: double on right col of current row, response
                 # on left col of NEXT row (gnubg reads left-to-right).
-                _ensure_row(b_next)
-                row = _clear_of_pass(b_next, 0)
+                row = b_next
+                _ensure_row(row)
                 rows[row][1] = dbl_str
                 b_next = row + 1
-                resp_row = _clear_of_pass(max(w_next, b_next), 1)
+                resp_row = max(w_next, b_next)
+                _ensure_row(resp_row)
                 rows[resp_row][0] = resp_str
                 w_next = resp_row + 1
                 b_next = max(b_next, resp_row)
 
         elif isinstance(entry, MoveRecord):
-            notation = _play_notation(entry.play, entry.player)
+            notation, board = _play_notation(entry.play, entry.player, board)
             dice = _dice_str(entry.dice)
             s = f"{dice}: {notation}" if notation else f"{dice}: "
 
-            forced_pass = not notation
             if entry.player == WHITE:
                 _ensure_row(w_next)
-                row = _clear_of_cube(w_next, 1) if forced_pass else w_next
-                rows[row][0] = s
-                w_next = row + 1
+                rows[w_next][0] = s
+                w_next += 1
             else:
                 _ensure_row(b_next)
-                row = _clear_of_cube(b_next, 0) if forced_pass else b_next
-                rows[row][1] = s
-                b_next = row + 1
+                rows[b_next][1] = s
+                b_next += 1
                 w_next = max(w_next, b_next)
 
         i += 1
@@ -605,34 +383,29 @@ def export_mat(
     point_word = "point" if points == 1 else "points"
     wins_str = f"Wins {points} {point_word}"
 
-    # For drops, place the "Wins" text alongside the drop marker in the same
-    # row so gnubg reads it correctly -- but ONLY in the WINNER's column. The
-    # winner of a dropped double is the DOUBLER, not the dropper, so appending
-    # it to whichever column happens to hold " Drops" silently credits the game
-    # to the loser -- readers take the winner from the column the token sits
-    # in. When the winner's column on the last row is already taken
-    # (white doubled there), fall back to a separate winner-column line.
+    # "Wins N points" goes in the WINNER's column: on the drop row when
+    # the winner's cell there is free (BLACK doubled, WHITE dropped on
+    # the next row), else on a line of its own. (An earlier version
+    # appended it to BLACK's cell on a WHITE double / BLACK drop,
+    # crediting the dropper with the game: XG then mis-scored the match.)
     winner_col = 0 if winner == WHITE else 1
-    drop_wins_separate = False
-    if record.ended_by_drop and rows:
-        last = rows[-1]
-        if not last[winner_col]:
-            last[winner_col] = wins_str
-        else:
-            drop_wins_separate = True
+    placed = False
+    if record.ended_by_drop and rows and not rows[-1][winner_col]:
+        rows[-1][winner_col] = f" {wins_str}"
+        placed = True
 
     for idx, (w, b) in enumerate(rows):
         num = f"{idx + 1:>3d})"
         if b:
-            lines.append(f"{num} {w:<{_MAT_W_WIDTH}s}{b}")
+            lines.append(f"{num} {w:<33s}{b}")
         else:
             lines.append(f"{num} {w}")
 
-    # Same columns as the play rows above, so a standalone winner line sits in
-    # the same column as that player's moves.
-    if not record.ended_by_drop or drop_wins_separate:
-        pad = _MAT_COL_B if winner == BLACK else _MAT_COL_W
-        lines.append(" " * pad + wins_str)
+    if not placed:
+        if winner == BLACK:
+            lines.append(f"                                  {wins_str}")
+        else:
+            lines.append(f"      {wins_str}")
     lines.append("")
 
     return "\n".join(lines)
@@ -640,35 +413,20 @@ def export_mat(
 
 # ── gnubg analysis ───────────────────────────────────────────────────────────
 
-def _write_gnubg_script(mat_files: List[str], script_path: str, plies: int = 3,
-                        extra_commands: Optional[List[str]] = None):
+def _write_gnubg_script(mat_files: List[str], script_path: str, plies: int = 3):
     """Write a Python script for gnubg's embedded interpreter.
 
     The script imports each .mat file, analyzes it, and prints statistics.
-    We look for mEMG in the output. ``extra_commands`` are issued first
-    (e.g. "set threads 1").
+    We look for mEMG in the output.
     """
-    lines = ["import gnubg", ""]
-    for c in extra_commands or []:
-        lines.append(f"gnubg.command('{c}')")
-    lines += [
+    lines = [
+        "import gnubg",
+        "",
         f"# {plies}-ply analysis for both chequer and cube decisions",
         f"gnubg.command('set analysis chequerplay evaluation plies {plies}')",
+        f"gnubg.command('set analysis cubedecision evaluation plies {plies}')",
+        "",
     ]
-    # Cubeless-money scoring: gnubg's default chequer eval is CUBEFUL, which
-    # scores moves by cube-leveraged equity. Set GNUBG_CUBELESS_EVAL=1 to score
-    # by static cubeless money equity (gammons/backgammons count, no cube) —
-    # the objective our cubeless models train on. IMPORTANT: gnubg still scores
-    # MISSED doubles in a 0-point session even when no cube action occurred, so
-    # cube analysis must be turned OFF too — otherwise the never-doubling cubeless
-    # agents rack up huge phantom cube errors and 'overall' becomes ~85% artifact
-    # (it is NOT chequer+cube of real play). With cube off, overall == chequer.
-    if os.environ.get("GNUBG_CUBELESS_EVAL") == "1":
-        lines.append("gnubg.command('set analysis chequerplay evaluation cubeful off')")
-        lines.append("gnubg.command('set analysis cube off')")
-    else:
-        lines.append(f"gnubg.command('set analysis cubedecision evaluation plies {plies}')")
-    lines.append("")
 
     for mat_file in mat_files:
         # Normalize path separators for the platform
@@ -688,30 +446,20 @@ def run_gnubg_analysis(
     gnubg_cmd: Optional[str] = None,
     verbose: bool = True,
     plies: int = 3,
-    extra_commands: Optional[List[str]] = None,
-) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]],
-           List[Tuple[float, float]]]:
+) -> List[Tuple[float, float]]:
     """Run gnubg in batch mode on a list of .mat files.
 
-    Returns (chequer_rates, cube_rates, overall_rates), where each is a
-    list of (white_mEMG, black_mEMG) tuples, one per game.
+    Returns a list of (white_mEMG, black_mEMG) tuples, one per game.
     mEMG = millipoints Error per Move in Equivalent Money Game.
     """
     if gnubg_cmd is None:
         gnubg_cmd = GNUBG_CMD
 
-    # Every analysis path funnels through here, so this is the choke point
-    # that guarantees no result is ever produced by a gnubg missing its
-    # two-sided bearoff database. Cached per binary, so the probe costs one
-    # ~0.2 s gnubg start per worker process, not per chunk.
-    assert_gnubg_bearoff(gnubg_cmd)
-
     # Use absolute paths so gnubg can find everything regardless of cwd.
     abs_work_dir = os.path.abspath(work_dir)
     abs_mat_files = [os.path.abspath(f) for f in mat_files]
     script_path = os.path.join(abs_work_dir, "_gnubg_analyze.py")
-    _write_gnubg_script(abs_mat_files, script_path, plies=plies,
-                        extra_commands=extra_commands)
+    _write_gnubg_script(abs_mat_files, script_path, plies=plies)
 
     # Run gnubg with:
     #   -t : text-only (no GUI)
@@ -723,42 +471,26 @@ def run_gnubg_analysis(
         print(f"  gnubg command: {' '.join(cmd)}")
         print(f"  working dir:   {work_dir}")
 
-    # No timeout: dropping slow games would bias mEMG against long/complex
-    # games — every game must be scored; a hang here means a code bug,
-    # which we want surfaced, not silently skipped.
-    # Instead, chunks slower than a reference budget are LOGGED with
-    # elapsed time + per-game move counts so we can tell
-    # "long game" (many moves) from "stuck gnubg" (few moves, huge time).
-    slow_after = 120 + len(mat_files) * 60 * (4 ** max(0, plies - 2))
-    _t0 = _time.monotonic()
+    # Scale timeout with number of games. 3-ply analysis is much slower
+    # per game than 2-ply (~30s/game vs ~3s/game), so bump generously.
+    timeout_secs = 120 + len(mat_files) * 60
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
+            timeout=timeout_secs,
         )
     except FileNotFoundError:
         raise FileNotFoundError(
             f"gnubg not found at '{gnubg_cmd}'. "
             f"Install gnubg or set GNUBG_CMD in gnubg_eval.py."
         )
-    _elapsed = _time.monotonic() - _t0
-    if _elapsed > slow_after:
-        _det = []
-        for _mf in mat_files:
-            try:
-                with open(_mf) as _fh:
-                    _txt = _fh.read()
-                # count half-moves: lines like " 12) 63: 24/18 13/10 ..."
-                _nmoves = sum(_ln.count(":") for _ln in _txt.splitlines()
-                              if _ln.strip()[:1].isdigit() and ")" in _ln)
-            except OSError:
-                _nmoves = -1
-            _det.append(f"{os.path.basename(_mf)}={_nmoves}mv")
-        print(f"  [slow-chunk] {int(_elapsed)}s (budget ref {int(slow_after)}s) "
-              f"plies={plies} games={len(mat_files)} moves: {' '.join(_det)} "
-              f"-- high move count => genuinely long game; low count + huge "
-              f"time => investigate for a bug", flush=True)
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(
+            f"gnubg timed out after {timeout_secs}s analyzing "
+            f"{len(mat_files)} games."
+        )
 
     # Dump raw output for debugging
     output = result.stdout + result.stderr
@@ -770,87 +502,37 @@ def run_gnubg_analysis(
                 print(f"  {line.rstrip()}")
         print("  --- end mEMG lines ---")
 
-    # Parse section-by-section. Per game, gnubg's `show statistics match`
-    # prints three blocks in order -- "Chequerplay statistics", "Cube
-    # statistics", "Overall statistics" -- each containing exactly one
-    # "Error rate ... mEMG ..." line with a (white, black) pair. We key each
-    # error line off the section header that precedes it rather than grouping
-    # positionally in 3s.
+    # Parse mEMG lines from output.
     #
-    # Why not positional 3-grouping: a game in which a player has 0 unforced
-    # moves (a very short game) prints "n/a" for the chequer error rate, so the
-    # value-regex matches nothing on that line and the game emits only 2 parsed
-    # error lines instead of 3. Positional grouping would then drop one line and
-    # misalign EVERY subsequent game, scattering a few large junk values into
-    # the wrong component (observed: a 1-point/DMP match has no cube decisions,
-    # so overall must equal chequer, yet ~5/1000 games disagreed by 20-44 mEMG).
-    # Section keying buckets each game's components correctly; a game missing any
-    # component (e.g. chequer = n/a) is dropped whole so the series stay aligned.
+    # Per game, gnubg prints 3 "Error rate mEMG" lines (all with both players):
+    #   1) Chequer play:  Error rate mEMG (MWC)  -201.4  (-10.069%)  -183.1  (-9.153%)
+    #   2) Cube decisions: Error rate mEMG (MWC)   -0.0  ( -0.000%)    -0.0  (-0.000%)
+    #   3) Overall total: Error rate mEMG (MWC)  -201.4  (-10.069%)  -183.1  (-9.153%)
     #
-    # Header spelling varies by gnubg version: older builds print "Chequerplay
-    # statistics", gnubg 1.08 prints "Checkerplay statistics". Match both.
-    # Numbers may carry an exponent (gnubg's degenerate rates, e.g. -1.0e+32).
-    # Without the exponent alternative the regex would backtrack and match "32"
-    # out of "e+32" — a plausible value that sneaks past the CAP filter.
-    val_re = re.compile(r"([-+]?\d+\.?\d*(?:[eE][-+]?\d+)?)"
-                        r"\s*\(\s*[-+]?\d+\.\d+(?:[eE][-+]?\d+)?%?\s*\)")
-    games = []          # list of {"chequer","cube","overall"} dicts
-    cur = None
-    section = None
+    # Since we play without the doubling cube, lines 2 and 3 are redundant.
+    # We collect all 3, then take every 3rd (the overall) per game.
+    all_error_lines = []
+
     for line in output.splitlines():
-        if "Chequerplay statistics" in line or "Checkerplay statistics" in line:
-            if cur is not None:
-                games.append(cur)
-            cur = {}
-            section = "chequer"
-            continue
-        if "Cube statistics" in line:
-            section = "cube"
-            continue
-        if "Overall statistics" in line:
-            section = "overall"
-            continue
-        if cur is None or section is None:
-            continue
         if "mEMG" not in line or "Error rate" not in line:
             continue
-        if section in cur:        # take the first error-rate line per section
-            continue
-        # Match-play (MWC): "-201.4 (-10.069%)" -> 201.4; Cubeful money
-        # (Points): "-4.0 ( -0.008)" -> 4.0. "n/a" yields no match -> None.
-        m = val_re.findall(line)
-        cur[section] = (abs(float(m[0])), abs(float(m[1]))) if len(m) >= 2 else None
-    if cur is not None:
-        games.append(cur)
 
-    # Drop degenerate or incomplete games: gnubg occasionally emits an absurd
-    # MWC error rate (e.g. 1e32) when a near-perfect player has ~0 marked
-    # decisions and normalization divides by ~0; and a game missing any
-    # component (n/a) cannot be averaged. Real mEMG is at most a few hundred.
-    CAP = 1.0e4
-    # With GNUBG_CUBELESS_EVAL=1 the script issues 'set analysis cube off', so
-    # gnubg prints NO Cube statistics section at all — a missing cube component
-    # is expected (zero cube error), not an incomplete game to drop.
-    cubeless = os.environ.get("GNUBG_CUBELESS_EVAL") == "1"
-    chequer_rates, cube_rates, overall_rates = [], [], []
-    dropped = 0
-    for g in games:
-        chk, cub, ovr = g.get("chequer"), g.get("cube"), g.get("overall")
-        if cubeless and cub is None:
-            cub = (0.0, 0.0)
-        if chk is None or cub is None or ovr is None:
-            dropped += 1
-            continue
-        vals = [chk[0], chk[1], cub[0], cub[1], ovr[0], ovr[1]]
-        if any((v != v) or v > CAP for v in vals):  # v!=v catches NaN; inf>CAP
-            dropped += 1
-            continue
-        chequer_rates.append(chk)
-        cube_rates.append(cub)
-        overall_rates.append(ovr)
-    if dropped:
-        print(f"  WARNING: dropped {dropped}/{len(games)} game(s) with degenerate "
-              f"or incomplete gnubg mEMG (>{CAP:g}, non-finite, or n/a)", flush=True)
+        # Extract the two mEMG values: the numbers immediately
+        # BEFORE each parenthesized companion value.
+        # Match-play (MWC) format: "-201.4   (-10.069%)" -> 201.4
+        # Cubeful money (Points) format: "-4.0   ( -0.008)" -> 4.0
+        mEMG_values = re.findall(
+            r"([-+]?\d+\.?\d*)\s*\(\s*[-+]?\d+\.\d+%?\s*\)", line
+        )
+        if len(mEMG_values) >= 2:
+            white_err = abs(float(mEMG_values[0]))
+            black_err = abs(float(mEMG_values[1]))
+            all_error_lines.append((white_err, black_err))
+
+    # Per game: index 0,3,6,... = chequer; 1,4,7,... = cube; 2,5,8,... = overall
+    chequer_rates = [all_error_lines[i] for i in range(0, len(all_error_lines), 3)]
+    cube_rates = [all_error_lines[i] for i in range(1, len(all_error_lines), 3)]
+    overall_rates = [all_error_lines[i] for i in range(2, len(all_error_lines), 3)]
 
     return chequer_rates, cube_rates, overall_rates
 
@@ -863,11 +545,11 @@ def _play_games_worker(args):
     model_path, num_games, work_dir, start_idx, cubeful, jacoby, oneply = args
 
     os.environ["OMP_NUM_THREADS"] = "1"
-    # model_path is None => random self-play baseline (the --random path).
-    agent = (
-        RandomAgent() if model_path is None
-        else _load_eval_agent(model_path, oneply=oneply, cubeful=cubeful)
-    )
+    from model import TDNetwork
+    from td_agent import TDAgent
+
+    net = TDNetwork.load(model_path)
+    agent = TDAgent(net, oneply=oneply)
 
     mat_files = []
     for i in range(num_games):
@@ -898,6 +580,127 @@ def _gnubg_worker(args):
 
 # ── High-level evaluation ────────────────────────────────────────────────────
 
+def evaluate_with_gnubg(
+    agent_white,
+    agent_black,
+    num_games: int = 10,
+    gnubg_cmd: Optional[str] = None,
+    work_dir: Optional[str] = None,
+    keep_files: bool = False,
+    verbose: bool = True,
+    cubeful: bool = False,
+    jacoby: bool = True,
+) -> dict:
+    """Play games, export to .mat, analyze with gnubg, return error rates.
+
+    Args:
+        agent_white:  Agent playing WHITE.
+        agent_black:  Agent playing BLACK.
+        num_games:    Number of evaluation games to play.
+        gnubg_cmd:    Path to gnubg executable (None = use default).
+        work_dir:     Directory for temporary .mat files (None = auto).
+        keep_files:   If True, don't delete .mat files after analysis.
+        verbose:      Print progress.
+
+    Returns:
+        dict with keys:
+            'white_mEMG':  list of per-game mEMG for white
+            'black_mEMG':  list of per-game mEMG for black
+            'avg_mEMG':    overall average mEMG across both players
+            'num_games':   number of games analyzed
+    """
+    # Create work directory
+    if work_dir is None:
+        work_dir = tempfile.mkdtemp(prefix="gnubg_eval_")
+    os.makedirs(work_dir, exist_ok=True)
+
+    if verbose:
+        print(f"Playing {num_games} evaluation games...")
+
+    # Play and record games
+    records = []
+    mat_files = []
+    for i in range(num_games):
+        if cubeful:
+            record = play_and_record_cubeful(
+                agent_white, agent_black, jacoby=jacoby,
+            )
+        else:
+            record = play_and_record(agent_white, agent_black)
+        records.append(record)
+
+        # Export to .mat
+        mat_content = export_mat(record, game_id=i + 1, money_game=cubeful)
+        mat_path = os.path.join(work_dir, f"game_{i+1}.mat")
+        with open(mat_path, "w") as f:
+            f.write(mat_content)
+        mat_files.append(mat_path)
+
+        if verbose and (i + 1) % max(1, num_games // 5) == 0:
+            print(f"  Recorded game {i+1}/{num_games}")
+
+    if verbose:
+        print(f"Exported {num_games} .mat files to {work_dir}")
+        print("Running gnubg analysis...")
+
+    # Run gnubg
+    chequer_rates, cube_rates, overall_rates = run_gnubg_analysis(
+        mat_files, work_dir, gnubg_cmd=gnubg_cmd, verbose=verbose,
+    )
+
+    # Summarize results
+    def _avg(rates):
+        w = [er[0] for er in rates]
+        b = [er[1] for er in rates]
+        a = w + b
+        return w, b, sum(a) / len(a) if a else None
+
+    chk_w, chk_b, chk_avg = _avg(chequer_rates)
+    cub_w, cub_b, cub_avg = _avg(cube_rates)
+    ovr_w, ovr_b, ovr_avg = _avg(overall_rates)
+
+    results = {
+        "chequer_mEMG": chk_avg,
+        "cube_mEMG": cub_avg,
+        "avg_mEMG": ovr_avg,
+        "num_games": len(overall_rates),
+        "num_games_requested": num_games,
+        "work_dir": work_dir,
+    }
+
+    if verbose:
+        if overall_rates:
+            print(f"\n{'='*50}")
+            print(f"  gnubg analysis: {len(overall_rates)} games")
+            print(f"{'='*50}")
+            print(f"  Chequer mEMG:   {chk_avg:.1f}  (W={sum(chk_w)/len(chk_w):.1f}  B={sum(chk_b)/len(chk_b):.1f})")
+            print(f"  Cube mEMG:      {cub_avg:.1f}  (W={sum(cub_w)/len(cub_w):.1f}  B={sum(cub_b)/len(cub_b):.1f})")
+            print(f"  Overall mEMG:   {ovr_avg:.1f}  (W={sum(ovr_w)/len(ovr_w):.1f}  B={sum(ovr_b)/len(ovr_b):.1f})")
+            print(f"{'='*50}")
+        else:
+            print("  WARNING: no error rates returned from gnubg.")
+            print("  Check that gnubg is installed and GNUBG_CMD is correct.")
+
+    # Cleanup temp files
+    if not keep_files:
+        for f in mat_files:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        script_path = os.path.join(work_dir, "_gnubg_analyze.py")
+        try:
+            os.remove(script_path)
+        except OSError:
+            pass
+        try:
+            os.rmdir(work_dir)
+        except OSError:
+            pass  # directory not empty or other issue
+
+    return results
+
+
 def evaluate_with_gnubg_parallel(
     model_path: str,
     num_games: int = 100,
@@ -926,14 +729,8 @@ def evaluate_with_gnubg_parallel(
         gnubg_workers:    Number of parallel gnubg analysis processes.
         gnubg_chunk_size: Games per gnubg analysis chunk.
     """
-    # model_path is None => random self-play baseline (no model to validate).
-    if model_path is not None:
-        assert_cubeful_supported(model_path, cubeful)
     if gnubg_cmd is None:
         gnubg_cmd = GNUBG_CMD
-    # Preflight the judge BEFORE generating games: a wrong binary would
-    # otherwise be discovered only after the whole generation phase.
-    assert_gnubg_bearoff(gnubg_cmd)
 
     if work_dir is None:
         work_dir = tempfile.mkdtemp(prefix="gnubg_eval_")
@@ -963,8 +760,22 @@ def evaluate_with_gnubg_parallel(
             results = pool.map(_play_games_worker, games_per_worker)
         mat_files = [f for chunk in results for f in chunk]
     else:
-        mat_files = _play_games_worker(
-            (model_path, num_games, work_dir, 1, cubeful, jacoby, oneply))
+        from model import TDNetwork
+        from td_agent import TDAgent
+        net = TDNetwork.load(model_path)
+        agent = TDAgent(net, oneply=oneply)
+
+        mat_files = []
+        for i in range(num_games):
+            if cubeful:
+                record = play_and_record_cubeful(agent, agent, jacoby=jacoby)
+            else:
+                record = play_and_record(agent, agent)
+            mat_content = export_mat(record, game_id=i + 1, money_game=cubeful)
+            mat_path = os.path.join(work_dir, f"game_{i+1}.mat")
+            with open(mat_path, "w") as f:
+                f.write(mat_content)
+            mat_files.append(mat_path)
 
     t_play = time.perf_counter() - t0
     if verbose:
@@ -1003,9 +814,15 @@ def evaluate_with_gnubg_parallel(
     t_analyze = time.perf_counter() - t1
 
     # ── Summarize ──
-    chk_w, chk_b, chk_avg = _avg_rates(all_chequer)
-    cub_w, cub_b, cub_avg = _avg_rates(all_cube)
-    ovr_w, ovr_b, ovr_avg = _avg_rates(all_overall)
+    def _avg(rates):
+        w = [er[0] for er in rates]
+        b = [er[1] for er in rates]
+        a = w + b
+        return w, b, sum(a) / len(a) if a else None
+
+    chk_w, chk_b, chk_avg = _avg(all_chequer)
+    cub_w, cub_b, cub_avg = _avg(all_cube)
+    ovr_w, ovr_b, ovr_avg = _avg(all_overall)
 
     # Bootstrap CIs for mEMG. Share one ProcessPool across all 3 calls.
     from concurrent.futures import ProcessPoolExecutor
@@ -1076,6 +893,14 @@ def evaluate_with_gnubg_parallel(
     return results
 
 
+# ── Lightweight random agent (no torch dependency) ──────────────────────────
+
+class _RandomAgent:
+    """Picks a random legal play.  No torch dependency."""
+    def choose_checker_action(self, state, dice, plays):
+        return random.choice(plays)
+
+
 # ── CLI entry point ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1096,6 +921,12 @@ if __name__ == "__main__":
                         help="Directory for temp .mat files")
     parser.add_argument("--keep-files", action="store_true",
                         help="Keep .mat files after analysis")
+    parser.add_argument("--export-only", action="store_true",
+                        help="Only export .mat files, don't run gnubg")
+    parser.add_argument("--self-play", action="store_true",
+                        help="Self-play (model vs itself) — this is the default when --model is used")
+    parser.add_argument("--vs-random", action="store_true",
+                        help="Play model vs random opponent instead of self-play")
     parser.add_argument("--workers", type=int, default=1,
                         help="Parallel game-playing workers (default: 1)")
     parser.add_argument("--gnubg-workers", type=int, default=None,
@@ -1114,32 +945,70 @@ if __name__ == "__main__":
                         help="gnubg analysis depth in plies (default: 3).")
     args = parser.parse_args()
 
-    if not args.model and not args.random:
-        parser.error("Either --model or --random is required")
-    if args.model and args.random:
-        parser.error("--model and --random are mutually exclusive")
-    if args.random and args.cubeful:
-        parser.error("--cubeful requires --model (random agents have no cube policy)")
-
-    # Self-play only. model_path=None => random self-play baseline.
-    model_path = None if args.random else args.model
     if args.random:
+        # No torch needed — pure random agents
+        agent_white = _RandomAgent()
+        agent_black = _RandomAgent()
         print("Mode: random vs random (no model)")
-    else:
+    elif args.model:
+        from td_agent import TDAgent
+        from model import TDNetwork
         print(f"Loading model: {args.model}")
-        print(f"Mode: self-play (model vs itself){' [1-ply]' if args.oneply else ''}")
+        net = TDNetwork.load(args.model)
+        agent_white = TDAgent(net, oneply=args.oneply)
 
-    evaluate_with_gnubg_parallel(
-        model_path=model_path,
-        num_games=args.games,
-        gnubg_cmd=args.gnubg,
-        work_dir=args.work_dir,
-        keep_files=args.keep_files,
-        workers=args.workers,
-        gnubg_workers=args.gnubg_workers or os.cpu_count(),
-        gnubg_chunk_size=args.gnubg_chunk_size,
-        cubeful=args.cubeful,
-        jacoby=args.jacoby,
-        oneply=args.oneply,
-        plies=args.plies,
-    )
+        if args.vs_random:
+            agent_black = _RandomAgent()
+            print(f"Mode: model (WHITE) vs random (BLACK){' [1-ply]' if args.oneply else ''}")
+        else:
+            agent_black = TDAgent(net, oneply=args.oneply)
+            print(f"Mode: self-play (model vs itself){' [1-ply]' if args.oneply else ''}")
+    else:
+        parser.error("Either --model or --random is required")
+
+    if args.export_only:
+        # Just export .mat files without running gnubg
+        work_dir = args.work_dir or "gnubg_games"
+        os.makedirs(work_dir, exist_ok=True)
+        print(f"Playing and exporting {args.games} games to {work_dir}/")
+
+        for i in range(args.games):
+            record = play_and_record(agent_white, agent_black)
+            mat_content = export_mat(record, game_id=i + 1)
+            mat_path = os.path.join(work_dir, f"game_{i+1}.mat")
+            with open(mat_path, "w") as f:
+                f.write(mat_content)
+            print(f"  Exported game {i+1}: "
+                  f"{'WHITE' if record.winner == WHITE else 'BLACK'} wins "
+                  f"in {len(record.moves)} moves")
+
+        print(f"\nDone. Import these into gnubg manually with:")
+        print(f'  gnubg -> File -> Import -> .mat match')
+    elif args.workers > 1 or args.self_play:
+        # Use parallel version for self-play with workers
+        if not args.model:
+            parser.error("--workers requires --model")
+        results = evaluate_with_gnubg_parallel(
+            model_path=args.model,
+            num_games=args.games,
+            gnubg_cmd=args.gnubg,
+            work_dir=args.work_dir,
+            keep_files=args.keep_files,
+            workers=args.workers,
+            gnubg_workers=args.gnubg_workers or os.cpu_count(),
+            gnubg_chunk_size=args.gnubg_chunk_size,
+            cubeful=args.cubeful,
+            jacoby=args.jacoby,
+            oneply=args.oneply,
+            plies=args.plies,
+        )
+    else:
+        results = evaluate_with_gnubg(
+            agent_white, agent_black,
+            num_games=args.games,
+            gnubg_cmd=args.gnubg,
+            work_dir=args.work_dir,
+            keep_files=args.keep_files,
+            cubeful=args.cubeful,
+            jacoby=args.jacoby,
+        )

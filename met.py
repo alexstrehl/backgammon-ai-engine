@@ -1,10 +1,14 @@
 """Match equity tables (MET), parsed from gnubg's XML format.
 
-Pins quantities with exact known values (v_dp, game-boundary MWC) to a
-real table instead of the network's implicit, drift-prone MET.
+Why this exists: the matchplay network was originally its own implicit
+MET (`TDAgent._eval_new_game`), which made `v_dp` — a quantity with an
+exact known value — a *learned* quantity free to drift. It did: in
+training, v_dp at 2-away/2-away decayed 0.680 → 0.639 and took the cube
+passive with it. A real table pins it.
 
-The tables are gnubg's own XML files (/usr/share/gnubg/met/), so the
-values here are bit-identical to what gnubg scores us against —
+The tables are gnubg's own XML files (the default one bundled as
+met_tables/Kazaross-XG2.xml, the others from gnubg's /usr/share/gnubg/met/),
+so the values here are bit-identical to what gnubg scores us against —
 provided the evaluator is pinned to the same table. See
 `GNUBG_SET_COMMAND`.
 
@@ -27,15 +31,15 @@ import numpy as np
 MET_DIR = "/usr/share/gnubg/met"
 
 # Prefer the copy bundled with this repo so a fresh box needs no gnubg
-# install; fall back to gnubg's system table. Both are byte-identical
-# (md5 0f0f4684). The bundled file carries its own all-permissive
-# copying notice -- keep it intact.
+# install; fall back to gnubg's system table. The bundled file is a
+# byte-identical copy of gnubg-data 1.08.003's table (md5 a436fd95). It
+# carries its own all-permissive copying notice -- keep it intact.
 _BUNDLED_MET = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "met_tables", "Kazaross-XG2.xml",
 )
-DEFAULT_MET = (_BUNDLED_MET if os.path.isfile(_BUNDLED_MET)
-               else os.path.join(MET_DIR, "Kazaross-XG2.xml"))
+_SYSTEM_MET = os.path.join(MET_DIR, "Kazaross-XG2.xml")
+DEFAULT_MET = _BUNDLED_MET if os.path.isfile(_BUNDLED_MET) else _SYSTEM_MET
 
 # Pin the evaluator to the same table. Anything else means training
 # against one MET and being scored against another.
@@ -50,6 +54,30 @@ MET_FEATURE_NAMES = (
     "dt_win_n", "dt_win_g", "dt_win_bg",
     "dt_lose_n", "dt_lose_g", "dt_lose_bg",
     "dp",
+)
+
+# The 13 above plus the six outcome prices at 4 x the current cube: the
+# level reached after a double and an immediate recube-and-take, which the
+# 13-feature block cannot express. Strict superset, appended at the end, so
+# a 350-input net expands to 356 by zero-padding (see surgery_1h64met4.py).
+N_MET4_FEATURES = 19
+
+# met6: met4 with the two EXACT DUPLICATES removed. x4_win_n and x4_lose_n
+# price 4C, which dt_win_g and dt_lose_g already price -- the block is a
+# function of POINTS STAKED, not cube level, so a gammon at 2C and a single
+# at 4C are the same MET lookup. Verified identical over 1,694 reachable
+# (away, away, crawford, cube) states. Dropping them costs no rank (the
+# 19-wide block is rank 13; the 17-wide one is rank 13 too) and removes two
+# columns whose gradient is by construction a copy of another column's.
+# The two bg columns are CONSTANT at 11pt and are kept deliberately: at
+# longer match lengths 12 points stops deciding the match and they separate.
+N_MET6_FEATURES = 17
+MET6_FEATURE_NAMES = MET_FEATURE_NAMES + (
+    "x4_win_g", "x4_win_bg", "x4_lose_g", "x4_lose_bg",
+)
+MET4_FEATURE_NAMES = MET_FEATURE_NAMES + (
+    "x4_win_n", "x4_win_g", "x4_win_bg",
+    "x4_lose_n", "x4_lose_g", "x4_lose_bg",
 )
 
 
@@ -73,6 +101,8 @@ class MatchEquityTable:
         # The reachable key space is tiny (3-point matches touch a few
         # dozen entries), and this sits in the encode hot path.
         self._block_cache: Dict[Tuple[int, int, bool, bool, int], np.ndarray] = {}
+        self._block4_cache: Dict[Tuple[int, int, bool, bool, int], np.ndarray] = {}
+        self._block6_cache: Dict[Tuple[int, int, bool, bool, int], np.ndarray] = {}
         self._mwc_cache: Dict[Tuple[int, int, bool, bool], float] = {}
 
     # ── construction ────────────────────────────────────────────────
@@ -255,6 +285,92 @@ class MatchEquityTable:
         self._block_cache[key] = out
         return out
 
+    def outcome_block_x6(
+        self,
+        my_away: int,
+        opp_away: int,
+        crawford_done: bool,
+        is_crawford: bool,
+        cube_value: int,
+    ) -> np.ndarray:
+        """The 17 MET features: outcome_block()'s 13, then the four 4x-cube
+        prices that are NOT already present.
+
+          [0:13]  exactly outcome_block(...)
+          [13]    win  gammon      at 4x cube  ( 8C)
+          [14]    win  backgammon  at 4x cube  (12C)
+          [15]    lose gammon      at 4x cube  ( 8C)
+          [16]    lose backgammon  at 4x cube  (12C)
+
+        The 4x single prices (4C) are omitted: dt_win_g and dt_lose_g are the
+        same MET lookup, so including them adds a column whose gradient is a
+        copy of another column's and whose information content is nil.
+
+        Returned array is cached and MUST NOT be mutated by callers.
+        """
+        key = (my_away, opp_away, crawford_done, is_crawford, cube_value)
+        hit = self._block6_cache.get(key)
+        if hit is not None:
+            return hit
+
+        out = np.empty(N_MET6_FEATURES, dtype=np.float32)
+        out[:N_MET_FEATURES] = self.outcome_block(
+            my_away, opp_away, crawford_done, is_crawford, cube_value,
+        )
+        cube = 4 * cube_value
+        # mult 2 = gammon (8C), mult 3 = backgammon (12C); mult 1 (4C) omitted.
+        out[13] = self.mwc_after(my_away, opp_away, crawford_done, is_crawford, cube * 2, True)
+        out[14] = self.mwc_after(my_away, opp_away, crawford_done, is_crawford, cube * 3, True)
+        out[15] = self.mwc_after(my_away, opp_away, crawford_done, is_crawford, cube * 2, False)
+        out[16] = self.mwc_after(my_away, opp_away, crawford_done, is_crawford, cube * 3, False)
+        out.flags.writeable = False
+        self._block6_cache[key] = out
+        return out
+
+    def outcome_block_x4(
+        self,
+        my_away: int,
+        opp_away: int,
+        crawford_done: bool,
+        is_crawford: bool,
+        cube_value: int,
+    ) -> np.ndarray:
+        """The 19 MET features: outcome_block()'s 13, then six more.
+
+          [0:13]  exactly outcome_block(...) -- same values, same order
+          [13:19] MWC after win/lose x normal/gammon/backgammon at
+                  4 x `cube_value`
+
+        The 4x level is exactly where a double-and-recube lands. The
+        13-feature block stops at 2x, so the price of the recube branch
+        was previously only reachable through the 7-hot cube-level input,
+        which carries no equity information at all.
+
+        Returned array is cached and MUST NOT be mutated by callers.
+        """
+        key = (my_away, opp_away, crawford_done, is_crawford, cube_value)
+        hit = self._block4_cache.get(key)
+        if hit is not None:
+            return hit
+
+        out = np.empty(N_MET4_FEATURES, dtype=np.float32)
+        out[:N_MET_FEATURES] = self.outcome_block(
+            my_away, opp_away, crawford_done, is_crawford, cube_value,
+        )
+        cube = 4 * cube_value
+        for i, mult in enumerate((1, 2, 3)):
+            out[N_MET_FEATURES + i] = self.mwc_after(
+                my_away, opp_away, crawford_done, is_crawford,
+                cube * mult, True,
+            )
+            out[N_MET_FEATURES + 3 + i] = self.mwc_after(
+                my_away, opp_away, crawford_done, is_crawford,
+                cube * mult, False,
+            )
+        out.flags.writeable = False
+        self._block4_cache[key] = out
+        return out
+
 
 _DEFAULT: Optional[MatchEquityTable] = None
 
@@ -309,14 +425,15 @@ def validate_met_file(path: str) -> None:
 def resolve_met_path(spec: Optional[str]) -> Optional[str]:
     """Turn a --met argument into an absolute XML path.
 
-    Accepts 'auto' (gnubg's default table), a bare table name such as
-    'snowie', or a path. Returns None for a falsey spec, meaning "keep
+    Accepts 'auto' (the bundled Kazaross-XG2 table, below), a bare table
+    name such as 'snowie' (looked up in MET_DIR, gnubg's system table
+    directory), or a path. Returns None for a falsey spec, meaning "keep
     the network's implicit MET".
 
     'auto' resolves to DEFAULT_MET: the copy bundled at
     met_tables/Kazaross-XG2.xml, falling back to gnubg's system table;
-    it raises if the resolved file does not exist. Content is not
-    validated here — call validate_met_file() if you need a guarantee.
+    it raises if neither file exists. Content is not validated here --
+    call validate_met_file() if you need a guarantee.
     """
     if not spec:
         return None
@@ -325,9 +442,9 @@ def resolve_met_path(spec: Optional[str]) -> Optional[str]:
         # wrong equities rather than an error.
         if not os.path.isfile(DEFAULT_MET):
             raise ValueError(
-                f"--met {spec!r} resolved to {DEFAULT_MET!r}, which does "
-                f"not exist. Pass --met <path> explicitly, or use the "
-                f"bundled met_tables/Kazaross-XG2.xml."
+                f"--met {spec!r}: no Kazaross-XG2 table found (looked for "
+                f"{_BUNDLED_MET!r} and {_SYSTEM_MET!r}). Restore the "
+                f"bundled file or pass --met <path> explicitly."
             )
         return DEFAULT_MET
     if os.path.isfile(spec):

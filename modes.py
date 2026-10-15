@@ -1,15 +1,14 @@
 """
 modes.py -- Game-mode abstractions for backgammon training.
 
-A GameMode describes one game type: initial state, episode (full game or match) 
-boundary, terminal outcome construction.
+A GameMode describes one game type: initial state, episode (full game
+or match) boundary, terminal outcome construction.
 
 Mode × output_mode pairing
 --------------------------
 GameMode and TDAgent.output_mode are orthogonal axes paired at
-training time. The coupling is the `TerminalOutcome` dataclass: the
+training time. The coupling is the `TerminalOutcome` dataclass. The
 Mode populates fields and the Agent reads the fields it cares about.
-New modes can extend TerminalOutcome.
 
   | Game          | Output mode | Terminal value         | Status     |
   |---------------|-------------|------------------------|------------|
@@ -19,12 +18,12 @@ New modes can extend TerminalOutcome.
   | CubefulMoney  | equity      | game_result × cube_val | ✓ exact    |
 
 Terminal call convention: at terminal `state.turn` is the LOSER
-because the engine already switched after the winning move; the
+because the engine already switched after the winning move. The
 mode asserts `state.winner() == 1 - state.turn`.
 
-Cubeful modes additionally carry a MatchState (cube ownership and
-cube value) alongside the BoardState. Cubeless modes never produce
-one — `initial_match_state()` returns None.
+Cubeful modes also carry a MatchState (cube ownership and cube value)
+alongside the BoardState. Cubeless modes never produce one. Their
+`initial_match_state()` returns None.
 """
 
 from dataclasses import dataclass, replace
@@ -58,7 +57,7 @@ def cube_perspective(cube_owner: CubeOwner, on_roll_player: int) -> CubePerspect
 
 @dataclass(frozen=True)
 class MatchState:
-    """State outside the BoardState: cube + optional match score.
+    """Cube state outside the BoardState, plus the match score.
 
     Money modes use match_length=0 (score fields ignored).
     Matchplay modes set match_length > 0 and track away-scores.
@@ -180,7 +179,7 @@ class GameMode:
 
     def validate_agent(self, agent) -> None:
         """Reject incompatible agents at training-loop entry. Default
-        accepts everything; modes with a hard requirement override.
+        accepts everything. Modes with a hard requirement override.
         """
         return
 
@@ -205,7 +204,7 @@ def _require_equity_output(mode_name: str, agent) -> None:
 
 
 class CubelessMoneyMode(GameMode):
-    """Cubeless money: episode = single game; gammons (2x) and
+    """Cubeless money: episode = single game. Gammons (2x) and
     backgammons (3x) carried in TerminalOutcome. Requires an
     equity-output agent.
     """
@@ -230,7 +229,7 @@ class CubelessMoneyMode(GameMode):
 
 
 class DMPMode(GameMode):
-    """Double Match Point: episode = single game; gammons don't matter."""
+    """Double Match Point: episode = single game. Gammons don't matter."""
 
     def is_episode_over(self, state: BoardState) -> bool:
         return state.is_game_over()
@@ -253,24 +252,21 @@ class MatchplayMode(GameMode):
     gammons/backgammons always count toward the score.
     """
 
-    def __init__(self, match_length: int = 2,
-                 score_curriculum: float = 0.0,
+    def __init__(self, match_length: int = 2, outcome_mix: float = 0.0,
                  oracle_spec: str = None, oracle_move_eps: float = None,
                  oracle_plies: int = 0,
                  oracle_act_prob: float = 0.0,
+                 move_explore_eps: float = 0.0,
                  td_move_eps: float = 0.0,
                  oracle_1ply_eps: float = 0.0,
+                 oneply_act_k: int = 0,
+                 td_eps_only: bool = False,
                  oracle_act_only: bool = False):
         if match_length < 1:
             raise ValueError(f"match_length must be >= 1, got {match_length}")
-        if not (0.0 <= score_curriculum <= 1.0):
-            raise ValueError(
-                f"score_curriculum must be in [0,1], got {score_curriculum}")
+        if not (0.0 <= outcome_mix <= 1.0):
+            raise ValueError(f"outcome_mix must be in [0,1], got {outcome_mix}")
         self.match_length = match_length
-        # Fraction of episodes that start at a seeded away-score pair
-        # (uniform over reachable pairs; trainer._curriculum_start).
-        # 0 = every episode starts at the natural full-match score.
-        self.score_curriculum = score_curriculum
         # Supervised oracle training: when set (a prob5 checkpoint
         # path, optional ":x=V" suffix), the collector keeps acting
         # with the trained net but REPLACES every target with the
@@ -294,11 +290,18 @@ class MatchplayMode(GameMode):
             raise ValueError(
                 f"oracle_act_prob must be in [0,1], got {oracle_act_prob}")
         self.oracle_act_prob = float(oracle_act_prob)
+        if not (0.0 <= float(move_explore_eps) <= 1.0):
+            raise ValueError(
+                f"move_explore_eps must be in [0,1], got {move_explore_eps}")
+        self.move_explore_eps = float(move_explore_eps)
         # TD self-consistency rows: also emit one row per legal
         # successor within this epsilon (MWC) of the best 0-ply value,
-        # each targeted at its OWN 1-ply value (no teacher). Closes the
-        # coverage hole where only the played successor ever becomes a
-        # row. Emitting a row does not play the move, so the state
+        # each targeted at its OWN 1-ply value. No teacher involved.
+        # Closes the coverage hole where ~540 successor reads feed each
+        # target but only the played one ever becomes a row; the
+        # skipped siblings are undervalued by +12.3 mMWC while their
+        # own 1-ply value is unbiased.
+        # Emitting a row does not play the move, so the state
         # distribution is unchanged.
         if not (0.0 <= float(td_move_eps) <= 1.0):
             raise ValueError(
@@ -313,10 +316,25 @@ class MatchplayMode(GameMode):
             raise ValueError(
                 f"oracle_1ply_eps must be in [0,1], got {oracle_1ply_eps}")
         self.oracle_1ply_eps = float(oracle_1ply_eps)
+        # Expert iteration: collector acts with 1-ply move selection over
+        # the top-K successors by the 0-ply read. 0 = act 0-ply (default).
+        if int(oneply_act_k) < 0:
+            raise ValueError(
+                f"oneply_act_k must be >= 0, got {oneply_act_k}")
+        self.oneply_act_k = int(oneply_act_k)
         # Drop the on-trajectory checker rows, keeping eps rows, cube rows
         # and boundary rows. Isolates whether the bootstrapped trajectory
         # targets are what degrades a converged net.
+        self.td_eps_only = bool(td_eps_only)
         self.oracle_act_only = bool(oracle_act_only)
+        # Fraction of the realized match outcome blended into every
+        # collected target: t = (1-mix)*backup + mix*z. Pure TD(0)
+        # (mix=0) lets cube-decision values sit at self-consistent
+        # wrong fixed points: cube samples are never outcome-grounded
+        # and their max/min backup re-injects sibling cube-context
+        # values into the bootstrap chain at every cube-eligible turn
+        # (diagnosed + fix validated via train_from_position.py).
+        self.outcome_mix = outcome_mix
 
     def initial_match_state(self) -> MatchState:
         return MatchState(
@@ -360,20 +378,13 @@ class MatchplayMode(GameMode):
 
 
 class CubefulMoneyMode(GameMode):
-    """Cubeful money. Carries a MatchState; terminal target multiplies
+    """Cubeful money. Carries a MatchState. Terminal target multiplies
     game_result by cube_value. Under Jacoby (default), gammons and
     backgammons only count once the cube has been turned.
-
-    `take_decision_state=True` selects the experimental take-decision
-    state collector (requires an agent built on `CubefulTakeEncoder`).
-    Each cube offer that gets accepted produces an extra TD transition
-    at the responder's take/pass decision state; the take/pass and
-    "too good" decisions become learned rather than analytical.
     """
 
-    def __init__(self, jacoby: bool = True, take_decision_state: bool = False):
+    def __init__(self, jacoby: bool = True):
         self.jacoby = jacoby
-        self.take_decision_state = take_decision_state
 
     def initial_match_state(self) -> MatchState:
         return MatchState(jacoby=self.jacoby)

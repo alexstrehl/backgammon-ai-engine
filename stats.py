@@ -2,17 +2,12 @@
 stats.py -- Statistical utilities for backgammon evaluation.
 
 Bootstrap confidence intervals and p-values, reusable across
-play_models.py (equity CIs) and gnubg_eval.py (mEMG CIs).
+play_models.py and the experiment scripts.
 
-Bootstraps run on a ProcessPoolExecutor; threads were tried but the
-inner loop (``rng.choice`` + ``statistic(arr)``) is GIL-bound on this
-workload so threads serialize and end up slower than processes.
-
-When a caller is going to issue multiple bootstrap calls back-to-back
-(e.g. one per estimator: mean / median / trimmed / capped), pass an
-``executor=ProcessPoolExecutor(max_workers=N)`` so the pool is
-constructed once and amortized across all calls. The function will
-not close the executor in that case.
+Bootstraps run on a ProcessPoolExecutor (the inner loop is GIL-bound).
+For several back-to-back calls pass
+``executor=ProcessPoolExecutor(max_workers=N)`` to reuse one pool. The
+function does not close it.
 """
 
 import os
@@ -24,12 +19,7 @@ import numpy as np
 # ── Robust location estimators ───────────────────────────────────────────────
 
 def trimmed_mean(values, trim=0.01):
-    """Mean with the top and bottom `trim` fraction removed.
-
-    Robust to heavy-tailed distributions where a few extreme values
-    (e.g. cube-war point totals in cubeful money) would dominate the
-    raw mean.
-    """
+    """Mean with the top and bottom `trim` fraction removed."""
     arr = np.sort(np.asarray(values, dtype=np.float64))
     n = len(arr)
     k = int(trim * n)
@@ -41,9 +31,8 @@ def trimmed_mean(values, trim=0.01):
 def capped_mean(values, cap=128.0):
     """Mean with per-value magnitude capped at `cap` (Winsorizing).
 
-    Interpretation: "equity assuming no single game is worth more than
-    ``cap`` points." Retains all samples and keeps the sign of tail
-    values (just bounded in magnitude).
+    The equity assuming no single game is worth more than ``cap``
+    points. Retains all samples and keeps the sign of tail values.
     """
     arr = np.asarray(values, dtype=np.float64)
     if arr.size == 0:
@@ -55,9 +44,7 @@ def capped_mean(values, cap=128.0):
 
 def _bootstrap_batch(arr, statistic, n_iters, seed):
     """Worker: run `n_iters` bootstrap resamples, return array of stats.
-
-    Must be a top-level function (not a closure / lambda) so that it
-    pickles for ProcessPoolExecutor.
+    Must stay top-level so that it pickles for ProcessPoolExecutor.
     """
     rng = np.random.default_rng(seed)
     n = len(arr)
@@ -82,7 +69,7 @@ def bootstrap_ci_statistic(
         values: array-like of per-game values.
         statistic: picklable callable taking a numpy array and returning
             a scalar (e.g. ``np.mean``, ``np.median``, ``trimmed_mean``).
-            Lambdas are not picklable; use ``functools.partial`` if the
+            Lambdas are not picklable. Use ``functools.partial`` if the
             statistic needs bound parameters.
         n_boot: bootstrap resamples (must be >= 1).
         ci: confidence level.
@@ -150,10 +137,7 @@ def bootstrap_ci_statistic(
 def bootstrap_ci(values, n_boot=10000, ci=0.95, seed=42, n_jobs=None,
                  executor=None):
     """Non-parametric bootstrap confidence interval for the mean.
-
     Thin wrapper over ``bootstrap_ci_statistic(values, np.mean, ...)``.
-    Kept as a named function for backward compatibility with earlier
-    call sites.
     """
     return bootstrap_ci_statistic(
         values, np.mean, n_boot=n_boot, ci=ci, seed=seed, n_jobs=n_jobs,

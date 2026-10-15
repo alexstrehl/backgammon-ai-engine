@@ -1,6 +1,9 @@
-"""Tests for backgammon_engine.py — run with: pytest tests/test_backgammon_engine.py -v"""
+"""Tests for backgammon_engine.py. Run with: pytest tests/test_backgammon_engine.py -v"""
 
 import random
+
+import pytest
+
 from backgammon_engine import (
     BoardState, WHITE, BLACK, BAR, OFF, NUM_CHECKERS,
     get_legal_plays, opening_roll, switch_turn,
@@ -8,18 +11,9 @@ from backgammon_engine import (
 
 
 def _bg_fast_or_skip():
-    """Import the built C engine, or skip the calling test if it isn't
-    available. Shared by every C-engine parity test below."""
-    import sys
-    sys.path.insert(0, "c_engine")
-    try:
-        import bg_fast
-        import importlib
-        importlib.reload(bg_fast)
-        return bg_fast
-    except (ImportError, OSError):
-        import pytest
-        pytest.skip("C engine not built")
+    """The built C engine (c_engine/bg_fast), or skip. Never reload it: a
+    reload mints new ctypes classes that puretd_py's argtypes reject."""
+    return pytest.importorskip("bg_fast")
 
 
 def test_starting_position_checker_count():
@@ -45,7 +39,7 @@ def test_opening_6_6():
 def test_bar_entry_enforced():
     b = BoardState.initial()
     b.bar[WHITE] = 1
-    b.points[5] = 4  # was 5, now 4
+    b.points[5] = 4  # the fifth checker is on the bar
     plays = get_legal_plays(b, (3, 1))
     for play, _ in plays:
         assert play[0][0] == BAR, f"First move should be bar entry, got {play[0]}"
@@ -98,7 +92,7 @@ def test_fully_blocked_bar():
 
 
 def test_random_rollout():
-    """200-step random game -- just verify no crashes."""
+    """A 200-step random game runs without errors."""
     random.seed(42)
     state = BoardState.initial()
     for _ in range(200):
@@ -115,7 +109,7 @@ def test_random_rollout():
 
 
 def test_opening_roll_no_doublets():
-    """opening_roll never returns doublets — they should be rerolled."""
+    """opening_roll never returns doublets; they are rerolled."""
     rng = random.Random(0)
     for _ in range(500):
         _, (d1, d2) = opening_roll(rng)
@@ -148,11 +142,9 @@ def test_opening_roll_picks_both_players_over_time():
     )
 
 
-# ── Bear-off regression tests ────────────────────────────────────────────────
-# These test a bug where _play_uses_die incorrectly claimed an exact bear-off
-# could "use" a larger die (e.g. bearing off from point 4 with die=4 was
-# reported as also using die=5), causing the "must use larger die" filter
-# to discard valid moves.
+# ── Bear-off move counts ─────────────────────────────────────────────────────
+# An exact bear-off must not count as using a larger die, or the "must use
+# larger die" filter discards valid moves.
 
 def _bearoff_position():
     """X (WHITE) bearing off, O (BLACK) blocks point 1."""
@@ -255,10 +247,8 @@ def test_bearoff_and_midgame_engines_agree():
 
 
 def test_initial_doubles_c_engine_nonzero():
-    """Regression: every doubles roll from the initial position has
-    legal 4-move plays. A previous bounds-guard bug in the C engine's
-    generate_plays recursion made the leaf at depth-4 return early,
-    silently dropping every full-doubles play and returning 0."""
+    """Every doubles roll from the initial position has legal 4-move
+    plays, and the C engine returns as many as Python."""
     bg_fast = _bg_fast_or_skip()
     b = BoardState.initial()
     for d in range(1, 7):
@@ -272,10 +262,8 @@ def test_initial_doubles_c_engine_nonzero():
 
 
 def test_full_4move_doubles_c_engine_parity():
-    """Targeted parity check on positions where the legal plays use
-    all 4 dice. This is the exact regime the depth-guard bug broke
-    (recursion never reaches the leaf-recording branch when num_moves
-    hits MAX_MOVES_PER_PLAY=4)."""
+    """C/Python parity on positions whose legal plays use all 4 dice
+    (num_moves reaches MAX_MOVES_PER_PLAY=4)."""
     bg_fast = _bg_fast_or_skip()
     cases = [
         (BoardState.initial(), (1, 1)),

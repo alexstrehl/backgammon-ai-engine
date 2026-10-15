@@ -89,20 +89,45 @@ class TestTrainerPrimitives:
         loss = trainer.train_step(encs, targets)
         assert math.isfinite(loss)
 
+    def test_train_step_nosync_is_train_step(self):
+        """train_step is train_step_nosync plus `.item()` (the host-pool
+        loop of `train` calls nosync): same losses
+        and weights on twin trainers; nosync returns a detached 0-dim
+        tensor and still clears the matchplay new-game memo per step."""
+        encs, targets = collect_episode(
+            TDAgent(TDNetwork(hidden_sizes=[16], output_mode="equity")),
+            CubelessMoneyMode(), random.Random(0))
+        twins = []
+        for _ in range(2):
+            torch.manual_seed(0)
+            net = TDNetwork(hidden_sizes=[16], output_mode="equity")
+            twins.append(Trainer(TDAgent(net), lr=1e-2))
+        a, b = twins
+        for _ in range(5):
+            a.agent._new_game_memo["k"] = 1.0
+            b.agent._new_game_memo["k"] = 1.0
+            la = a.train_step(encs, targets)
+            lb = b.train_step_nosync(encs, targets)
+            assert isinstance(la, float)
+            assert isinstance(lb, torch.Tensor) and lb.dim() == 0
+            assert not lb.requires_grad and lb.grad_fn is None
+            assert lb.item() == la
+            assert not a.agent._new_game_memo
+            assert not b.agent._new_game_memo
+        for pa, pb in zip(a.agent.network.parameters(),
+                          b.agent.network.parameters()):
+            assert torch.equal(pa, pb)
+
 
 # ── value_oneply_checker terminal handling (equity mode) ─────────────
 
 
 class TestValueOneplyCheckerEquityTerminals:
     """Equity-mode 1-ply lookahead must distinguish single / gammon /
-    backgammon wins among the terminal successors it enumerates.
-    Probability mode collapses them all to 1.0 so it doesn't need
-    this differentiation."""
+    backgammon wins among its terminal successors."""
 
     def _eval_equity_oneply(self, state):
-        # torch_seed pinned so the network init is deterministic; the
-        # test only depends on terminal-detection logic, not the
-        # network's actual numbers, but we want reproducibility.
+        # Seed pinned for a deterministic network init.
         torch.manual_seed(0)
         net = TDNetwork(hidden_sizes=[16], output_mode="equity")
         agent = TDAgent(net)
@@ -236,8 +261,7 @@ def _closed_home_with_black_barred():
 
 def _naive_oneply_cubeful(agent, state, plays, match_state):
     """Non-batched reference for _choose_checker_oneply_cubeful. Makes
-    one evaluate_cubeful call per non-terminal encoding instead of
-    folding everything into a single batched forward pass."""
+    one evaluate_cubeful call per non-terminal encoding."""
     mover = state.turn
     opponent = 1 - mover
     opp_can_offer = match_state.can_offer(opponent)
@@ -335,9 +359,8 @@ class TestChooseCheckerOneplyCubeful:
     ])
     @pytest.mark.parametrize("ms_name", [n for n, _ in _MATCH_STATES])
     def test_parity_with_naive_reference(self, pos_name, dice, ms_name):
-        """Batched path and a dead-simple per-state reference must agree
-        on best_val across positions × cube configs. Use pytest.approx
-        for numeric tolerance on float accumulation differences."""
+        """Batched path and per-state reference must agree on best_val
+        (to float tolerance) across positions × cube configs."""
         if pos_name == "starting":
             state = BoardState.initial()
         else:
@@ -357,9 +380,8 @@ class TestChooseCheckerOneplyCubeful:
         assert batched_val == pytest.approx(ref_val, abs=1e-5, rel=1e-5)
 
     def test_forced_pass_branch_is_actually_exercised(self):
-        """Sanity: the closed-home position must produce at least one
-        forced-pass opp dice outcome, otherwise the forced-pass parity
-        case above is vacuous."""
+        """The closed-home position must yield at least one forced-pass
+        opp dice outcome, else the parity case above is vacuous."""
         state = _closed_home_with_black_barred()
         plays = get_legal_plays(state, (3, 4))
         assert plays
@@ -372,9 +394,8 @@ class TestChooseCheckerOneplyCubeful:
             "expected at least one forced-pass opp dice in closed-home test pos"
 
     def test_single_forward_pass_per_call(self):
-        """Performance contract: the whole candidate × 21 dice ×
-        {scenario A, scenario B} tensor is folded into ONE network call.
-        Count invocations of agent.network.forward."""
+        """The whole candidate × 21 dice × {scenario A, scenario B}
+        tensor must go through ONE network forward call."""
         agent = _make_cubeful_agent(seed=1)
         match_state = MatchState(cube_owner=CubeOwner.CENTERED, jacoby=True)
         state = BoardState.initial()
@@ -398,9 +419,8 @@ class TestChooseCheckerOneplyCubeful:
             f"expected exactly 1 network forward pass, got {len(calls)}: {calls}"
 
     def test_terminal_candidate_wins_and_gets_exact_equity(self):
-        """If a candidate move ends the game with WHITE winning, that
-        candidate's val must equal game_result (or 1.0 under Jacoby on
-        centered cube). It must also be chosen as best."""
+        """A game-ending candidate must be chosen as best, with val ==
+        game_result (1.0 under Jacoby on a centered cube)."""
         state = _near_bear_off_white(black_off=0, black_in_white_home=False)
         agent = _make_cubeful_agent(seed=2)
         # Jacoby off → gammons count → val == 2.0 for a gammon finish.
@@ -435,15 +455,14 @@ class TestChooseCheckerOneplyCubeful:
         assert best_val == pytest.approx(1.0)
 
 
-# ── 0-ply selection: terminal-mask regression ────────────────────────
+# ── 0-ply selection: terminal mask ───────────────────────────────────
 
 
 def _mixed_terminal_position():
     """WHITE has 13 off, 1 on point 5, 1 on point 0. BLACK has 1 off so
     WHITE's terminal finish is a single win (game_result=1), not a
     gammon. With dice (6, 1), legal plays include a terminal bear-off
-    and a non-terminal reorganization — exactly the setup where 0-ply
-    selection must handle terminals correctly."""
+    and a non-terminal reorganization."""
     state = BoardState(
         points=[0] * 24, bar=[0, 0], off=[13, 1], turn=0,
     )
@@ -454,10 +473,9 @@ def _mixed_terminal_position():
 
 
 def _stub_network_terminal_looks_good():
-    """Wrap a forward fn so terminal encodings (OPP_OFF ≥ threshold)
-    return a HIGH value (0.9) and non-terminals return LOW (0.1).
-    Pre-fix argmin would pick the non-terminal — the very bug we're
-    guarding against."""
+    """Forward stub. Terminal encodings (OPP_OFF ≥ threshold) return
+    HIGH (0.9) and non-terminals LOW (0.1), so an unmasked argmin would
+    pick the non-terminal."""
     from encoding import OPP_OFF_INDEX, TERMINAL_OFF_THRESHOLD
 
     def stub(x):
@@ -468,9 +486,8 @@ def _stub_network_terminal_looks_good():
 
 
 class TestZeroPlyTerminalMask:
-    """Regression: 0-ply action selection must not let the network's
-    arbitrary output on terminal encodings cause argmin to walk past
-    a winning move."""
+    """0-ply action selection must mask terminal encodings, so the
+    network's output on them cannot make argmin skip a winning move."""
 
     def test_setup_has_both_terminal_and_nonterminal_plays(self):
         state = _mixed_terminal_position()
@@ -483,9 +500,8 @@ class TestZeroPlyTerminalMask:
         )
 
     def test_cubeful_0ply_picks_terminal_over_fooling_network(self):
-        """With a stubbed network that makes terminals look WORSE (higher
-        value) than non-terminals, the cubeful 0-ply path must still
-        pick the terminal via the mask."""
+        """With a stub that makes terminals look WORSE (higher value),
+        the cubeful 0-ply path must still pick the terminal."""
         state = _mixed_terminal_position()
         torch.manual_seed(0)
         net = TDNetwork(
@@ -513,7 +529,7 @@ class TestZeroPlyTerminalMask:
         assert bootstrap == pytest.approx(1.0)
 
     def test_cubeless_0ply_picks_terminal_over_fooling_network_fast_path(self):
-        """Same regression for the cubeless 0-ply path (actions=None
+        """Same check for the cubeless 0-ply path (actions=None
         branch, uses _get_legal_plays_encoded)."""
         state = _mixed_terminal_position()
         torch.manual_seed(0)
@@ -537,7 +553,7 @@ class TestZeroPlyTerminalMask:
         assert target == pytest.approx(1.0)
 
     def test_cubeless_0ply_picks_terminal_over_fooling_network_actions_path(self):
-        """Same regression for the `actions=[...]` branch (used by eval
+        """Same check for the `actions=[...]` branch (used by eval
         scripts that pass explicit (Play, state) lists)."""
         state = _mixed_terminal_position()
         torch.manual_seed(0)

@@ -178,7 +178,7 @@ def test_build_network_dispatches(source):
         resume=None, expand=None, expand_depth=None, hidden=None,
         output_mode=None, encoder=None,
         warm_start_equity=None, warm_start_cubeful=None,
-        warm_start_cubeful_take=None, warm_start_matchplay=None,
+        warm_start_matchplay=None,
         warm_start_matchplay1h=None, warm_start_matchplay_cubeful=path,
     )
     net = build_network(args)
@@ -192,7 +192,7 @@ def test_mutual_exclusivity(source):
         resume=None, expand=None, expand_depth=None, hidden=None,
         output_mode=None, encoder=None,
         warm_start_equity=None, warm_start_cubeful=None,
-        warm_start_cubeful_take=None, warm_start_matchplay="x.pt",
+        warm_start_matchplay="x.pt",
         warm_start_matchplay1h=None, warm_start_matchplay_cubeful=path,
     )
     with pytest.raises(ValueError, match="mutually exclusive"):

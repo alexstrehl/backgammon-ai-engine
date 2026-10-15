@@ -1,77 +1,143 @@
 """Generator-based vectorized (lockstep) self-play collection for
 MATCHPLAY with 1-ply checker targets.
 
+Design (ported from the money-game engine's cubeful-money
+`vectorized_collect.py`, but every mirror rewritten for matchplay):
+
 Each EPISODE (= one full match) is a Python generator that runs the
 exact logic of `trainer._collect_episode_matchplay` but, wherever the
 serial code would call `network(...)`, `yield`s the (N, n_feat) float32
-feature matrix and receives the (N,) values back via `.send()`. A
-per-process driver holds B live generators, concatenates their pending
-matrices into ONE local forward on `device` (in-process, no IPC),
-scatters the slices back, and refills finished slots.
+feature matrix it was about to push through the net and receives the
+(N,) float32 values back via `.send()`. A per-process driver holds B
+live generators, concatenates their B pending matrices into ONE local
+forward on `device` (in-process, no IPC), scatters the slices back, and
+refills finished slots until the episode quota is met.
 
-The correctness contract is narrow and mechanical: the matrix a
-generator yields is byte-identical to the input of the serial forward
-it replaces, and the value it receives is used in exactly the same
-expression. Everything else -- score curriculum, cube phase and its
-exploration coins, boundary upweighting, the
-`random.Random` consumption order -- is a line-for-line mirror, which
-makes B=1 with a CPU driver net BIT-IDENTICAL to the serial collector
-on a shared seed (`tests/test_vectorized_matchplay.py`).
+The correctness contract is deliberately narrow and mechanical:
+
+    the matrix a generator yields is byte-identical to the input of the
+    serial forward it replaces, and the value it receives is used in
+    exactly the same expression.
+
+Everything else in the episode -- the score curriculum, the cube phase
+and its exploration coins, boundary upweighting, the outcome-mix pass,
+the `random.Random` consumption order -- is a line-for-line mirror. That
+is what makes single-game driving (B=1, CPU driver net) BIT-IDENTICAL to
+`trainer._collect_episode_matchplay` on a shared seed, which is what
+`tests/test_vectorized_matchplay.py` proves.
 
 WHAT IS *NOT* YIELDED
-`TDAgent._eval_new_game` stays on the worker's own CPU agent net: it is
-an exact MET lookup or two memoised batch-1 forwards, and it is reached
-from four places, some inside loops holding a live `bg_fast` lazy
-states view; yielding there would restructure the most delicate code
-for microseconds. The memo is per-agent and order-independent (weights
-frozen for the round), so lockstep interleaving cannot change it.
-`respond_to_double_matchplay(hint=offer)` is pure arithmetic on the
-offer cache and consumes no forward.
+`TDAgent._eval_new_game` stays on the worker's own CPU agent net. It is
+either an exact MET lookup (zero forwards, with `--met`) or two batch-1
+forwards memoised on a tiny score lattice, and it is reached from four
+places -- `v_dp`, the responder's take point, every terminal successor
+in both move selection and the 1-ply target, and the game-boundary
+target -- several of them inside loops holding a live `bg_fast` lazy
+states view. Yielding from there would force a restructuring of exactly
+the most delicate code for a handful of microseconds per worker call.
+Running it on the agent's CPU fp32 net keeps it bit-identical to the
+serial collector. The memo is per-agent and order-independent (weights
+are frozen for the round), so lockstep interleaving cannot change it.
 
-WHAT IS NOT FUSED (do not "optimise" these -- each breaks bit parity)
-`offer_double_matchplay`'s v_nd/v_dt are yielded SEPARATELY, not as one
-2-row request: torch reductions are batch-composition sensitive at
-~1e-7 and a cube decision is a min/max comparison that gates the RNG
-stream. The 1-ply target keeps its per-dice `get_legal_plays_encoded`
-loop (batched `expand_21` omits terminal replies and changes batch
-composition), keeps float64 Python accumulation over `_DICE_OUTCOMES`,
-and move selection keeps the PYTHON `get_legal_plays` -- the C fused
-generator emits plays in a different order, breaking argmin ties.
+Likewise `respond_to_double_matchplay(hint=offer)` is pure arithmetic on
+the offer cache and consumes no forward at all.
 
-EPISODE-LENGTH GUARD (default off)
-In lockstep a single runaway game pins a driver slot forever, so the
-round never finishes. `max_episode_plies` is checked at the top of the
-per-game loop and DISCARDS the whole episode (whole match). Default 0
-(disabled) so the default path is behaviour-identical to serial. A
-match cannot loop at the MATCH level (`after_game` strictly decreases
-an away score); only a single game can run away. Discards are reported
-explicitly -- each generator returns `(enc, tgt, discarded)` -- so a
-legitimately-empty episode is never miscounted as a runaway.
+WHAT IS NOT FUSED
+`offer_double_matchplay` does two separate batch-1 forwards (v_nd and
+v_dt). They are yielded SEPARATELY rather than stacked into one 2-row
+request: torch's reductions are batch-composition sensitive at the
+~1e-7 level, and a cube decision is a `min`/`max` comparison that gates
+the RNG stream, so a fused pair would cost exact parity for one saved
+lockstep step (which is already amortised across B games anyway).
+
+For the same reason the 1-ply target keeps its per-dice
+`get_legal_plays_encoded` loop rather than switching to the batched
+`expand_21` (which omits terminal replies and would change the batch
+composition of every remaining row), keeps its float64 Python
+accumulation over `_DICE_OUTCOMES` rather than a dot product. Move
+selection keeps the PYTHON `get_legal_plays`. (An earlier version of
+this paragraph said the C fused generator emits plays in a different
+order; it does not: the same successors in the same order on all 36
+ordered rolls -- `c_api/movegen_fuzz.py`, 8,640,000 board x roll cases,
+0 mismatches, and `tests/test_movegen_order_stable.py`. The serial collector
+under BG_FAST_FORWARD uses the C generator and matches this one.)
+
+EPISODE-LENGTH GUARD (NEW BEHAVIOUR, DEFAULT OFF)
+Unlike the money-game collectors, the serial match collector has NO
+ply bound of any kind. A guard is nevertheless operationally necessary here:
+in lockstep a single runaway game does not merely grow one worker's RSS,
+it pins a driver slot forever, so the round never finishes even though
+the other B-1 games completed. `max_episode_plies` is therefore checked
+at the top of the PER-GAME loop, before any work for that ply, and
+DISCARDS the whole episode (the whole match). It defaults to 0
+(disabled) precisely so that the default vectorized path is
+behaviour-identical to the serial collector.
+
+Note that a matchplay episode cannot loop forever at the MATCH level:
+every `after_game` strictly decreases one away score, so a match is at
+most 2*match_length-1 games. Only a single game can run away.
+
+Discards are reported explicitly rather than inferred from an empty
+return: each generator returns `(enc, tgt, discarded)` and the worker
+returns `(enc, tgt, n_discarded)`, so a legitimately-empty episode is
+never miscounted as a runaway.
 
 SCOPE
-Matchplay only, 1-ply targets, 0-ply move selection. `--oneply-acting`
-is refused. `boltzmann_temp > 0` is refused: `_boltzmann_select` draws
-from torch's GLOBAL generator, whose call order under lockstep depends
-on B, making results non-reproducible across batch sizes. `B < 1` is
-refused (a zero batch fills no driver slot and returns empty results).
+Matchplay only, 1-ply targets (`oneply=True`), 0-ply move selection.
+`--oneply-acting` does not exist for matchplay and is refused.
+`boltzmann_temp > 0` is refused: `_boltzmann_select` draws from torch's
+GLOBAL generator, whose call order under lockstep depends on B, which
+would make results non-reproducible across batch sizes.
+`B < 1` is refused: a zero/negative batch fills no driver slot, so the
+worker would return an empty result for every episode it never started.
 
-EXACTNESS AT B > 1
-Bit-exact at B=1 by construction. At B > 1 the row COUNT, ORDER,
-ENCODINGS and trajectories still exactly match serial -- only target
-VALUES move (<= ~4e-7), because a row sits at a different offset inside
-the fused GEMM. Pure fp32 batch composition, not aliasing: with a
-batch-composition-invariant network the row multisets are exactly equal
-(`TestBatchInvariance`).
+HOW EXACT IS "EQUIVALENT" AT B > 1
+Exactly bit-exact at B=1 (that is a construction guarantee, see above),
+and at B > 1 the row COUNT, row ORDER, ENCODINGS and trajectories are
+still exactly those of the serial collector -- only the target VALUES
+move, because a row sits at a different offset inside the fused GEMM.
+Measured magnitude of that shift (production 512/512/256/256 net, 3pt,
+24-60 episodes): <= 3.0e-7 with a CPU driver, <= 4.2e-7 with a CUDA
+driver, mean target identical to 6 decimal places. It is pure fp32
+batch composition, not aliasing: driven by a batch-composition-
+INVARIANT network the B=1 and B=32 row multisets are EXACTLY equal
+(`tests/test_vectorized_matchplay.py::TestBatchInvariance`).
 
-VRAM / THROUGHPUT
-One CUDA context (~500 MB, `vram_mb_per_driver()`) per DRIVER PROCESS:
-contexts are amortised across B games, not across workers, so worker
-count is VRAM-capped (~20-25 drivers on 12 GB); `Trainer.train` refuses
-over-budget configs up front and this module falls back to a CPU driver
-if a CUDA failure escapes the check. Roughly ~5x per core over CPU
-serial. Rates need full drivers: keep
-`episodes_per_round >= workers * vectorized_batch` or batches shrink
-and the round's tail is one long match (`Trainer.train` prints a NOTE).
+VRAM
+One CUDA context per DRIVER PROCESS: the design amortises contexts
+across B games, it does not avoid multiplying them across workers.
+Measured 434-466 MiB per driver on a 3080 Ti (B=24..32), i.e. ~500 MB
+budgeted by `vram_mb_per_driver()`. `--workers 48` would therefore want
+~24 GB and cannot run on a 12 GB card; `Trainer.train` refuses that up
+front (see `vram_reason`) and this module additionally falls back to a
+CPU driver if a CUDA failure escapes the check at run time, so a worker
+never takes the whole run down with it.
+
+BENCHMARK (RTX 3080 Ti, 3pt, 512/512/256/256, box shared
+with a 40-core job -- ALL of these numbers move +/-20% with box load)
+    CPU serial   K=8             8.0-8.9 ep/s
+    CPU serial   K=12           11.2-11.5 ep/s
+    vectorized   K=8   B=24     41.5-41.9 ep/s
+    vectorized   K=12  B=24     54-66 ep/s
+    vectorized   K=16  B=24     58-77 ep/s   (~7.0 GB VRAM)
+    vectorized   K=20  B=24     78.5 ep/s    (~8.8 GB VRAM)
+~5x per core over the CPU baseline at equal core count. The original
+commit message for this file claimed "K=16 is past the knee" off a
+single K=16 sample of 58.19 ep/s; that does not reproduce -- five
+interleaved K=12/K=16 pairs put K=16 ahead every time, and GPU
+utilisation at K=12 averages only ~46%. The knee is nearer K=16-20,
+bounded by VRAM (~25 drivers at B=32 on a 12 GB card) rather than by
+the GPU. Whole-box framing: the CPU path scales to ~45 ep/s at 48
+workers, so the honest headline is ~1.7x peak throughput while freeing
+~30 cores, not 5.7x.
+
+These rates need a round big enough to keep the drivers full. The
+benchmark gave each worker 50-200 episodes per `pool.map`; at the
+trainer's default `--episodes-per-round 100` with K=12 each worker gets
+~8, fewer than B, so batches shrink and the round's tail is one long
+match -- measured 20-40 ep/s for the same config. Keep
+`episodes_per_round >= workers * vectorized_batch`; `Trainer.train`
+prints a NOTE when it is not.
 """
 
 from __future__ import annotations
@@ -130,6 +196,76 @@ def vram_mb_per_driver() -> float:
         except ValueError:
             pass
     return _VRAM_MB_PER_DRIVER
+
+
+# ── CUDA MPS ────────────────────────────────────────────────────────
+#
+# Every process that opens a CUDA context gets its own, and contexts
+# time-slice rather than run concurrently. 0-ply collection yields only
+# ~8 rows per slot-yield (62.6% of yields are batch-1 cube rows), so the
+# round trip is latency-bound and the W driver contexts spend their time
+# being switched between instead of computing. MPS gives them one shared
+# GPU scheduler and the time-slicing goes away.
+#
+# Measured on a 9980X + RTX 5090, matchplay 0-ply, B=64 epr=4096, same
+# checkpoint both arms: collect 12.1s -> 5.8s, 230 -> 356 ep/s (+56%) at
+# W=32. The gain is contention between contexts, so it scales with the
+# WORKER COUNT, not with the ply depth: the same A/B at W=16 was only
+# +8%, and 1-ply (~350-400 rows per trip, already GPU-bound) is ~0%.
+#
+# Detected and reported, never started: `nvidia-cuda-mps-control -d` is
+# a HOST-WIDE daemon that changes GPU behaviour for every other CUDA
+# client and weakens error isolation (one client's fault can poison the
+# shared context). That is a decision for the operator of the box, not
+# for a training script -- on a shared box it would silently affect
+# somebody else's job. See ./mps.sh.
+#
+# Throughput only: MPS changes how kernels are scheduled, not what they
+# compute. The A/B above held batch loss (2.1-3.3e-4) and pool size
+# (2.13-2.15M) indistinguishable across arms.
+
+_MPS_DEFAULT_PIPE_DIR = "/tmp/nvidia-mps"
+
+# Below this many drivers there is too little contention to be worth the
+# daemon: +8% measured at W=16 vs +56% at W=32.
+MPS_MIN_WORKERS = 16
+
+
+def mps_pipe_dir() -> str:
+    """The control-pipe directory this process's CUDA client would use."""
+    return os.environ.get("CUDA_MPS_PIPE_DIRECTORY") or _MPS_DEFAULT_PIPE_DIR
+
+
+def mps_active() -> bool:
+    """True if a live MPS control daemon is reachable on that pipe dir.
+
+    Read from the filesystem rather than by making a CUDA call: the
+    client library decides whether to route through MPS at
+    context-creation time, from CUDA_MPS_PIPE_DIRECTORY, so this is the
+    same question the driver asks -- and it costs nothing when MPS is
+    absent.
+
+    The pid is verified because a pipe directory outlives the daemon
+    that made it: reporting "MPS ON" into a run log that is then used to
+    explain a throughput number would be worse than reporting nothing.
+    """
+    d = mps_pipe_dir()
+    if not os.path.exists(os.path.join(d, "control")):
+        return False
+    try:
+        with open(os.path.join(d, "nvidia-cuda-mps-control.pid")) as fh:
+            pid = int(fh.read().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False          # stale pipe dir, daemon is gone
+    except PermissionError:
+        pass                  # alive, owned by another user
+    except OSError:
+        return False
+    return True
 
 
 def device_reason(device: str) -> Optional[str]:
@@ -265,10 +401,12 @@ def _choose_checker_action_matchplay_gen(agent, state, dice, match_state,
     (0-ply selection). Yields the (n_plays, n_feat) matrix; receives
     (n_plays,) values. Returns (chosen_state, bootstrap) or None.
 
-    Uses the PYTHON `get_legal_plays` exactly as the serial method does:
-    the fused C generator dedups through a hash set and emits plays in a
-    different ORDER, so argmin would break ties differently and the two
-    collectors would diverge on the very first tie.
+    Uses the PYTHON `get_legal_plays`, as the serial method does without
+    BG_FAST_FORWARD. The C generator (the serial method's path under
+    BG_FAST_FORWARD) emits the same plays in the same order on all 36
+    ordered rolls (c_api/movegen_fuzz.py, 8,640,000 cases, 0 mismatches;
+    tests/test_movegen_order_stable.py), so argmin breaks ties alike
+    either way; an earlier version of this note said otherwise.
     """
     plays = get_legal_plays(state, dice)
     if not plays:
@@ -448,7 +586,7 @@ def collect_episode_matchplay_gen(
 
     With `max_episode_plies == 0` (the default) this is a line-for-line
     mirror: same RNG consumption order, same sample order, same
-    boundary upweighting. Driven single-game
+    boundary upweighting, same outcome-mix pass. Driven single-game
     against a CPU net it is bit-identical to the serial collector.
 
     `max_episode_plies > 0` bounds the PER-GAME turn count (reset at
@@ -459,10 +597,10 @@ def collect_episode_matchplay_gen(
     """
     enc_list: List[np.ndarray] = []
     targets: List[float] = []
+    viewers: List[int] = []
 
     # Score curriculum (consumes rng exactly as the serial collector).
-    match_state = _curriculum_start(
-        initial_match_state, rng, getattr(mode, "score_curriculum", 0.0))
+    match_state = _curriculum_start(initial_match_state, rng)
 
     while True:
         game_ms = match_state.start_game()
@@ -482,6 +620,7 @@ def collect_episode_matchplay_gen(
                 enc_list.append(agent._encode_matchplay(
                     state, game_ms, is_cube_action=True,
                 ))
+                viewers.append(player)
                 offer = yield from _offer_double_matchplay_gen(
                     agent, state, game_ms,
                 )
@@ -519,6 +658,7 @@ def collect_episode_matchplay_gen(
                             for _ in range(_BOUNDARY_UPWEIGHT - 1):
                                 enc_list.append(enc_list[-1])
                                 targets.append(t)
+                                viewers.append(player)
                         game_done = True
                         continue
                 else:
@@ -528,6 +668,7 @@ def collect_episode_matchplay_gen(
             enc_list.append(agent._encode_matchplay(
                 state, game_ms, is_cube_action=False,
             ))
+            viewers.append(player)
             result = yield from _choose_checker_action_matchplay_gen(
                 agent, state, dice, game_ms, rng=rng,
             )
@@ -578,6 +719,7 @@ def collect_episode_matchplay_gen(
                     for _ in range(_BOUNDARY_UPWEIGHT - 1):
                         enc_list.append(enc_list[-1])
                         targets.append(t)
+                        viewers.append(player)
                     game_done = True
                     continue
                 if oneply:
@@ -600,6 +742,16 @@ def collect_episode_matchplay_gen(
     if not enc_list:
         return _EMPTY_ENC, _EMPTY_TGT, False
     t_arr = np.asarray(targets, dtype=np.float32)
+    mix = getattr(mode, "outcome_mix", 0.0)
+    if mix > 0.0:
+        assert len(viewers) == len(targets)
+        white_won = match_state.my_away <= 0
+        z = np.asarray(
+            [1.0 if (white_won if v == 0 else not white_won) else 0.0
+             for v in viewers],
+            dtype=np.float32,
+        )
+        t_arr = (1.0 - mix) * t_arr + mix * z
     return np.stack(enc_list), t_arr, False
 
 
@@ -633,7 +785,7 @@ def drive_episode(gen, net, device: str = "cpu"):
 _VEC_FIELDS = (
     "state_dict hidden_sizes input_size output_mode encoder_name "
     "mode num_episodes seed oneply oneply_acting boltzmann_temp "
-    "bf16_inference cube_targets_1ply met_path B device "
+    "bf16_inference met_path B device "
     "max_episode_plies met_scopes activation"
 )
 # met_scopes defaults to None (= ground every scope) and activation to
@@ -659,8 +811,8 @@ def vectorized_matchplay_worker(args):
     master's `vram_reason` check is what should normally prevent it.
 
     NOTE: the args tuple arity must stay in sync with `_build_vec_args`
-    in `Trainer.train`. It is the 14-field `_collect_worker` tuple plus
-    `(B, device, max_episode_plies, met_scopes)`.
+    in `Trainer.train`. It is the leading 13 fields of the `_collect_worker`
+    tuple plus `(B, device, max_episode_plies, met_scopes, activation)`.
     """
     os.environ["OMP_NUM_THREADS"] = "1"
     torch.set_num_threads(1)
@@ -734,6 +886,12 @@ def _run_lockstep(a: "VecArgs", device: str):
     )
     net.load_state_dict(state_dict)
     net.to(device).eval()
+    # BG_FAST_FORWARD (c_api/fast_forward.py): a CPU driver runs the
+    # batched forward on a c_api backend (torch: bitwise the same).
+    from c_api.fast_forward import FastForward, backend_from_env, supports
+    _ff_backend = backend_from_env() if device == "cpu" else None
+    fast = (FastForward(net, _ff_backend)
+            if _ff_backend and supports(net) else None)
 
     # The AGENT is built on CPU so its move-gen / encode keep the bg_fast
     # C fast path (which requires a CPU agent). Its own net copy is only
@@ -807,10 +965,13 @@ def _run_lockstep(a: "VecArgs", device: str):
                 big = slots[0][1]
             else:
                 big = np.concatenate([s[1] for s in slots], axis=0)
-            t = torch.from_numpy(np.ascontiguousarray(big))
-            if device != "cpu":
-                t = t.to(device)
-            out = net(t).reshape(-1).to("cpu", torch.float32).numpy()
+            if fast is not None:
+                out = fast(big)
+            else:
+                t = torch.from_numpy(np.ascontiguousarray(big))
+                if device != "cpu":
+                    t = t.to(device)
+                out = net(t).reshape(-1).to("cpu", torch.float32).numpy()
 
             off = 0
             new_slots = []
