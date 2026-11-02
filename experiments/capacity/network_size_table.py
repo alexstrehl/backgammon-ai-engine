@@ -59,7 +59,7 @@ ROWS = [
     ("prob5", "5-layer", "5L", "cubeless_prob5_512_512_256_256_256",
      "best_models/experimental/cubeless_prob5_512_512_256_256_256.pt", "[512,512,256,256,256]", "p5-5L"),
     ("prob5", "5-layer wide", "5Lw", "cubeless_prob5_768_512_256_256_256",
-     "best_models/cubeless_prob5_768_512_256_256_256.pt", "[768,512,256,256,256]", "p5-768w5L"),
+     "best_models/experimental/cubeless_prob5_768_512_256_256_256.pt", "[768,512,256,256,256]", "p5-768w5L"),
     ("prob5", "6-layer wide", "6Lw", "cubeless_prob5_768_512_256_256_256_256",
      "best_models/experimental/cubeless_prob5_768_512_256_256_256_256.pt", "[768,512,256,256,256,256]", "p5-768w6L"),
     ("prob5", "5-layer 768x768", "5Lww", "cubeless_prob5_768_768_256_256_256",

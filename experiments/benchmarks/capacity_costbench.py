@@ -33,24 +33,24 @@ MANIFEST = {
     "cfs-1L":    ("cubeful", "cubeful_money_512.pt", ("39d75783",)),
     "cfs-2L":    ("cubeful", "cubeful_money_512_512.pt", ("1ddbb775",)),
     "cf3L-mod":  ("cubeful", "cubeful_money_512_512_256.pt", ("27a728cf",)),
-    "cf4L":      ("cubeful", "cubeful_money_512_512_256_256.pt", ("6afda0f8",)),
+    "cf4L":      ("cubeful", "cubeful_money_512_512_256_256.pt", ("6afda0f8", "3a6bad63")),
     "cf5L-f9":   ("cubeful", "cubeful_money_512_512_256_256_256.pt",
                   ("37e41475", "a56adba2")),
     "cf768w5L":  ("cubeful", "cubeful_money_768_512_256_256_256.pt", ("f65c49fe",)),
     "cfW1":      ("cubeful", "cubeful_money_768_512_256_256_256_256.pt",
                   ("4f86345a", "9097ea9c")),
-    "cf768x768": ("cubeful", "cubeful_money_768_768_256_256_256.pt", ("de9e6e84",)),
+    "cf768x768": ("cubeful", "cubeful_money_768_768_256_256_256.pt", ("de9e6e84", "4e855ac0")),
     # cubeless prob5
     "p5s-1L":    ("prob5", "cubeless_prob5_512.pt", ("fa2c6935",)),
     "p5s-2L":    ("prob5", "cubeless_prob5_512_512.pt", ("e8c0c760",)),
     "p5s-3L":    ("prob5", "cubeless_prob5_512_512_256.pt", ("3da8e498",)),
-    "p5-4L256":  ("prob5", "cubeless_prob5_512_512_256_256.pt", ("ac95a983",)),
+    "p5-4L256":  ("prob5", "cubeless_prob5_512_512_256_256.pt", ("ac95a983", "84b2293e")),
     "p5-5L":     ("prob5", "cubeless_prob5_512_512_256_256_256.pt",
                   ("bade7d51", "953d27c8")),
     "p5-768w5L": ("prob5", "cubeless_prob5_768_512_256_256_256.pt", ("bd1a7931",)),
     "p5-768w6L": ("prob5", "cubeless_prob5_768_512_256_256_256_256.pt",
                   ("a9df2ffc", "90f2bc1d")),
-    "p5-768x768": ("prob5", "cubeless_prob5_768_768_256_256_256.pt", ("b3fad4eb",)),
+    "p5-768x768": ("prob5", "cubeless_prob5_768_768_256_256_256.pt", ("b3fad4eb", "9ecbc3ee")),
 }
 
 

@@ -129,10 +129,10 @@ HedgeHog shim `-O3 -march=native`, Open Sage its wheel's `-O3 -ffast-math
 ## Inputs
 
 - PureTD cubeful:
-  [best_models/cubeful_money_512_512_256_256.pt](../../best_models/cubeful_money_512_512_256_256.pt)
+  [best_models/history/cubeful_money_512_512_256_256_6afda0f8.pt](../../best_models/history/cubeful_money_512_512_256_256_6afda0f8.pt)
   (md5 `6afda0f8`).
 - PureTD cubeless (prob5):
-  [best_models/cubeless_prob5_512_512_256_256.pt](../../best_models/cubeless_prob5_512_512_256_256.pt)
+  [best_models/history/cubeless_prob5_512_512_256_256_ac95a983.pt](../../best_models/history/cubeless_prob5_512_512_256_256_ac95a983.pt)
   (md5 `ac95a983`).
 - PureTD C API: `VENV=/path/to/venv/bin/python bash c_api/build.sh torch simd`
   (`torch` links that interpreter's libtorch).

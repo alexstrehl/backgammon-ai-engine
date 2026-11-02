@@ -18,15 +18,17 @@ To our knowledge this is the first open-source backgammon AI trained entirely th
 
 | Model | Type | Output | Architecture | Params | vs gnubg 0-ply | XG++ PR (0-ply) | md5 | File |
 |-------|------|--------|-------------|--------|----------------|-----------------|-----|------|
-| Best 4L cubeful | cubeful-money | equity | [512,512,256,256] | 563k | **+85.2 mEq/game** [+83.5, +87.0] | **0.80** [0.76, 0.84] | `6afda0f8` | `best_models/cubeful_money_512_512_256_256.pt` |
-| Wide 5L cubeful | cubeful-money | equity | [768,768,256,256,256] | 1,074k | **+102.8 mEq/game** [+101.1, +104.5]² | — | `de9e6e84` | `best_models/experimental/cubeful_money_768_768_256_256_256.pt` |
+| Best 4L cubeful | cubeful-money | equity | [512,512,256,256] | 563k | **+85.2 mEq/game** [+83.5, +87.0] | **0.80** [0.76, 0.84] | `3a6bad63` | `best_models/cubeful_money_512_512_256_256.pt` |
+| Wide 5L cubeful | cubeful-money | equity | [768,768,256,256,256] | 1,074k | **+102.8 mEq/game** [+101.1, +104.5]² | — | `4e855ac0` | `best_models/experimental/cubeful_money_768_768_256_256_256.pt` |
 | Best 3L cubeful | cubeful-money | equity | [512,512,256] | 497k | **+53.6 mEq/game** [+51.9, +55.4] | — | `799f8c75` | `best_models/cubeful_money_512_512_256.pt` |
-| 4L cubeless prob5 | cubeless-money | prob5 | [512,512,256,256] | 562k | **+45.8 mEq/game** [+45.0, +46.7] | — | `ac95a983` | `best_models/cubeless_prob5_512_512_256_256.pt` |
-| Wide 5L cubeless prob5 | cubeless-money | prob5 | [768,768,256,256,256] | 1,072k | **+54.2 mEq/game** [+53.4, +55.0]² | — | `b3fad4eb` | `best_models/experimental/cubeless_prob5_768_768_256_256_256.pt` |
+| 4L cubeless prob5 | cubeless-money | prob5 | [512,512,256,256] | 562k | **+45.8 mEq/game** [+45.0, +46.7] | — | `84b2293e` | `best_models/cubeless_prob5_512_512_256_256.pt` |
+| Wide 5L cubeless prob5 | cubeless-money | prob5 | [768,768,256,256,256] | 1,072k | **+54.2 mEq/game** [+53.4, +55.0]² | — | `9ecbc3ee` | `best_models/experimental/cubeless_prob5_768_768_256_256_256.pt` |
 
 *All "vs gnubg 0-ply" results are 10M-game evaluations with non-parametric (bootstrap) 95% confidence intervals. Cubeful rows report the capped (±128) mean equity. All rows play the real gnubg 1.08.003 binary over its external-player socket. XG++ PR is the eXtreme Gammon (XG++) Performance Rating, lower is better, measured at 0-ply on 1000 self-play games with bootstrap 95% CIs. Backing data: `experiments/head_to_head/results/` (per-row provenance in the CSV headers).*
 
 *² Paired dice (5M pairs, CIs bootstrap over pairs): [h2h_wide5L_vs_gnubg0_paired.csv](experiments/head_to_head/results/h2h_wide5L_vs_gnubg0_paired.csv).*
+
+*The four models with md5 `3a6bad63`, `4e855ac0`, `84b2293e` and `9ecbc3ee` were refreshed in November; their vs-gnubg and PR columns are still those of the models they replaced, now in [best_models/history/](best_models/history/) (`6afda0f8`, `de9e6e84`, `ac95a983`, `b3fad4eb`). Each refreshed model beats the one it replaced; full re-evaluation pending.*
 
 ## How It Works
 

@@ -30,7 +30,7 @@ The production column is in [h2h_experimental_vs_prod.csv](../../../experiments/
 
 Reference points on the gnubg scale: the production prob5 4L reads +45.8, the 6L cubeful teacher about +91.
 The two-layer nets beat gnubg 0-ply. The one-layer nets do not. The production comparisons are against
-`cubeless_prob5_512_512_256_256.pt` (`ac95a983`) and `cubeful_money_512_512_256_256.pt` (`6afda0f8`),
+`history/cubeless_prob5_512_512_256_256_ac95a983.pt` and `history/cubeful_money_512_512_256_256_6afda0f8.pt`,
 10,000,000 games each.
 
 ## The three-layer prob5 net

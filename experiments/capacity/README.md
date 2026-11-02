@@ -18,7 +18,7 @@ python experiments/head_to_head/run.py \
     --side2 best_models/cubeful_money_512_512_256_256.pt \
     --game-mode cubeful-money --jacoby --games 250000 --workers 48 --save DIR
 python experiments/head_to_head/run.py \
-    --side1 best_models/cubeless_prob5_768_512_256_256_256.pt \
+    --side1 best_models/experimental/cubeless_prob5_768_512_256_256_256.pt \
     --side2 best_models/cubeless_prob5_512_512_256_256.pt \
     --game-mode cubeless-money --games 250000 --workers 48 --save DIR
 python experiments/head_to_head/run.py --combine DIR
@@ -66,7 +66,7 @@ aggregates, cube rows included: `../benchmarks/results/<host>_20261014/`
 | prob5 3-layer | [`cubeless_prob5_512_512_256.pt`](../../best_models/experimental/small_models/cubeless_prob5_512_512_256.pt) | [512,512,256] | 496,133 | `3da8e498` | -3.7 [-4.5, -2.8] | 10M | 5,726 (0.88×) | 5,237 (0.89×) | 42,485 (0.88×) | 18,115 (0.88×) |
 | prob5 4-layer (production) | [`cubeless_prob5_512_512_256_256.pt`](../../best_models/cubeless_prob5_512_512_256_256.pt) | [512,512,256,256] | 561,925 | `ac95a983` | --- |  | 5,032 (1.00×) | 4,644 (1.00×) | 37,288 (1.00×) | 15,866 (1.00×) |
 | prob5 5-layer | [`cubeless_prob5_512_512_256_256_256.pt`](../../best_models/experimental/cubeless_prob5_512_512_256_256_256.pt) | [512,512,256,256,256] | 627,717 | `bade7d51` | +1.9 [+1.1, +2.8] | 10M | 4,571 (1.10×) | 4,180 (1.11×) | 33,949 (1.10×) | 14,363 (1.10×) |
-| prob5 5-layer wide | [`cubeless_prob5_768_512_256_256_256.pt`](../../best_models/cubeless_prob5_768_512_256_256_256.pt) | [768,512,256,256,256] | 809,221 | `bd1a7931` | +5.2 [+4.3, +6.0] | 10M | 3,619 (1.39×) | 3,297 (1.41×) | 27,182 (1.37×) | 11,169 (1.42×) |
+| prob5 5-layer wide | [`cubeless_prob5_768_512_256_256_256.pt`](../../best_models/experimental/cubeless_prob5_768_512_256_256_256.pt) | [768,512,256,256,256] | 809,221 | `bd1a7931` | +5.2 [+4.3, +6.0] | 10M | 3,619 (1.39×) | 3,297 (1.41×) | 27,182 (1.37×) | 11,169 (1.42×) |
 | prob5 6-layer wide | [`cubeless_prob5_768_512_256_256_256_256.pt`](../../best_models/experimental/cubeless_prob5_768_512_256_256_256_256.pt) | [768,512,256,256,256,256] | 875,013 | `a9df2ffc` | +6.7 [+5.8, +7.6] | 10M | 3,332 (1.51×) | 3,056 (1.52×) | 25,668 (1.45×) | 10,563 (1.50×) |
 | prob5 5-layer 768x768 | [`cubeless_prob5_768_768_256_256_256.pt`](../../best_models/experimental/cubeless_prob5_768_768_256_256_256.pt) | [768,768,256,256,256] | 1,071,621 | `b3fad4eb` | +9.7 [+8.9, +10.6] | 10M | 2,748 (1.83×) | 2,564 (1.81×) | 20,474 (1.82×) | 8,305 (1.91×) |
 
