@@ -256,7 +256,10 @@ static int episode_cubeful(bgc_engine *e, const bgc_collect_opts *o, bgc_rng *rn
             if (dbl && !take) return EP_KEPT;                /* dropped: episode ends */
             if (dbl) {                                       /* after_take(player) */
                 cube.owner = (1 - player) + 1;
-                cube.value *= 2;
+                /* value stays 1: features and targets are per unit of
+                 * cube, and doubling it would overflow after many
+                 * redoubles. Ownership still records the turned cube
+                 * (Jacoby reads it). No doubling cap is imposed. */
             }
         }
 
@@ -318,6 +321,7 @@ long bgc_collect(bgc_engine *e, const bgc_collect_opts *o, unsigned long long se
     if (kind != BGC_KIND_PROB && kind != BGC_KIND_EQUITY && kind != BGC_KIND_CUBEFUL
         && kind != BGC_KIND_PROB5)
         return -1;
+    if (kind == BGC_KIND_CUBEFUL && bgc_i_cubeful_bearoff(e)) return -1;  /* TDAgent's samples only */
     const bgc_encoder *en = bgc_i_encoder(e);
     if (!en->collect) {
         fprintf(stderr, "bgc_collect: encoder %s: no C collector (encoder table: "

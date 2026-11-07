@@ -22,9 +22,9 @@ within the reported CI, it does not replay the games.
   `14184acc9c60ef67be0fad88548fd51a`.
 - PureTD:
   [best_models/cubeless_prob5_512_512_256_256.pt](../../best_models/cubeless_prob5_512_512_256_256.pt)
-  (md5 `ac95a983`) and
+  (md5 `88b03c1c`) and
   [best_models/cubeful_money_512_512_256_256.pt](../../best_models/cubeful_money_512_512_256_256.pt)
-  (md5 `6afda0f8`). Every `.npz` and CSV row carries the side's md5, and
+  (md5 `4e25e4f7`). Every `.npz` and CSV row carries the side's md5, and
   `--combine` refuses to pool across md5s.
 
 ```bash
@@ -139,10 +139,52 @@ A 10M-game row is either `--games 10000000` or batches run with
 python experiments/head_to_head/run.py --combine DIR
 ```
 
+## Luck-adjusted scoring (`variance.py`)
+
+`variance.py` plays cubeless or cubeful money on paired dice (the two games
+of a pair use the same dice with the seats swapped) and subtracts each
+game's dice luck as judged by a fixed PureTD reference net: on every turn
+after the opening roll, the reference's value of the roll that came up
+minus its average over the 21 possible rolls. The correction has mean
+zero, so the adjusted mean estimates the same mEq/game as plain games with
+a much smaller confidence interval. Sides are PureTD checkpoints at 0-ply
+or 1-ply (`--oneply1`, `--oneply2`; 1-ply uses the `PURETD_ROOT_FILTER`
+root filter, recorded in the output) or `gnubg-ext`, `gnubg-ext-full`,
+`gnubg-ext-rootfull` at `--plies 0..4`. The reference (`--reference`,
+default the production 4-layer net of the game mode) must be a PureTD
+money net.
+
+```bash
+# Production prob5 4L vs the prob5 3L (the defaults); reference = the 4L.
+python experiments/head_to_head/variance.py --pairs 10000 --workers 16 \
+  --seed 20261024 --out DIR/pilot_4l.npz
+
+# Cubeful money (Jacoby on; --no-jacoby for the variant) vs gnubg 0-ply,
+# luck reference = the former production net, as in the top README.
+python experiments/head_to_head/variance.py --game-mode cubeful-money \
+  --side1 best_models/cubeful_money_512_512_256_256.pt --side2 gnubg-ext --plies 0 \
+  --reference best_models/history/cubeful_money_512_512_256_256_6afda0f8.pt \
+  --pairs 100000 --workers 16 --seed 20261105 --out DIR/cf4l_vs_gnubg0.npz
+
+# Summarize; runs with disjoint seeds or --pair-start ranges pool.
+python experiments/head_to_head/variance.py --summarize DIR/*.npz
+```
+
+Every game is also played without the correction, which checks that the
+correction changes neither play nor dice and times both paths. `--beta`
+(default 1) is fixed before a run. CIs are normal over pair means. Cubeful
+runs also report the estimate with the payoff clipped to ±128 before the
+luck is subtracted. A run writes a `.npz` (per-game payoff, luck, turns,
+timings, metadata) and a `.json` summary; `run.py --combine` does not read
+them.
+
 ## Results
 
 mEq/game from PureTD's perspective (positive = PureTD ahead), with bootstrap
-95% CIs. 1-ply baselines use their default move pruning. Cubeful rows are the capped (±128) mean, Jacoby on. Summaries:
+95% CIs. Rows measure the former production nets `6afda0f8` (cubeful) and
+`ac95a983` (prob5), now in `best_models/history/`. Luck-adjusted gnubg rows
+for the current nets are in the [top README](../../README.md).
+1-ply baselines use their default move pruning. Cubeful rows are the capped (±128) mean, Jacoby on. Summaries:
 [results/h2h_cubeless_summary.csv](results/h2h_cubeless_summary.csv),
 [results/h2h_cubeful_summary.csv](results/h2h_cubeful_summary.csv); the
 Best 3L cubeful, Best 4L cubeless, Best 3L cubeless and Best DMP rows:

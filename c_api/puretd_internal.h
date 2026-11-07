@@ -163,6 +163,29 @@ BGC_HIDDEN int bgc_i_jan_offer(bgc_engine *e, const BoardState *s, const bgc_cub
 BGC_HIDDEN int bgc_i_jan_respond(bgc_engine *e, const BoardState *s, const bgc_cube *cube,
                                  int plies, const bgc_cube_eval *hint);
 
+/* ── CUBEFUL + bearoff tables (bearoff_td.BearoffTDAgent) ─────────
+ * puretd_janowski.c's bearoff.py ports for the cubeful engine (puretd.c):
+ * a routing context per engine (the table, the tiers: two-sided only, or
+ * also the hazard DP; a hazard-DP cache), the exact folded value of a
+ * position and the exact cube values of a root. */
+struct bgc_boroute;
+BGC_HIDDEN struct bgc_boroute *bgc_i_bo_new(const bgc_bearoff *t, int hazard);
+BGC_HIDDEN void bgc_i_bo_free(struct bgc_boroute *r);
+BGC_HIDDEN void bgc_i_bo_set_hazard(struct bgc_boroute *r, int hazard);
+/* bearoff.may_reach_bearoff(s, plies). */
+BGC_HIDDEN int bgc_i_bo_may_reach(const BoardState *s, int plies);
+/* v[c] = bearoff.race_equity(s, c, with_own_fold=True, hazard) for the
+   three cube perspectives c of s->turn: 1, or 0 when no tier applies; -1
+   on allocation failure. _row: the same from s's perspective196 row. */
+BGC_HIDDEN int bgc_i_bo_folded(struct bgc_boroute *r, const BoardState *s, double v[3]);
+BGC_HIDDEN int bgc_i_bo_folded_row(struct bgc_boroute *r, const float *row, double v[3]);
+/* bearoff.race_cube_values(s, persp, hazard): 1 and (nd, dt), 0, -1. */
+BGC_HIDDEN int bgc_i_bo_cube(struct bgc_boroute *r, const BoardState *s, int persp,
+                             double *nd, double *dt);
+/* bgc_set_bearoff on a CUBEFUL engine (puretd.c); whether one is attached. */
+BGC_HIDDEN int bgc_i_cubeful_set_bearoff(bgc_engine *e, const bgc_bearoff *t);
+BGC_HIDDEN int bgc_i_cubeful_bearoff(const bgc_engine *e);
+
 /* ── profile build ────────────────────────────────────────────────
  * CFLAGS_EXTRA=-DBGC_PROFILE: CLOCK_MONOTONIC counters per (context,
  * step), read with bgc_prof_read / cleared with bgc_prof_reset (exported

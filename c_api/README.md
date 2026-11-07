@@ -63,6 +63,7 @@ generation, selection, cube logic and the game loop are shared (`puretd.c`).
 | `bgc_value(e, s, cube, ica)` | 0-ply net value, `s->turn`'s view (prob5: clamped equity) |
 | `bgc_value_prob5(e, s, probs, eq)` | prob5: the 5 clamped probabilities and the equity |
 | `bgc_value_1ply(e, s, cube)` | 1-ply checker value for the player on roll |
+| `bgc_dice_values(e, s, cube, values)` | money: all 21 mover-view reference values from one expansion (per unit of cube) |
 | `bgc_best_move(e, s, d1, d2, cube, plies, ...)` | checker play: index in `get_legal_plays` order, -1 forced pass |
 | `bgc_score_moves(...)` | every candidate's selector score (mover's view) |
 | `bgc_value_1ply_play(e, s, d1, d2, cube, &v1, ...)` | `bgc_value_1ply` + `bgc_best_move` at 0-ply from one expansion (the roll's candidates are expansion replies; bitwise the two calls' results on `ref`/`simd`, the two calls on the others) |
@@ -72,6 +73,7 @@ generation, selection, cube logic and the game loop are shared (`puretd.c`).
 | `bgc_jan_*`, `bgc_bo_*` | the Janowski conversion and the bearoff tables alone (parity tests) |
 | `bgc_rng_*` | `random.Random(seed)`-compatible MT19937 |
 | `bgc_play_game(white, black, opts, rng, res, rec, ctx)` | one cubeful or cubeless game, optional per-decision callback |
+| `bgc_play_game_vr(...)` | money game plus a centered dice-luck sum in actual points, with unchanged play and RNG |
 | `bgc_collect(e, opts, seed, n, enc, tgt, cap, &n_discarded)` | `trainer.collect_episode` samples of `n` self-play episodes (dmp, cubeless money, cubeful money; 0-ply or 1-ply targets, 0-ply play, argmin), one `random.Random(seed)` stream; -2 when `cap` rows do not fit (replay the seed); -3 (`BGC_COLLECT_UNSUPPORTED`) for an encoder without a C collector |
 | `bgc_bench_checker` / `bgc_bench_cube` / `bgc_bench_selfplay` | benchmark loops timed inside C |
 
@@ -82,6 +84,28 @@ generation, selection, cube logic and the game loop are shared (`puretd.c`).
 | `BGC_KIND_CUBEFUL` | cubeful encoder, per-unit cubeful equity | checker play as `TDAgent.choose_checker_action` (centered, 0-ply); values NAN |
 | `BGC_KIND_PROB5` | cubeless encoder, 5 sigmoids | yes |
 | `BGC_KIND_PROB5JAN` (6) | a perspective196 prob5 net opened by `bgc_open_janowski` | no: the error value |
+
+## Dice luck correction (money games)
+
+`play_game(white, black, opts, rng, reference=ref, vr_every=1)` plays the
+ordinary game and adds `luck_white` and `n_corrected` to the result.
+`luck_white` is the sum, in White's points, over the corrected turns of the
+reference net's value of the roll that came up minus its average over the
+21 rolls. The opening roll is not corrected, then every `vr_every`-th turn
+is. Both terms use the reference's own best 0-ply move for each roll,
+passes and terminal moves included, so no player decision enters the
+correction, and play and the dice stream are those of the ordinary game.
+The two players and the reference share one backend and the game mode's
+kind (EQUITY or PROB5 cubeless, CUBEFUL cubeful); PROB5JAN and DMP
+references are not supported.
+`Engine.dice_values(state, ms=None)` returns the same 21 values in
+`(1,1), (1,2), ..., (6,6)` order, per unit of the cube in cubeful games
+(ownership and Jacoby applied). The cubeful loop corrects after the cube
+action, multiplies the centered term by the current cube and adds nothing
+on a drop. A cube that would overflow a C int is an error, not a cap. The
+adjusted score is `payoff - beta * luck_white`, estimated over seat-swapped
+pairs by
+[`experiments/head_to_head/variance.py`](../experiments/head_to_head/variance.py).
 
 ## Prob5Jan (money Janowski)
 
@@ -181,7 +205,7 @@ both committed pools it picks the full-width move on 100% of prob5 and
   count unless Jacoby with a centered cube.
 - `bgc_respond_to_double`: `s->turn` is the doubler; the result is the
   responder's take (1) or pass (0). The hint is used when its `plies`
-  match.
+  match and its values were computed.
 - Ties: first candidate in `get_legal_plays` order.
 - Terminal successors score their result (1/2/3; 1 under Jacoby with a
   centered cube; 1.0 for P(win) nets), never the net output.

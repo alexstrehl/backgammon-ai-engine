@@ -117,8 +117,8 @@ def _stale(so, backend):
         return True
     srcs = [os.path.join(CAPI, f) for f in os.listdir(CAPI)
             if f.startswith(f"backend_{backend}.") or f in (
-                "puretd.c", "puretd_collect.c", "puretd.h", "puretd_internal.h",
-                "puretd_backend.h", "build.sh")]
+                "puretd.c", "puretd_collect.c", "puretd_janowski.c", "puretd.h",
+                "puretd_internal.h", "puretd_backend.h", "build.sh")]
     srcs += [os.path.join(REPO, "c_engine", "bg_engine.c"),
              os.path.join(REPO, "c_engine", "bg_engine.h"),
              os.path.join(REPO, "c_inference", "nn_eval.c"),

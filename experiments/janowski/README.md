@@ -32,10 +32,10 @@ beyond the two-sided table without gammons the hazard DP is approximate
 ## Inputs
 
 - PureTD, side `bo:`:
-  [best_models/cubeful_money_512_512_256_256.pt](../../best_models/cubeful_money_512_512_256_256.pt)
+  [best_models/history/cubeful_money_512_512_256_256_6afda0f8.pt](../../best_models/history/cubeful_money_512_512_256_256_6afda0f8.pt)
   (md5 `6afda0f85b039a186f018753120ed74c`).
 - Prob5Jan, side `janowski:`:
-  [best_models/cubeless_prob5_512_512_256_256.pt](../../best_models/cubeless_prob5_512_512_256_256.pt)
+  [best_models/history/cubeless_prob5_512_512_256_256_ac95a983.pt](../../best_models/history/cubeless_prob5_512_512_256_256_ac95a983.pt)
   (md5 `ac95a983a114c269257225e0b84a5d9f`). `JANOWSKI_X=<x>` sets the
   cube-life index; unset is 0.76.
 - Bearoff tables, built once into `~/.cache`
@@ -62,8 +62,8 @@ x = 0.76; prefix `JANOWSKI_X=<x>` for the other rows. By default
 
 ```bash
 OMP_NUM_THREADS=1 python experiments/head_to_head/run.py \
-    --side1 bo:best_models/cubeful_money_512_512_256_256.pt \
-    --side2 janowski:best_models/cubeless_prob5_512_512_256_256.pt \
+    --side1 bo:best_models/history/cubeful_money_512_512_256_256_6afda0f8.pt \
+    --side2 janowski:best_models/history/cubeless_prob5_512_512_256_256_ac95a983.pt \
     --game-mode cubeful-money --games 1000000 --workers 48 --log-runaway 256 --save DIR
 python experiments/head_to_head/run.py --combine DIR
 ```

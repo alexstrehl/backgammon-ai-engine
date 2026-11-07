@@ -193,7 +193,8 @@ class GameRecord:
     jacoby: bool = True            # rule the game was played under (cubeful only)
 
 
-def play_and_record(agent_white, agent_black, rng=None) -> GameRecord:
+def play_and_record(agent_white, agent_black, rng=None, *, on_roll=None,
+                    record_moves=True) -> GameRecord:
     """Play a full cubeless game, recording every dice roll and move.
 
     Both agents should implement choose_checker_action(state, dice, plays).
@@ -202,6 +203,9 @@ def play_and_record(agent_white, agent_black, rng=None) -> GameRecord:
     (e.g. a ``random.Random``); every die of this game, opening roll
     included, is drawn from it and nothing else touches it. ``None``
     (default) draws from the global ``random`` module.
+    ``on_roll(state, dice, None)`` observes every roll, the opening and
+    forced passes included. It must not mutate the position or draw game
+    dice. ``record_moves=False`` skips the move list and keeps the result.
     """
     if rng is None:
         rng = random
@@ -216,32 +220,32 @@ def play_and_record(agent_white, agent_black, rng=None) -> GameRecord:
             first_roll = False
         else:
             d1, d2 = rng.randint(1, 6), rng.randint(1, 6)
+        if on_roll is not None:
+            on_roll(state, (d1, d2), None)
         plays = get_legal_plays(state, (d1, d2))
 
         if plays:
             agent = agent_white if state.turn == WHITE else agent_black
             play, next_state = agent.choose_checker_action(state, (d1, d2), plays)
-            if play is None:
+            if record_moves and play is None:
                 # Successor-only agents (e.g. gnubg-ext) return no Play:
                 # recover it, since a blank move scores 0 error.
                 for _p, _s in plays:
                     if _s == next_state:
                         play = _p
                         break
-            record.moves.append(MoveRecord(
-                player=state.turn,
-                dice=(d1, d2),
-                play=play,
-            ))
+            if record_moves:
+                record.moves.append(MoveRecord(
+                    player=state.turn, dice=(d1, d2), play=play,
+                ))
             # next_state already has turn switched (engine convention)
             state = next_state
         else:
             # No legal moves: record the dice roll with an empty play.
-            record.moves.append(MoveRecord(
-                player=state.turn,
-                dice=(d1, d2),
-                play=(),
-            ))
+            if record_moves:
+                record.moves.append(MoveRecord(
+                    player=state.turn, dice=(d1, d2), play=(),
+                ))
             state = switch_turn(state)
 
     record.winner = state.winner()
@@ -252,6 +256,7 @@ def play_and_record(agent_white, agent_black, rng=None) -> GameRecord:
 def play_and_record_cubeful(
     agent_white, agent_black, jacoby: bool = True,
     record_moves: bool = True, rng=None, cube_cap: int = None,
+    *, on_roll=None,
 ) -> GameRecord:
     """Play a full cubeful money game, recording dice, moves, and cube
     actions. Both agents must support offer_double / respond_to_double /
@@ -265,6 +270,9 @@ def play_and_record_cubeful(
     ``rng`` (optional): a dedicated dice source with ``randint(a, b)``;
     every die of this game, opening roll included, comes from it. ``None``
     (default) draws from the global ``random`` module.
+    ``on_roll(state, dice, match_state)`` observes every roll, after any
+    double/take and before checker play. A drop has no roll and no
+    callback. It must not mutate its arguments or draw game dice.
     """
     from modes import MatchState, CubeOwner
 
@@ -320,6 +328,8 @@ def play_and_record_cubeful(
             d1, d2 = opening_dice
         else:
             d1, d2 = rng.randint(1, 6), rng.randint(1, 6)
+        if on_roll is not None:
+            on_roll(state, (d1, d2), match_state)
         result = agent.choose_checker_action_cubeful(
             state, (d1, d2), match_state,
         )

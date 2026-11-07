@@ -1,6 +1,8 @@
 /*
  * puretd_janowski.c -- Prob5Jan: a cubeless prob5 net under the Janowski
- * money cube layer (BGC_KIND_PROB5JAN), and the bearoff tables it reads.
+ * money cube layer (BGC_KIND_PROB5JAN), and the bearoff tables it reads
+ * (also routed for the cubeful engine: the bgc_i_bo_* helpers at the end,
+ * bearoff_td.BearoffTDAgent's exact values, driven by puretd.c).
  *
  * The Python modules are the reference, ported function for function:
  *   janowski.py         bgc_jan_equity, _folded, _cubeless_equity, _fold,
@@ -465,6 +467,23 @@ static double haz_equity(const double dp[3], int persp, int fold) {
     return cap > nd ? cap : nd;
 }
 
+typedef struct { int a, b; double dp[3]; } haz_slot;
+
+/* _race_dp values of one-sided rows (a, b) through a cache of HC_SLOTS
+   (NaN in dp[0] on allocation failure, not cached). */
+static void haz_cached(haz_slot *hc, const bgc_bearoff *t, int a, int b, double dp[3]) {
+    haz_slot *h = &hc[((unsigned)a * 40503u + (unsigned)b) & (HC_SLOTS - 1)];
+    if (h->a == a && h->b == b) {
+        memcpy(dp, h->dp, sizeof h->dp);
+        return;
+    }
+    race_dp3(t, a, b, dp);
+    if (isnan(dp[0])) return;
+    h->a = a;
+    h->b = b;
+    memcpy(h->dp, dp, sizeof h->dp);
+}
+
 /* ── the tables alone ──────────────────────────────────────────── */
 
 static int bo_args_ok(const bgc_bearoff *t, const BoardState *s) {
@@ -547,8 +566,6 @@ int bgc_bo_race_equity(const bgc_bearoff *t, const BoardState *s, int persp, int
    value per branch, cubeless equity, the probabilities used. */
 typedef struct { double v[2], sec, p[5]; } leaf;
 
-typedef struct { int a, b; double dp[3]; } haz_slot;
-
 struct bgc_jan {
     double x;
     int board_sanity;
@@ -593,6 +610,7 @@ int bgc_set_jan(bgc_engine *e, const bgc_jan_opts *o) {
 }
 
 int bgc_set_bearoff(bgc_engine *e, const bgc_bearoff *t) {
+    if (e && bgc_kind(e) == BGC_KIND_CUBEFUL) return bgc_i_cubeful_set_bearoff(e, t);
     if (!e || bgc_kind(e) != BGC_KIND_PROB5JAN) return -1;
     bgc_i_jan(e)->bo = t;
     return 0;
@@ -600,16 +618,7 @@ int bgc_set_bearoff(bgc_engine *e, const bgc_bearoff *t) {
 
 /* _race_dp values of one-sided rows (a, b), cached. */
 static void haz_dp(struct bgc_jan *j, int a, int b, double dp[3]) {
-    haz_slot *h = &j->hc[((unsigned)a * 40503u + (unsigned)b) & (HC_SLOTS - 1)];
-    if (h->a == a && h->b == b) {
-        memcpy(dp, h->dp, sizeof h->dp);
-        return;
-    }
-    race_dp3(j->bo, a, b, dp);
-    if (isnan(dp[0])) return;
-    h->a = a;
-    h->b = b;
-    memcpy(h->dp, dp, sizeof h->dp);
+    haz_cached(j->hc, j->bo, a, b, dp);
 }
 
 /* Branch cubes: the leaf player's cube perspective, jacoby and whether
@@ -933,4 +942,102 @@ int bgc_i_jan_respond(bgc_engine *e, const BoardState *s, const bgc_cube *cube, 
     double nd, dt;
     if (jan_cube_values(e, s, cube, plies, &nd, &dt)) return -1;
     return dt <= 1.0;
+}
+
+/* ── CUBEFUL bearoff routing (puretd.c; bearoff_td.BearoffTDAgent) ── */
+
+struct bgc_boroute {
+    const bgc_bearoff *t;
+    int hazard;                     /* route the hazard tier too (_exact_tier) */
+    Play *tsplays;                  /* ts_wnd scratch, MAX_PLAYS, lazily */
+    haz_slot hc[HC_SLOTS];          /* _race_dp cache by one-sided rows */
+};
+
+struct bgc_boroute *bgc_i_bo_new(const bgc_bearoff *t, int hazard) {
+    struct bgc_boroute *r = calloc(1, sizeof(*r));
+    if (!r) return NULL;
+    r->t = t;
+    r->hazard = hazard != 0;
+    for (int i = 0; i < HC_SLOTS; i++) r->hc[i].a = -1;
+    return r;
+}
+
+void bgc_i_bo_free(struct bgc_boroute *r) {
+    if (!r) return;
+    free(r->tsplays);
+    free(r);
+}
+
+void bgc_i_bo_set_hazard(struct bgc_boroute *r, int hazard) { r->hazard = hazard != 0; }
+
+/* bearoff.may_reach_bearoff: pips outside home (19 a bar checker) within
+   one move for the player on roll, and within one more (plies >= 2) or
+   none for the other. */
+int bgc_i_bo_may_reach(const BoardState *s, int plies) {
+    int out[2];
+    for (int p = 0; p < 2; p++) {
+        int n = 19 * s->bar[p];
+        for (int i = 0; i < 24; i++) {
+            const int v = s->points[i];
+            if (p == WHITE && v > 0 && i >= 6) n += v * (i - 6 + 1);
+            else if (p == BLACK && v < 0 && i < 18) n += -v * (18 - i);
+        }
+        out[p] = n;
+    }
+    return out[s->turn] <= 24 && out[1 - s->turn] <= (plies >= 2 ? 24 : 0);
+}
+
+/* _exact_tier of a view under r's tiers. */
+static int route_tier(const struct bgc_boroute *r, const bo_view *v, int *a, int *b) {
+    const int tier = exact_tier(r->t, v, a, b);
+    return tier == TIER_HAZ && !r->hazard ? TIER_NONE : tier;
+}
+
+/* race_equity(., c, with_own_fold=True) for c = 0..2 of a view. */
+static int folded_view(struct bgc_boroute *r, const bo_view *v, double out[3]) {
+    if (!v->cls) return 0;
+    int a, b;
+    const int tier = route_tier(r, v, &a, &b);
+    if (tier == TIER_NONE) return 0;
+    if (tier == TIER_TS) {                  /* V is the fold (build_ts_table) */
+        for (int c = 0; c < 3; c++) out[c] = ts_V(r->t, a, b, c);
+        return 1;
+    }
+    double dp[3];
+    haz_cached(r->hc, r->t, a, b, dp);
+    if (isnan(dp[0])) return -1;
+    for (int c = 0; c < 3; c++) out[c] = haz_equity(dp, c, 1);
+    return 1;
+}
+
+int bgc_i_bo_folded(struct bgc_boroute *r, const BoardState *s, double v[3]) {
+    bo_view w;
+    view_state(s, &w);
+    return folded_view(r, &w, v);
+}
+
+int bgc_i_bo_folded_row(struct bgc_boroute *r, const float *row, double v[3]) {
+    bo_view w;
+    view_row(row, &w);
+    return folded_view(r, &w, v);
+}
+
+int bgc_i_bo_cube(struct bgc_boroute *r, const BoardState *s, int persp, double *nd,
+                  double *dt) {
+    bo_view v;
+    view_state(s, &v);
+    if (!v.cls) return 0;
+    int a, b;
+    const int tier = route_tier(r, &v, &a, &b);
+    if (tier == TIER_NONE) return 0;
+    if (tier == TIER_TS) {
+        if (!r->tsplays && !(r->tsplays = malloc(MAX_PLAYS * sizeof(Play)))) return -1;
+        return tier_cube_values(r->t, tier, a, b, persp, r->tsplays, nd, dt) ? -1 : 1;
+    }
+    double dp[3];
+    haz_cached(r->hc, r->t, a, b, dp);
+    if (isnan(dp[0])) return -1;
+    *nd = dp[persp];
+    *dt = 2.0 * dp[PERSP_THEIRS];
+    return 1;
 }

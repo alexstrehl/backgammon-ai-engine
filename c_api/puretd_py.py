@@ -20,6 +20,10 @@ board_sanity=True, bearoff=True)` / `CAgent(..., janowski=True)`; the
 bearoff tables come from `BearoffTable` (bearoff.c_table_path()'s flat
 file, one mmap per process and backend); `JanowskiC` mirrors janowski.py's
 conversion and bearoff.py's exact values for parity tests.
+Cubeful + bearoff tables (bearoff_td.BearoffTDAgent, side bo:):
+`Engine(cubeful_model, bearoff=True, bearoff_hazard=True)` /
+`CAgent(..., bearoff=True)`; bearoff_hazard=False routes the two-sided
+table only.
 A .pt is exported to BGNN in a private 0700 temp dir (removed at exit);
 the export names the net's encoder (export_weights.py format 2) and
 bgc_open resolves it through the C API's encoder table (Engine.encoder;
@@ -51,7 +55,7 @@ BACKENDS = ("torch", "simd", "cblas", "ref")
 PLAY_BACKEND = "simd"       # fastest at play batch sizes
 
 # puretd.h BGC_ABI_VERSION; bump both on any public struct or signature change.
-ABI_VERSION = 1
+ABI_VERSION = 4
 _ABI_TAG = f"puretd-abi:{ABI_VERSION}\0".encode()
 
 KIND_PROB, KIND_EQUITY, KIND_CUBEFUL, KIND_PROB5 = 0, 1, 2, 3
@@ -284,6 +288,7 @@ def load_lib(backend):
         "bgc_value": ([E, BS, P(CCube), I], F),
         "bgc_value_prob5": ([E, BS, P(F), P(F)], I),
         "bgc_value_1ply": ([E, BS, P(CCube)], F),
+        "bgc_dice_values": ([E, BS, P(CCube), P(D)], I),
         "bgc_best_move": ([E, BS, I, I, P(CCube), I, BS, P(_CPlay), P(F)], I),
         "bgc_score_moves": ([E, BS, I, I, P(CCube), I, P(F), BS], I),
         "bgc_value_1ply_play": ([E, BS, I, I, P(CCube), P(F), BS, P(F)], I),
@@ -296,6 +301,8 @@ def load_lib(backend):
         "bgc_rng_randint": ([P(CRng), I, I], I),
         "bgc_play_game": ([E, E, P(CGameOpts), P(CRng), P(CGameResult),
                            RECORD_FN, ctypes.c_void_p], I),
+        "bgc_play_game_vr": ([E, E, P(CGameOpts), P(CRng), P(CGameResult),
+                              E, I, P(D), P(I), RECORD_FN, ctypes.c_void_p], I),
         "bgc_collect": ([E, P(CCollectOpts), ctypes.c_ulonglong, I, P(F), P(F),
                          ctypes.c_long, P(I)], ctypes.c_long),
         "bgc_bench_checker": ([E, BS, P(I), P(CCube), I, I, P(D)], I),
@@ -310,6 +317,7 @@ def load_lib(backend):
         "bgc_bearoff_open": ([ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t], BO),
         "bgc_bearoff_close": ([BO], None),
         "bgc_set_bearoff": ([E, BO], I),
+        "bgc_set_bearoff_hazard": ([E, I], I),
         "bgc_jan_equity": ([D5, I, D, I], D),
         "bgc_jan_equity_folded": ([D5, I, D, I], D),
         "bgc_jan_cubeless_equity": ([D5], D),
@@ -634,11 +642,17 @@ class JanowskiC:
 class Engine:
     """One bgc_engine: a model on one backend. Thread-confined.
     janowski=True: a prob5 model as Prob5Jan (x None = janowski.DEFAULT_X;
-    bearoff: True = the default BearoffTable, a path, a BearoffTable, or
-    False = no exact bearoff)."""
+    bearoff: None/True = the default BearoffTable, a path, a BearoffTable,
+    or False = no exact bearoff). A cubeful model with bearoff (True, a
+    path or a BearoffTable; default None = none) plays as
+    bearoff_td.BearoffTDAgent; bearoff_hazard=False routes the two-sided
+    table only."""
 
     def __init__(self, model, backend=None, root_filter=0.0, janowski=False, x=None,
-                 board_sanity=True, bearoff=True):
+                 board_sanity=True, bearoff=None, bearoff_hazard=True):
+        if janowski and not bearoff_hazard:
+            raise ValueError("the C Prob5Jan routes both bearoff tiers "
+                             "(bearoff_hazard=False is cubeful-only)")
         self.backend = backend or default_backend()
         self.lib = _jan_lib(self.backend) if janowski else load_lib(self.backend)
         self._bearoff = None
@@ -668,9 +682,12 @@ class Engine:
         self._states = (_CBoardState * MAX_PLAYS)()
         self.root_filter = 0.0
         self.set_root_filter(root_filter)
+        self.bearoff_hazard = True
         if janowski:
             self.set_jan(x, board_sanity)
-            self.set_bearoff(bearoff)
+            self.set_bearoff(True if bearoff is None else bearoff)
+        elif bearoff:
+            self.set_bearoff(bearoff, hazard=bearoff_hazard)
 
     def set_jan(self, x=None, board_sanity=True):
         """Prob5Jan's x (None: janowski.DEFAULT_X) and board_sanity."""
@@ -680,12 +697,23 @@ class Engine:
             raise ValueError(f"bgc_set_jan failed (kind {self.kind}, x {x!r})")
         self.x, self.board_sanity = o.x, bool(board_sanity)
 
-    def set_bearoff(self, table=True):
-        """Prob5Jan's exact bearoff tables: True (default table), a path,
-        a BearoffTable, or None/False (off)."""
+    def set_bearoff(self, table=True, hazard=None):
+        """Exact bearoff tables: True (default table), a path, a
+        BearoffTable, or None/False (off). Prob5Jan: bearoff_exact.
+        Cubeful: BearoffTDAgent's routing; `hazard` False = the two-sided
+        table only, True = also the hazard DP (the default at open), None
+        = unchanged."""
+        if hazard is not None:
+            if self.lib.bgc_set_bearoff_hazard(self.h, int(bool(hazard))) != 0:
+                raise ValueError(f"bgc_set_bearoff_hazard: cubeful engines only "
+                                 f"(kind {self.kind})")
+            self.bearoff_hazard = bool(hazard)
         t = _bearoff_table(table, self.backend)
         if self.lib.bgc_set_bearoff(self.h, t.h if t is not None else None) != 0:
-            raise ValueError(f"bgc_set_bearoff failed (kind {self.kind})")
+            self._bearoff = None
+            raise ValueError(f"bgc_set_bearoff failed (kind {self.kind}, encoder "
+                             f"{self.encoder}): Prob5Jan, or a cubeful net on "
+                             f"perspective196")
         self._bearoff = t                         # keeps the mmap alive
 
     def set_root_filter(self, thresh):
@@ -724,6 +752,22 @@ class Engine:
     def value_1ply(self, state, ms=None):
         return self.lib.bgc_value_1ply(self.h, ctypes.byref(_python_to_c(state)),
                                        _cube_arg(ms))
+
+    def dice_values(self, state, ms=None):
+        """The 21 mover-view money reference values, passes included.
+
+        Dice order (1,1), (1,2), ..., (6,6). All values come from one
+        expansion, so a luck correction takes both of its terms from them.
+        Cubeful: `ms` is required and the values are per unit of its cube.
+        Cubeless: `ms` must be None. PROB5JAN and DMP are not supported.
+        """
+        values = np.empty(21, dtype=np.float64)
+        if self.lib.bgc_dice_values(
+                self.h, ctypes.byref(_python_to_c(state)), _cube_arg(ms),
+                values.ctypes.data_as(ctypes.POINTER(ctypes.c_double))):
+            raise ValueError("dice_values requires a nonterminal state, a money model, "
+                             "and a valid matching cube (cubeful only)")
+        return values
 
     # checker
     def best_move(self, state, dice, ms=None, plies=0):
@@ -804,6 +848,9 @@ class Engine:
         (-2), the seed is replayed into the call's own buffers from twice
         that capacity, and the result does not share memory with `out`
         (compare `enc.ctypes.data`)."""
+        if self.kind == KIND_CUBEFUL and self._bearoff is not None:
+            raise ValueError("bgc_collect: a cubeful engine with bearoff tables "
+                             "attached does not collect (set_bearoff(False) first)")
         if isinstance(opts, CCollectOpts):
             o = CCollectOpts(opts.oneply, opts.jacoby, opts.max_plies)
             for k, v in kwargs.items():
@@ -896,13 +943,25 @@ class Engine:
         return secs, decs, dict(zip(keys, list(tot)))
 
 
-def play_game(white, black, opts, rng, record=False):
+def play_game(white, black, opts, rng, record=False, *, reference=None, vr_every=1):
     """One game through bgc_play_game. `rng` is an Rng (its stream
     advances) or an int seed. Returns (result dict, records); records is a
     list of dicts (kind, state, dice, cube, decision, next_state, value)
-    when `record`, else None."""
+    when `record`, else None. With `reference` (money games) the result
+    also carries luck_white and n_corrected: the opening roll is not
+    corrected, every `vr_every`-th later turn is, and play and dice are
+    those of the ordinary path.
+    """
     if white.lib is not black.lib:
         raise ValueError("both engines must use the same backend library")
+    if reference is not None:
+        if reference.lib is not white.lib:
+            raise ValueError("reference must use the same backend library")
+        kinds = (KIND_CUBEFUL,) if opts.cubeful else (KIND_EQUITY, KIND_PROB5)
+        if any(e.kind not in kinds for e in (white, black, reference)):
+            raise ValueError("luck correction requires matching cubeful or cubeless money models")
+        if not isinstance(vr_every, int) or not 1 <= vr_every <= 2**31 - 1:
+            raise ValueError("vr_every must be a positive C int")
     if not isinstance(rng, Rng):
         rng = Rng(rng, white.backend)
     res = CGameResult()
@@ -920,11 +979,20 @@ def play_game(white, black, opts, rng, record=False):
         })
 
     fn = RECORD_FN(_cb) if record else RECORD_FN()
-    r = white.lib.bgc_play_game(white.h, black.h, ctypes.byref(opts),
-                                ctypes.byref(rng.c), ctypes.byref(res), fn, None)
+    extra = {}
+    if reference is None:
+        r = white.lib.bgc_play_game(white.h, black.h, ctypes.byref(opts),
+                                    ctypes.byref(rng.c), ctypes.byref(res), fn, None)
+    else:
+        luck, count = ctypes.c_double(), ctypes.c_int()
+        r = white.lib.bgc_play_game_vr(
+            white.h, black.h, ctypes.byref(opts), ctypes.byref(rng.c),
+            ctypes.byref(res), reference.h, vr_every, ctypes.byref(luck),
+            ctypes.byref(count), fn, None)
+        extra = {"luck_white": luck.value, "n_corrected": count.value}
     if r:
         raise RuntimeError("bgc_play_game failed")
-    return res.as_dict(), recs
+    return {**res.as_dict(), **extra}, recs
 
 
 # ── Agent ──────────────────────────────────────────────────────────
@@ -934,14 +1002,16 @@ class CAgent(Agent):
     from the Python game loops. `plies` 0 or 1."""
 
     def __init__(self, model, plies=0, backend=None, engine=None, root_filter=None,
-                 janowski=False, **jan_kw):
+                 janowski=False, **engine_kw):
         """root_filter: 1-ply root filter threshold (None: PURETD_ROOT_FILTER,
         ignored for janowski; a nonzero explicit one raises for janowski).
-        janowski: Prob5Jan (jan_kw: Engine's x, board_sanity, bearoff)."""
+        janowski: Prob5Jan (engine_kw: Engine's x, board_sanity, bearoff).
+        A cubeful model with bearoff=True (engine_kw; bearoff_hazard) is
+        bearoff_td.BearoffTDAgent."""
         if plies not in (0, 1):
             raise ValueError(f"CAgent supports plies 0 or 1 (got {plies})")
         self.engine = engine if engine is not None else Engine(
-            model, backend, janowski=janowski, **jan_kw)
+            model, backend, janowski=janowski, **engine_kw)
         if root_filter is None and engine is None and self.engine.kind != KIND_PROB5JAN:
             root_filter = root_filter_from_env()
         if root_filter is not None:

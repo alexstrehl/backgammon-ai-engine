@@ -2,9 +2,9 @@
 
 The chain that trains the cubeful-money and prob5 models from scratch to
 production strength. It is the recipe behind
-[best_models/cubeful_money_512_512_256_256.pt](../../best_models/cubeful_money_512_512_256_256.pt)
+[best_models/history/cubeful_money_512_512_256_256_6afda0f8.pt](../../best_models/history/cubeful_money_512_512_256_256_6afda0f8.pt)
 (md5 `6afda0f8`) and
-[best_models/cubeless_prob5_512_512_256_256.pt](../../best_models/cubeless_prob5_512_512_256_256.pt)
+[best_models/history/cubeless_prob5_512_512_256_256_ac95a983.pt](../../best_models/history/cubeless_prob5_512_512_256_256_ac95a983.pt)
 (md5 `ac95a983`), with schedule adjustments, and was run end to end twice
 at these settings ([Results](#results)). Each architecture or task change
 runs a subsequence of: 0-ply at a constant LR, 0-ply annealed, 1-ply at a
@@ -240,10 +240,10 @@ both sides 0-ply: cubeful money with Jacoby, capped
 
 ```bash
 python experiments/head_to_head/run.py --side1 models/cf_restart.pt \
-  --side2 best_models/cubeful_money_512_512_256_256.pt \
+  --side2 best_models/history/cubeful_money_512_512_256_256_6afda0f8.pt \
   --game-mode cubeful-money --jacoby --games 500000 --workers 48 --save DIR_CF
 python experiments/head_to_head/run.py --side1 models/p5_restart.pt \
-  --side2 best_models/cubeless_prob5_512_512_256_256.pt \
+  --side2 best_models/history/cubeless_prob5_512_512_256_256_ac95a983.pt \
   --game-mode cubeless-money --games 500000 --workers 48 --save DIR_P5
 python experiments/head_to_head/run.py --combine DIR_CF
 python experiments/head_to_head/run.py --combine DIR_P5

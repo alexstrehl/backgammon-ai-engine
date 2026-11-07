@@ -28,7 +28,7 @@ They are weaker than the production 4-layer nets and trade strength for size. Al
 
 The production column is in [h2h_experimental_vs_prod.csv](../../../experiments/head_to_head/results/h2h_experimental_vs_prod.csv). Per-game raws are not committed.
 
-Reference points on the gnubg scale: the production prob5 4L reads +45.8, the 6L cubeful teacher about +91.
+Reference points on the gnubg scale: the prob5 4L `ac95a983` reads +45.8, the 6L cubeful teacher about +91.
 The two-layer nets beat gnubg 0-ply. The one-layer nets do not. The production comparisons are against
 `history/cubeless_prob5_512_512_256_256_ac95a983.pt` and `history/cubeful_money_512_512_256_256_6afda0f8.pt`,
 10,000,000 games each.

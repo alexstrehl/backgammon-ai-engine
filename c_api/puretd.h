@@ -31,7 +31,7 @@ typedef struct bgc_engine bgc_engine;      /* model + backend + scratch; thread-
    refuses a library whose version or struct sizes differ. The library
    also carries the string "puretd-abi:<version>" (puretd_py checks it
    without loading the library). */
-#define BGC_ABI_VERSION 1
+#define BGC_ABI_VERSION 4
 int bgc_abi_version(void);
 /* sizeof the public structs, in this order: BoardState, Play, bgc_cube,
    bgc_cube_eval, bgc_search, bgc_encoder_info, bgc_jan_opts, bgc_rng,
@@ -110,6 +110,19 @@ int   bgc_value_prob5(bgc_engine *, const BoardState *, float probs[5], float *e
    CUBEFUL with a NULL cube: NAN. */
 float bgc_value_1ply(bgc_engine *, const BoardState *, const bgc_cube *);
 
+/* Money reference values for the 21 unordered dice (d1 = 1..6,
+   d2 = d1..6) from the mover's view, each the value of the reference's
+   best 0-ply move, from one expansion. Forced passes and terminal moves
+   are included. The values are doubles from the same batch, so a
+   centered dice control variate reads the realized roll and the
+   expectation from one source. Cubeless (EQUITY/PROB5): cube must be
+   NULL. Cubeful (CUBEFUL): a valid cube is required and the values are
+   per unit of its value, with ownership, Jacoby and any attached bearoff
+   tables applied. The state must be nonterminal. PROB and PROB5JAN are
+   not supported. Returns 0, or -1 on invalid arguments or an evaluation
+   failure. */
+int bgc_dice_values(bgc_engine *, const BoardState *, const bgc_cube *, double values[21]);
+
 /* Checker play at `plies` (0 or 1). Returns the chosen index into the
    get_legal_plays order, -1 on a forced pass (nothing evaluated), -2 on
    invalid arguments or allocation failure. out_state gets the resulting
@@ -151,6 +164,27 @@ int bgc_score_moves(bgc_engine *, const BoardState *, int d1, int d2,
 typedef struct { float root_thresh; } bgc_search;
 int bgc_set_search(bgc_engine *, const bgc_search * /* nullable */);
 
+/* ── CUBEFUL + bearoff tables (bearoff_td.BearoffTDAgent, side bo:) ───
+ * bgc_set_bearoff(e, t) on a CUBEFUL engine (perspective196 base) routes
+ * bearoff-class positions to the tables (bearoff.py _exact_tier: the
+ * two-sided table, and beyond it the hazard DP for gammon-free bearoffs
+ * unless bgc_set_bearoff_hazard(e, 0)), at 0- and 1-ply, cube required:
+ *   bgc_best_move / bgc_score_moves  a bearoff-class candidate scores
+ *                     -race_equity(c, opp persp, with_own_fold=True); at
+ *                     1-ply it stays unexpanded, a candidate within one
+ *                     move of the class expands with its bearoff-class
+ *                     leaves at that folded value, and these candidates
+ *                     win ties against the net-only rest
+ *   bgc_value_1ply    leaves routed the same way
+ *   bgc_offer_double / bgc_respond_to_double  a bearoff-class root takes
+ *                     race_cube_values at any plies (respond ignores the
+ *                     hint there); other roots as without a table, 1-ply
+ *                     leaves routed
+ *   bgc_value         the net's value (unrouted)
+ *   bgc_value_1ply_play  the two calls
+ *   bgc_collect       -1 (detach the table to collect)
+ * Without a cube the engine plays as without a table. */
+
 /* Money cube actions, CUBEFUL and PROB5JAN (others: offer 0, respond 1). -1 on
    invalid arguments (NULL cube, plies not 0/1). */
 typedef struct { int plies; float v_no_double; float v_double_take;
@@ -159,7 +193,7 @@ typedef struct { int plies; float v_no_double; float v_double_take;
 int bgc_offer_double(bgc_engine *, const BoardState *, const bgc_cube *, int plies,
                      bgc_cube_eval *out /* nullable */);         /* 1 double, 0 not */
 /* state->turn is the DOUBLER; returns the responder's decision. The hint
-   is used when hint->plies == plies. */
+   is used when hint->plies == plies and its values were computed. */
 int bgc_respond_to_double(bgc_engine *, const BoardState *, const bgc_cube *, int plies,
                           const bgc_cube_eval *hint /* nullable */); /* 1 take, 0 pass */
 
@@ -197,8 +231,14 @@ int bgc_set_jan(bgc_engine *, const bgc_jan_opts *);
 typedef struct bgc_bearoff bgc_bearoff;
 bgc_bearoff *bgc_bearoff_open(const char *path, char *err, size_t errlen);
 void bgc_bearoff_close(bgc_bearoff *);
-/* Attach (NULL: detach = bearoff_exact off). 0, -1 on another kind. */
+/* Attach (NULL: detach). PROB5JAN: bearoff_exact on/off. CUBEFUL: the
+   routing above (-1 for another base encoder or on allocation failure,
+   then detached). 0, -1 on another kind. */
 int bgc_set_bearoff(bgc_engine *, const bgc_bearoff *);
+/* CUBEFUL: 1 (the default) routes the hazard tier too, 0 the two-sided
+   table only. Kept across bgc_set_bearoff. 0, -1 on another kind
+   (PROB5JAN always routes both tiers). */
+int bgc_set_bearoff_hazard(bgc_engine *, int on);
 /* The conversion alone (janowski.py), double, Python's operation order.
    p = P(w), P(wg), P(wbg), P(lg), P(lbg) of the player on roll; persp =
    that player's cube perspective (PERSP 0 centered, 1 mine, 2 theirs). */
@@ -257,6 +297,22 @@ typedef void (*bgc_record_fn)(void *ctx, int kind, const BoardState *state,
 int bgc_play_game(bgc_engine *white, bgc_engine *black, const bgc_game_opts *,
                   bgc_rng *, bgc_game_result *, bgc_record_fn /* nullable */, void *ctx);
 
+/* bgc_play_game with an observational dice control variate. Cubeless:
+   players and reference EQUITY/PROB5. Cubeful: all CUBEFUL. Play and
+   the RNG stream are those of bgc_play_game. The opening roll is not
+   corrected. Every `every`-th later turn (1 = all) adds
+   q(actual dice) - E_d[q(d)] in WHITE's points to *luck_white, with q
+   the reference's bgc_dice_values at the pre-roll board and the
+   post-take cube, times the cube value in cubeful games. A drop has no
+   roll and no correction. *n_corrected counts the corrected turns. The
+   adjusted score Y - beta*luck is the caller's: nothing is fitted or
+   clipped here. Both output pointers are required and every >= 1.
+   Returns 0, or -1 on failure. */
+int bgc_play_game_vr(bgc_engine *white, bgc_engine *black, const bgc_game_opts *,
+                     bgc_rng *, bgc_game_result *, bgc_engine *reference,
+                     int every, double *luck_white, int *n_corrected,
+                     bgc_record_fn /* nullable */, void *ctx);
+
 /* Batch-training collector (puretd_collect.c): the samples of
    trainer.collect_episode with a TDAgent at boltzmann_temp 0, play at
    0-ply (oneply_acting off). Kind PROB = dmp (terminal target 1),
@@ -284,7 +340,8 @@ typedef struct {
    is too small (outputs partial: grow and call again with the same seed,
    a round is replayable), BGC_COLLECT_UNSUPPORTED (-3, nothing written)
    for an encoder without a C collector (collect 0 in the encoder table).
-   n_discarded (nullable): episodes dropped for max_plies. */
+   n_discarded (nullable): episodes dropped for max_plies. -1 for a
+   CUBEFUL engine with a bearoff table attached. */
 #define BGC_COLLECT_UNSUPPORTED (-3)
 long bgc_collect(bgc_engine *e, const bgc_collect_opts *o,
                  unsigned long long seed, int n_episodes,

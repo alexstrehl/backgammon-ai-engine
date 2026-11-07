@@ -83,7 +83,7 @@ PureTD: C API `torch` rows; the `simd` rows are Table 13's.
 
 PureTD C API, `torch` and `simd` backends, in the same sweeps as Tables 11 and 12. 1-ply rows: root filter 0.08.
 
-- Code: [c_api/backend_torch.cpp](c_api/backend_torch.cpp), [c_api/backend_simd.c](c_api/backend_simd.c), [c_api/README.md#L161-L173](c_api/README.md?plain=1#L161-L173) (root filter), [experiments/benchmarks/rootf_validate.py](experiments/benchmarks/rootf_validate.py)
+- Code: [c_api/backend_torch.cpp](c_api/backend_torch.cpp), [c_api/backend_simd.c](c_api/backend_simd.c), [c_api/README.md#root-filter](c_api/README.md#root-filter) (root filter), [experiments/benchmarks/rootf_validate.py](experiments/benchmarks/rootf_validate.py)
 - Command: [experiments/benchmarks/README.md#L173-L178](experiments/benchmarks/README.md?plain=1#L173-L178) (suite), [experiments/benchmarks/README.md#L192-L215](experiments/benchmarks/README.md?plain=1#L192-L215) (per job)
 - Results: [experiments/benchmarks/results/zen5_9700x_20261014/aggregate.txt](experiments/benchmarks/results/zen5_9700x_20261014/aggregate.txt), [experiments/benchmarks/results/zen3_5950x_20261014/aggregate.txt](experiments/benchmarks/results/zen3_5950x_20261014/aggregate.txt), [experiments/benchmarks/README.md#L225-L251](experiments/benchmarks/README.md?plain=1#L225-L251) (`PureTD torch` and `PureTD simd` rows, with intervals), [experiments/benchmarks/results/rootf_validate_20261011.txt](experiments/benchmarks/results/rootf_validate_20261011.txt) (root filter agreement)
 
@@ -91,7 +91,7 @@ PureTD C API, `torch` and `simd` backends, in the same sweeps as Tables 11 and 1
 
 HedgeHog engine, shim binary and models are third-party and not committed: [third_party_opponents/hedgehog/README.md#L21-L45](third_party_opponents/hedgehog/README.md?plain=1#L21-L45). HedgeHog engine `e8847f4`. Cubeful cells: the cube-capped (64, both sides) rows. The paper gives HedgeHog's equity: signs flipped against the CSVs.
 
-- Code: [third_party_opponents/hedgehog/hedgehog_agent.py](third_party_opponents/hedgehog/hedgehog_agent.py), [third_party_opponents/hedgehog/shim/hh_shim.cpp](third_party_opponents/hedgehog/shim/hh_shim.cpp), [play_models.py#L486-L496](play_models.py#L486-L496), [third_party_opponents/gnubg/gnubg_eval.py#L283-L286](third_party_opponents/gnubg/gnubg_eval.py#L283-L286) (cube cap)
+- Code: [third_party_opponents/hedgehog/hedgehog_agent.py](third_party_opponents/hedgehog/hedgehog_agent.py), [third_party_opponents/hedgehog/shim/hh_shim.cpp](third_party_opponents/hedgehog/shim/hh_shim.cpp), [play_models.py#L486-L496](play_models.py#L486-L496), [third_party_opponents/gnubg/gnubg_eval.py#L291-L294](third_party_opponents/gnubg/gnubg_eval.py#L291-L294) (cube cap)
 - Command: [experiments/head_to_head/HEDGEHOG.md#L14-L37](experiments/head_to_head/HEDGEHOG.md?plain=1#L14-L37)
 - Results: [experiments/head_to_head/results/h2h_cubeless_summary.csv](experiments/head_to_head/results/h2h_cubeless_summary.csv), [experiments/head_to_head/results/h2h_cubeful_cap64_summary.csv](experiments/head_to_head/results/h2h_cubeful_cap64_summary.csv), [experiments/head_to_head/HEDGEHOG.md#L39-L63](experiments/head_to_head/HEDGEHOG.md?plain=1#L39-L63)
 
